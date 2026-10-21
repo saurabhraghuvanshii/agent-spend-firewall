@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+.env
+.env.local
+.env.*.local
+.claude/settings.local.json
+coverage/
+.plan
