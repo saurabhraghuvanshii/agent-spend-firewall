@@ -1,0 +1,11 @@
+dist
+coverage
+node_modules
+pnpm-lock.yaml
+.plan
+.claude
+
+# Human-owned agent instruction files: keep their hand formatting
+AGENTS.md
+CLAUDE.md
+SUBAGENTS.md

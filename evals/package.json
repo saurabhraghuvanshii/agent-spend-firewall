@@ -1,0 +1,10 @@
+{
+  "name": "@asf/evals",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "evals": "vitest run --passWithNoTests",
+    "test": "vitest run --passWithNoTests"
+  }
+}
