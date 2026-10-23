@@ -6,7 +6,8 @@
  */
 import { definePolicy, rule } from "@asf/core";
 
-// TODO(T002): replace with the refund tool name(s) discovered from the Razorpay MCP server.
+// Confirmed by T002 discovery (docs/razorpay-tools.json): `create_refund` is the only tool that creates a refund
+// (required args `payment_id`, `amount` in paise; `update_refund` only edits notes).
 export const REFUND_TOOLS: readonly string[] = ["create_refund"];
 
 /** ₹10,000: refunds above this are always denied. */
