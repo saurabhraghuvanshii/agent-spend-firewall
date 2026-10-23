@@ -58,6 +58,9 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
     devDependencies:
+      '@asf/policies':
+        specifier: workspace:*
+        version: link:../../policies
       '@types/better-sqlite3':
         specifier: ^9.6.0
         version: 9.6.0

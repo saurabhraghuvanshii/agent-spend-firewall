@@ -42,7 +42,14 @@ export interface HistoryQuery {
   withinMs: number;
 }
 
+/**
+ * Recent-activity lookup. "Recent actions" are money actions that were executed, possibly executed
+ * (outcome `timeout` / `upstream_error`) or are pending (in flight / awaiting or approved but not
+ * yet executed); denied actions and outcomes `denied` / `not_forwarded` are excluded
+ * (see `countsTowardLimits`). Adapters compare `match` against redacted audit args with `argsMatch`.
+ */
 export interface HistoryPort {
+  /** True if a recent action for `tool` within `withinMs` matches every key of `match`. */
   hasRecent(q: HistoryQuery): Promise<Result<boolean>>;
 }
 
@@ -52,13 +59,22 @@ export interface StatsQuery {
 }
 
 export interface StatsSummary {
-  /** Sum of executed (forwarded and successful) actions in the window, integer paise. */
+  /**
+   * Sum, in integer paise, of actions in the window that were executed, possibly executed
+   * (outcome `timeout` / `upstream_error`) or are pending (in flight / awaiting or approved but
+   * not yet executed). Excludes denied actions and outcomes `denied` / `not_forwarded`.
+   */
   amountPaise: number;
+  /** Number of such actions (same inclusion rule as `amountPaise`). */
   count: number;
 }
 
 export interface StatsPort {
-  /** Executed actions only (not denied / pending ones). */
+  /**
+   * Totals for executed, possibly executed and pending actions of `tools` in the window; excludes
+   * denied and not-forwarded ones (see `countsTowardLimits`). An action's time is its latest
+   * attempt/outcome timestamp (`activityTs`).
+   */
   sumLast(q: StatsQuery): Promise<Result<StatsSummary>>;
 }
 
@@ -121,6 +137,7 @@ export interface PolicyContext {
   string(field: string): string;
   readonly history: { hasRecent(q: HistoryQuery): Promise<boolean> };
   readonly stats: { sumLast(q: StatsQuery): Promise<StatsSummary> };
+  /** Memoised per evaluation: repeated lookups of the same id (any rule, any phase) make one port call. The value is frozen. */
   readonly razorpay: { payment(id: string): Promise<PaymentInfo> };
 }
 

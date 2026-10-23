@@ -44,10 +44,25 @@ export interface EvalState {
    * rule did not await still denies (fail closed).
    */
   readonly inflight: Promise<unknown>[];
+  /**
+   * Razorpay payment lookups started during this evaluation, keyed by payment id. Lives on the
+   * per-evaluation state (not on a ctx), so it is shared by every rule and survives the context
+   * rebuild between the transform and gate phases, but is never shared across `evaluate` calls.
+   * Values are the shared lookup (resolving to a frozen `PaymentInfo`, or rejecting with a
+   * neutral, unrecorded `PolicyFault`); each caller gets its own derived promise, which records
+   * the fault attributed to the rule that called `payment(id)`.
+   */
+  readonly paymentCache: Map<string, Promise<PaymentInfo>>;
 }
 
 export function newEvalState(): EvalState {
-  return { fault: undefined, closed: false, currentRuleId: "", inflight: [] };
+  return {
+    fault: undefined,
+    closed: false,
+    currentRuleId: "",
+    inflight: [],
+    paymentCache: new Map(),
+  };
 }
 
 /**
@@ -82,9 +97,6 @@ export function createContext(
     state.fault ??= f;
     return f;
   };
-  const ensureOpen = (): void => {
-    if (state.closed) throw fault("engine-error", "evaluation already finished");
-  };
   const own = (field: string): JsonValue | undefined =>
     Object.hasOwn(args, field) ? args[field] : undefined;
 
@@ -93,29 +105,82 @@ export function createContext(
     call: () => Promise<Result<T>>,
     check: (v: unknown) => v is T,
   ): Promise<T> {
-    const p = runPort(name, call, check);
-    // Mark handled (the fault is recorded on `state` regardless) and track for settleInflight.
+    return track(runPort(name, call, check));
+  }
+
+  /** Mark handled (the fault is recorded on `state` regardless) and track for settleInflight. */
+  function track<T>(p: Promise<T>): Promise<T> {
     state.inflight.push(p.then(noop, noop));
     return p;
   }
 
+  /**
+   * Memoised payment lookup: one port call per payment id per evaluation. Every caller gets its
+   * own promise that (a) re-checks that the evaluation is still open when the shared lookup
+   * settles, and (b) on failure records a fault attributed to the caller's rule, so a cached
+   * failure denies for every rule that uses it (fail closed), not only the first.
+   */
+  function cachedPayment(id: string): Promise<PaymentInfo> {
+    if (state.closed) return rejected(fault("engine-error", "evaluation already finished"));
+    let shared = state.paymentCache.get(id);
+    if (shared === undefined) {
+      // Snapshot the port value (each field read once) before validating, then freeze it, so a
+      // value with getters, or a rule mutating it, cannot change what a later rule sees.
+      // The shared lookup is attributed to no rule and records nothing on `state`: whichever rule
+      // is current when it settles may never have touched it. Each caller's derived promise below
+      // re-raises the fault via `faultFor`, attributed to the rule that called `payment(id)`.
+      shared = runPort(
+        "razorpay payment",
+        () => deps.razorpay.payment(id).then(snapshotPaymentResult),
+        (v: unknown): v is PaymentInfo => isPaymentInfo(v) && v.id === id,
+        neutralFault,
+      ).then((v) => Object.freeze(v));
+      void shared.then(noop, noop);
+      state.paymentCache.set(id, shared);
+    }
+    const ruleId = state.currentRuleId;
+    const faultFor = (code: FaultCode, message: string): PolicyFault => {
+      const f = new PolicyFault(code, message, ruleId);
+      state.fault ??= f;
+      return f;
+    };
+    return track(
+      shared.then(
+        (v) => {
+          if (state.closed) throw faultFor("engine-error", "evaluation already finished");
+          return v;
+        },
+        (e: unknown) => {
+          throw e instanceof PolicyFault
+            ? faultFor(e.code, e.safeMessage)
+            : faultFor("engine-error", "razorpay payment lookup failed");
+        },
+      ),
+    );
+  }
+
+  /**
+   * Run a port call and validate its result. `mk` builds (and, for the default `fault`, records)
+   * the PolicyFault for any failure; the shared payment lookup passes `neutralFault` instead.
+   */
   async function runPort<T>(
     name: string,
     call: () => Promise<Result<T>>,
     check: (v: unknown) => v is T,
+    mk: (code: FaultCode, message: string) => PolicyFault = fault,
   ): Promise<T> {
-    ensureOpen();
+    if (state.closed) throw mk("engine-error", "evaluation already finished");
     let r: Result<T>;
     try {
       r = await call();
     } catch {
-      throw fault("engine-error", `${name} lookup threw`);
+      throw mk("engine-error", `${name} lookup threw`);
     }
-    if (state.closed) throw fault("engine-error", "evaluation already finished");
+    if (state.closed) throw mk("engine-error", "evaluation already finished");
     if (typeof r !== "object" || r === null)
-      throw fault("engine-error", `${name} lookup returned a malformed result`);
-    if (!r.ok) throw fault("engine-error", `${name} lookup failed`);
-    if (!check(r.value)) throw fault("engine-error", `${name} lookup returned an invalid value`);
+      throw mk("engine-error", `${name} lookup returned a malformed result`);
+    if (!r.ok) throw mk("engine-error", `${name} lookup failed`);
+    if (!check(r.value)) throw mk("engine-error", `${name} lookup returned an invalid value`);
     return r.value;
   }
 
@@ -170,11 +235,19 @@ export function createContext(
         if (typeof id !== "string" || id === "") {
           return rejected(fault("engine-error", "invalid payment id for lookup"));
         }
-        return callPort("razorpay payment", () => deps.razorpay.payment(id), isPaymentInfo);
+        return cachedPayment(id);
       },
     }),
   };
   return Object.freeze(ctx);
+}
+
+/**
+ * Fault for a lookup shared by several rules: attributed to no rule and NOT recorded on the eval
+ * state. Only safe where every consumer re-raises it through its own recording `faultFor`.
+ */
+function neutralFault(code: FaultCode, message: string): PolicyFault {
+  return new PolicyFault(code, message, "");
 }
 
 /** Rejected promise pre-marked as handled; the fault is already recorded on the eval state. */
@@ -230,6 +303,29 @@ function isStatsSummary(v: unknown): v is StatsSummary {
   if (typeof v !== "object" || v === null) return false;
   const s = v as Record<string, unknown>;
   return isNonNegSafeInt(s["amountPaise"]) && isNonNegSafeInt(s["count"]);
+}
+
+/**
+ * Replace an ok payment value with a detached plain copy of the `PaymentInfo` fields (read once).
+ * Anything else is returned unchanged for `runPort` to reject. A throwing getter rejects (⇒ fault).
+ */
+function snapshotPaymentResult(r: Result<PaymentInfo>): Result<PaymentInfo> {
+  const raw: unknown = r;
+  if (typeof raw !== "object" || raw === null) return r;
+  const res = raw as Record<string, unknown>;
+  if (res["ok"] !== true) return r;
+  const v: unknown = res["value"];
+  if (typeof v !== "object" || v === null) return r;
+  const p = v as Record<string, unknown>;
+  const copy: Record<string, unknown> = {
+    id: p["id"],
+    status: p["status"],
+    amountPaise: p["amountPaise"],
+    amountRefundedPaise: p["amountRefundedPaise"],
+    currency: p["currency"],
+  };
+  // Validated by `isPaymentInfo` in runPort before anyone sees it.
+  return { ok: true, value: copy as unknown as PaymentInfo };
 }
 
 function isPaymentInfo(v: unknown): v is PaymentInfo {

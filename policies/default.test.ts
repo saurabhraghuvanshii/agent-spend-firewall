@@ -194,6 +194,14 @@ describe("default policy", () => {
     expect(stats.calls).toEqual([{ tools: [...REFUND_TOOLS], windowMs: 3_600_000 }]);
   });
 
+  it("looks the payment up once per evaluation (currency + exceeds_paid share the cache)", async () => {
+    const razorpay = fakeRazorpay([payment()]);
+    expect((await refund(amt(30_000), { deps: { razorpay } })).decision.type).toBe("allow");
+    expect(razorpay.calls).toEqual([PAY]);
+    await refund(amt(30_000), { deps: { razorpay } });
+    expect(razorpay.calls).toEqual([PAY, PAY]); // not cached across evaluations
+  });
+
   it("duplicate refund within 10 minutes is denied; older or different ones are not", async () => {
     const clock = fakeClock(10_000_000);
     const now = clock.nowMs();

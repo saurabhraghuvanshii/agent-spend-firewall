@@ -82,6 +82,17 @@ export interface RecordOutcomeInput {
 }
 
 export type AuditDecisionInput = (typeof AUDIT_DECISIONS)[number];
+export type AuditAttemptRecord = Extract<AuditRecord, { kind: "attempt" }>;
+export type AuditOutcomeRecord = Extract<AuditRecord, { kind: "outcome" }>;
+
+/** An attempt joined with its outcome record, if one has been written. */
+export interface AuditActivity {
+  readonly attempt: AuditAttemptRecord;
+  readonly outcome?: AuditOutcomeRecord;
+}
+
+/** Default cap on rows `readActivitySince` scans before failing closed. */
+export const DEFAULT_MAX_ACTIVITY_ROWS = 10_000;
 export type AuditOutcomeInput = (typeof AUDIT_OUTCOMES)[number];
 
 export interface AuditStore {
@@ -95,6 +106,19 @@ export interface AuditStore {
   recordOutcome(input: RecordOutcomeInput): Result<AuditRecord>;
   /** All rows ordered by seq; unparseable / inconsistent rows become `{ invalid: true, seq }`. */
   readAll(): Result<Array<AuditRecord | InvalidAuditRow>>;
+  /**
+   * Activity in the window `[sinceMs, ∞)` for history / velocity checks (T007): every attempt whose own `ts`, or
+   * whose outcome's `ts`, is at or after `sinceMs`, each paired with its outcome (if any), ordered by attempt seq.
+   *
+   * Scans newest → oldest and stops at the first row older than `sinceMs` (record `ts` is non-decreasing by seq:
+   * appends reject backdated caller timestamps and clamp clock regressions). Timestamps are compared as parsed
+   * epoch ms, never as strings. Reads in one transaction (consistent snapshot).
+   *
+   * Fails closed (`err`): unreadable / non-canonical row or unparseable `ts` in the scanned range, an outcome whose
+   * attempt is missing or not earlier in the chain, a duplicate id / outcome, more than `maxActivityRows` rows in
+   * range, a non-finite `sinceMs`, or any read failure. Hashes are NOT re-verified here (use `verify()`).
+   */
+  readActivitySince(sinceMs: number): Result<AuditActivity[]>;
   /** `verifyChain` over `readAll()`. `err` only if the DB cannot be read. */
   verify(): Result<VerifyResult>;
   /** Idempotent. */
@@ -111,6 +135,8 @@ export interface OpenAuditStoreOptions {
   readonly?: boolean;
   /** SQLite busy timeout in ms (default 5000). */
   busyTimeoutMs?: number;
+  /** Max rows `readActivitySince` may scan (default `DEFAULT_MAX_ACTIVITY_ROWS`); more ⇒ `err`. */
+  maxActivityRows?: number;
 }
 
 /** Expected trigger SQL exactly as SQLite stores it in `sqlite_master.sql` (no IF NOT EXISTS, no `;`). */
@@ -374,6 +400,10 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   const idGen = opts.idGen ?? (() => randomUUID());
   const isReadonly = opts.readonly ?? false;
   const busyTimeoutMs = opts.busyTimeoutMs ?? 5000;
+  const maxActivityRows = opts.maxActivityRows ?? DEFAULT_MAX_ACTIVITY_ROWS;
+  if (!Number.isSafeInteger(maxActivityRows) || maxActivityRows < 1) {
+    return err("audit.open_failed", "maxActivityRows must be a positive integer");
+  }
 
   let db: Database.Database;
   try {
@@ -433,6 +463,8 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   let insertStmt: Database.Statement | null;
   let attemptBodyStmt: Database.Statement;
   let outcomeExistsStmt: Database.Statement;
+  let recentStmt: Database.Statement;
+  let attemptRowStmt: Database.Statement;
   let warnings: string[] = [];
   try {
     db.pragma(`busy_timeout = ${String(Math.max(0, Math.trunc(busyTimeoutMs)))}`);
@@ -485,6 +517,12 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     );
     outcomeExistsStmt = db.prepare(
       "SELECT 1 AS present FROM audit_log WHERE kind = 'outcome' AND json_extract(body_json, '$.attemptId') = ?",
+    );
+    recentStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log ORDER BY seq DESC",
+    );
+    attemptRowStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE id = ?",
     );
   } catch (e: unknown) {
     if (db.open) db.close();
@@ -570,6 +608,65 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   }
 
   const appendTx = db.transaction(appendInTx);
+
+  /** Runs inside a (deferred) read transaction. See `AuditStore.readActivitySince`. */
+  function readActivityInTx(sinceMs: number): Result<AuditActivity[]> {
+    const attempts = new Map<string, AuditAttemptRecord>();
+    const outcomes = new Map<string, AuditOutcomeRecord>();
+    const invalid = (message: string, seq: number): Result<AuditActivity[]> =>
+      err("audit.activity_invalid", message, { seq });
+    let scanned = 0;
+    // Iterate (not .all()) so only the window is read; collect, then look up older attempts after the cursor closes.
+    for (const raw of recentStmt.iterate() as Iterable<unknown>) {
+      scanned++;
+      if (scanned > maxActivityRows) {
+        return err("audit.activity_too_large", "too many audit records in the activity window", {
+          maxRows: maxActivityRows,
+        });
+      }
+      const rec = parseRow(raw, 0);
+      if ("invalid" in rec)
+        return invalid("audit record in the activity window is unreadable", rec.seq);
+      const ms = Date.parse(rec.ts);
+      if (!Number.isFinite(ms))
+        return invalid("audit record has an unparseable timestamp", rec.seq);
+      if (ms < sinceMs) break;
+      if (rec.kind === "attempt") {
+        if (attempts.has(rec.id)) return invalid("duplicate attempt id in audit log", rec.seq);
+        attempts.set(rec.id, rec);
+      } else {
+        if (outcomes.has(rec.attemptId)) return invalid("duplicate outcome in audit log", rec.seq);
+        outcomes.set(rec.attemptId, rec);
+      }
+    }
+    const all = new Map(attempts);
+    for (const [attemptId, outcome] of outcomes) {
+      let attempt = attempts.get(attemptId);
+      if (attempt === undefined) {
+        // Outcome in the window for an attempt older than the cutoff: indexed lookup by UNIQUE id.
+        const raw: unknown = attemptRowStmt.get(attemptId);
+        if (raw === undefined) return invalid("outcome references a missing attempt", outcome.seq);
+        const rec = parseRow(raw, 0);
+        if ("invalid" in rec) return invalid("attempt for an outcome is unreadable", rec.seq);
+        if (rec.kind !== "attempt")
+          return invalid("outcome references a non-attempt record", outcome.seq);
+        if (!Number.isFinite(Date.parse(rec.ts))) {
+          return invalid("audit record has an unparseable timestamp", rec.seq);
+        }
+        attempt = rec;
+        all.set(attemptId, rec);
+      }
+      if (attempt.seq >= outcome.seq) return invalid("outcome precedes its attempt", outcome.seq);
+    }
+    const result: AuditActivity[] = [];
+    for (const attempt of [...all.values()].sort((a, b) => a.seq - b.seq)) {
+      const outcome = outcomes.get(attempt.id);
+      result.push(outcome === undefined ? { attempt } : { attempt, outcome });
+    }
+    return ok(result);
+  }
+
+  const readActivityTx = db.transaction(readActivityInTx);
 
   /** Guard + catch-all for write paths: never throws, fails closed. */
   function guardedWrite(fn: () => Result<AuditRecord>): Result<AuditRecord> {
@@ -715,6 +812,18 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         return ok(rows.map((r, i) => parseRow(r, i + 1)));
       } catch (e: unknown) {
         return err("audit.read_failed", "could not read audit log", describeError(e));
+      }
+    },
+
+    readActivitySince(sinceMs: number): Result<AuditActivity[]> {
+      if (typeof sinceMs !== "number" || !Number.isFinite(sinceMs)) {
+        return err("audit.invalid_input", "sinceMs must be a finite number");
+      }
+      if (!db.open) return err("audit.read_failed", "audit store is closed");
+      try {
+        return readActivityTx(sinceMs);
+      } catch (e: unknown) {
+        return err("audit.read_failed", "could not read audit activity", describeError(e));
       }
     },
 

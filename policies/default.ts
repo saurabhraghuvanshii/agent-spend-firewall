@@ -14,9 +14,12 @@ export const REFUND_TOOLS: readonly string[] = ["create_refund"];
 export const HARD_CAP_PAISE = 1_000_000;
 /** ₹2,000: refunds above this need a human. */
 export const APPROVAL_THRESHOLD_PAISE = 200_000;
-/** ₹20,000 per rolling hour across all refund tools (executed refunds + this one). */
+/**
+ * ₹20,000 per rolling hour across all refund tools: recent refunds (executed, possibly executed, or
+ * pending / awaiting approval; denied and never-forwarded ones excluded) + this one.
+ */
 export const VELOCITY_MAX_PAISE = 2_000_000;
-/** At most this many executed refunds per rolling hour. */
+/** At most this many recent refunds (same inclusion rule as above) per rolling hour. */
 export const VELOCITY_MAX_COUNT = 10;
 export const VELOCITY_WINDOW_MS = 60 * 60 * 1000;
 export const DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
@@ -57,6 +60,8 @@ export const defaultPolicy = definePolicy({
       })
       .deny("Refund exceeds the refundable amount, or the payment is not captured"),
 
+    // "Made" includes pending and possibly-executed refunds, so the same refund can't be queued
+    // twice while one is awaiting approval. Payment lookups above are cached per evaluation.
     rule("refund.duplicate")
       .on(REFUND_TOOLS)
       .when((ctx) =>

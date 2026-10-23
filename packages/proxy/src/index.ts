@@ -4,7 +4,11 @@ export { nodeHasher } from "./node-hasher.js";
 export {
   AUDIT_DECISIONS,
   AUDIT_OUTCOMES,
+  DEFAULT_MAX_ACTIVITY_ROWS,
   openAuditStore,
+  type AuditActivity,
+  type AuditAttemptRecord,
+  type AuditOutcomeRecord,
   type AuditDecisionInput,
   type AuditOutcomeInput,
   type AuditStore,
@@ -88,3 +92,18 @@ export {
   type Next,
   type Stage,
 } from "./interceptor-chain.js";
+export {
+  createHistoryPort,
+  createPolicyDeps,
+  createRazorpayLookup,
+  createStatsPort,
+  DEFAULT_LOOKUP_TIMEOUT_MS,
+  FETCH_PAYMENT_TOOL,
+  MAX_LOOKUP_TEXT_CHARS,
+  PAYMENT_ID_PATTERN,
+  systemClock,
+  systemTimer,
+  type ActivitySource,
+  type AdapterOpts,
+  type UpstreamPaymentPort,
+} from "./context-adapters.js";
