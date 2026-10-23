@@ -35,6 +35,17 @@ export default tseslint.config(
     },
   },
   {
+    // Same split for the policies package: tsconfig.json covers policy files, tests use tsconfig.test.json.
+    files: ["policies/*.test.ts", "policies/vitest.config.ts"],
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+        project: "./policies/tsconfig.test.json",
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+  {
     files: ["**/*.js", "**/*.mjs", "**/*.cjs"],
     ...tseslint.configs.disableTypeChecked,
   },
