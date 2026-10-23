@@ -13,7 +13,8 @@
     "test": "pnpm -r test",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
-    "evals": "pnpm --filter @asf/evals evals"
+    "evals": "pnpm --filter @asf/evals evals",
+    "audit:verify": "pnpm --filter @asf/proxy audit:verify"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
