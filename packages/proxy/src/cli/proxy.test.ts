@@ -212,6 +212,24 @@ describe("startProxy", () => {
     );
     expect(jsonOf(unknown)).toMatchObject({ ruleId: "firewall.unknown_tool" });
 
+    // T004 wiring: money tools advertise a required reason and calls without one never reach upstream.
+    const listed = await agent.listTools();
+    const refund = listed.tools.find((t) => t.name === "create_refund");
+    expect(refund?.inputSchema.required).toContain("reason");
+    expect(listed.tools.find((t) => t.name === "fetch_payment")?.inputSchema.required).toEqual([
+      "payment_id",
+    ]);
+    const before = fake.calls.length;
+    const noReason = await agent.request(
+      {
+        method: "tools/call",
+        params: { name: "create_refund", arguments: { payment_id: "pay_1", amount: 100 } },
+      },
+      CallToolResultSchema,
+    );
+    expect(jsonOf(noReason)).toMatchObject({ ruleId: "firewall.reason_required" });
+    expect(fake.calls.length).toBe(before);
+
     await running.shutdown();
     await running.shutdown();
     expect(fake.disposed()).toBe(1);
@@ -238,7 +256,12 @@ describe("startProxy", () => {
     await running.proxy.connect(b);
     const agent = new Client({ name: "t", version: "0" }, { capabilities: {} });
     await agent.connect(a);
-    expect((await agent.listTools()).tools).toHaveLength(41);
+    const cachedList = (await agent.listTools()).tools;
+    expect(cachedList).toHaveLength(41);
+    // The cached snapshot is rewritten too: money tools require a reason.
+    expect(cachedList.find((t) => t.name === "create_refund")?.inputSchema.required).toContain(
+      "reason",
+    );
     await running.shutdown();
     await agent.close();
     expect(writes).not.toHaveBeenCalled();

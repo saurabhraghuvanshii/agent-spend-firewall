@@ -57,3 +57,34 @@ export {
   type ProxyServerOptions,
   type UpstreamErrorBody,
 } from "./server.js";
+export {
+  advertiseTool,
+  AMOUNT_KEY,
+  MONEY_DESCRIPTION_PREFIX,
+  REASON_DESCRIPTION,
+  REASON_MAX,
+  REASON_MIN,
+  rewriteMoneySchema,
+  rewriteMoneyTool,
+  UNSUPPORTED_KEYWORDS,
+  type InputSchema,
+  type RewriteError,
+  type RewriteResult,
+} from "./schema-rewrite.js";
+export {
+  allCurrenciesInr,
+  findInvalidAmount,
+  hasSafeTopLevelKeys,
+  isValidReason,
+  MAX_ARGS_DEPTH,
+  MAX_ARGS_NODES,
+  moneyArgsStage,
+  REASON_MIN_WORD_CHARS,
+} from "./money-args.js";
+export {
+  composeInterceptors,
+  firewallChain,
+  type ComposeOptions,
+  type Next,
+  type Stage,
+} from "./interceptor-chain.js";

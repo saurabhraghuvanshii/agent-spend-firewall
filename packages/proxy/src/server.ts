@@ -1,7 +1,8 @@
 /**
  * The firewall's MCP server (T003): mirrors the upstream Razorpay MCP server's tools to the agent and forwards calls.
  *
- * - `tools/list`: the LIVE upstream list (name, description, inputSchema, annotations), unchanged. If upstream can't
+ * - `tools/list`: the LIVE upstream list (name, description, inputSchema, annotations), passed through the `advertise`
+ *   hook (default: unchanged; the CLI rewrites money tools, T004). If upstream can't
  *   be reached, the committed `docs/razorpay-tools.json` snapshot (`cachedTools`) is advertised instead, so an agent
  *   that lists tools once at startup still sees them; calls then fail with `upstream_unavailable` until upstream
  *   connects, and the agent gets `notifications/tools/list_changed` if the live list differs from what it saw.
@@ -9,9 +10,12 @@
  *   (`LiveTools`). The cache, and lists from earlier generations or a list marked stale by `list_changed`, are never
  *   an allowlist for forwarding: without a validated live list for the current generation the call is refused
  *   (`upstream_unavailable` for a name we know of, else `firewall.unknown_tool`). Every call then goes through a
- *   `CallInterceptor` with the tool's class from `classifyTool` (pass-through by default; T004 / T008 replace it).
+ *   `CallInterceptor` with the tool's class from `classifyTool` (pass-through by default; the CLI wires T004's
+ *   `moneyArgsStage`; T008 adds the policy engine).
  *   An interceptor that throws ⇒ deny (fail closed). `forward` re-checks the name against the then-current list and
- *   pins the upstream generation, so a reconnect between the check and the send can't smuggle a call through.
+ *   pins the upstream generation, so a reconnect between the check and the send can't smuggle a call through. If the
+ *   tool's input schema on that list differs from the one the interceptor validated against, the call is refused
+ *   (`upstream_unavailable`, "tool schema changed; retry", not sent).
  * - Upstream failures become `isError: true` results with a JSON body `{ error, message, forwarded }`; the server
  *   never throws from `tools/call` and never crashes on upstream errors.
  * - An upstream result that contains the key id / secret in any encoding is replaced wholesale by an
@@ -57,6 +61,16 @@ export interface CallContext {
    * gets forwarded — only the object passed to `forward` is.
    */
   readonly args: Readonly<Record<string, unknown>>;
+  /**
+   * The tool's ORIGINAL upstream input schema (as listed on the current generation), deep-frozen copy. Not the
+   * advertised (rewritten) one: call-time checks re-derive that themselves (T004).
+   */
+  readonly inputSchema: Tool["inputSchema"];
+  /**
+   * The agent's `reason` for a money call, set by the T004 stage after validation and stripped from `args`.
+   * UNTRUSTED free text: for audit / approver display only, never for allow decisions (D-004).
+   */
+  readonly untrustedReason?: string;
   readonly sessionId: string;
   /** Aborted when the agent cancels the request. */
   readonly signal: AbortSignal;
@@ -71,7 +85,8 @@ export interface CallContext {
  * - `args` must be a plain JSON object (no prototypes other than Object, no functions / undefined / non-finite
  *   numbers / bigint / symbols, bounded depth) ⇒ else deny `firewall.invalid_forward_args`. It is copied at the
  *   moment of the call: exactly that value is sent; later mutation by the caller has no effect.
- * - T004: the interceptor strips `reason` from the args BEFORE calling `forward` (upstream never sees it).
+ * - T004: the interceptor strips `reason` from the args BEFORE calling `forward` (upstream never sees it); see
+ *   `money-args.ts` / `interceptor-chain.ts`.
  * - T008: the interceptor writes the audit entry BEFORE calling `forward`, and records the outcome after.
  */
 export type Forward = (args: Record<string, unknown>) => Promise<CallToolResult>;
@@ -152,6 +167,24 @@ function isPlainJsonObject(value: unknown, depth = 0): value is Record<string, u
   }
   return true;
 }
+
+/** Deterministic JSON (object keys sorted) for comparing schemas across listings. */
+export function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+const SCHEMA_CHANGED: UpstreamErrorBody = {
+  error: "upstream_unavailable",
+  message: "tool schema changed; retry",
+  forwarded: false,
+};
 
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -351,7 +384,8 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
         // Exact match (Map: no prototype keys, no case folding) against the list for the CURRENT generation only.
         const current = await refresh();
         if (current === undefined) return notAvailable(name);
-        if (!current.tools.has(name)) return unknownTool(name);
+        const listedTool = current.tools.get(name);
+        if (listedTool === undefined) return unknownTool(name);
         if (!isPlainJsonObject(rawArgs)) {
           return denyResult(
             "firewall.invalid_args",
@@ -359,10 +393,13 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
           );
         }
 
+        // The interceptor validates against THIS schema; forward refuses if the schema it would send under differs.
+        const schemaKey = stableStringify(listedTool.inputSchema);
         const ctx: CallContext = {
           tool: name,
           toolClass: classifyTool(name),
           args: deepFreeze(structuredClone(rawArgs)),
+          inputSchema: deepFreeze(structuredClone(listedTool.inputSchema)),
           sessionId: extra.sessionId ?? fallbackSessionId,
           signal: extra.signal,
         };
@@ -404,7 +441,12 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
           // Re-check against the list for the generation we will send on; pin that generation.
           const now = await refresh();
           if (now === undefined) return notAvailable(name);
-          if (!now.tools.has(name)) return unknownTool(name);
+          const nowTool = now.tools.get(name);
+          if (nowTool === undefined) return unknownTool(name);
+          if (stableStringify(nowTool.inputSchema) !== schemaKey) {
+            log(`schema of ${escapeForTerminal(name)} changed during the call; refused`);
+            return jsonErrorResult(SCHEMA_CHANGED);
+          }
           return toCallResult(
             name,
             await upstream.callTool(name, toSend, {

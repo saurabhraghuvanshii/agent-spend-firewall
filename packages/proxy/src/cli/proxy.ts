@@ -26,6 +26,8 @@ import { fileURLToPath } from "node:url";
 import { err, ok, type Result } from "@asf/core";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { composeInterceptors, firewallChain } from "../interceptor-chain.js";
+import { advertiseTool } from "../schema-rewrite.js";
 import { createProxyServer, type ProxyServer } from "../server.js";
 import {
   buildChildEnv,
@@ -226,6 +228,9 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
   const proxy = createProxyServer({
     upstream,
     cachedTools: config.cachedTools,
+    // T004: money tools advertise a required `reason`, integer-paise amounts and INR; calls are checked to match.
+    advertise: advertiseTool,
+    interceptor: composeInterceptors(firewallChain(), { logger }),
     callTimeoutMs: config.callTimeoutMs,
     logger,
     redact,

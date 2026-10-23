@@ -1,0 +1,697 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`docs/razorpay-tools.json > advertised money schemas (snapshot) 1`] = `
+{
+  "capture_payment": {
+    "properties": {
+      "amount": {
+        "description": "The amount to be captured (in paisa). Should be equal to the authorized amount",
+        "minimum": 1,
+        "type": "integer",
+      },
+      "currency": {
+        "description": "ISO code of the currency in which the payment was made (e.g., INR)",
+        "enum": [
+          "INR",
+        ],
+        "type": "string",
+      },
+      "payment_id": {
+        "description": "Unique identifier of the payment to be captured. Should start with 'pay_'",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "payment_id",
+      "amount",
+      "currency",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "close_qr_code": {
+    "properties": {
+      "qr_code_id": {
+        "description": "Unique identifier of the QR Code to be closedThe QR code id should start with 'qr_'",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "qr_code_id",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "create_instant_settlement": {
+    "properties": {
+      "amount": {
+        "description": "The amount you want to get settled instantly in amount in the smallest currency sub-unit (e.g., for ₹295, use 29500)",
+        "minimum": 200,
+        "type": "integer",
+      },
+      "description": {
+        "description": "Custom note for the instant settlement.",
+        "maxLength": 30,
+        "pattern": "^[a-zA-Z0-9 ]*$",
+        "type": "string",
+      },
+      "notes": {
+        "description": "Key-value pairs for additional information. Max 15 pairs, 256 chars each",
+        "maxProperties": 15,
+        "properties": {},
+        "type": "object",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "settle_full_balance": {
+        "default": false,
+        "description": "If true, Razorpay will settle the maximum amount possible and ignore amount parameter",
+        "type": "boolean",
+      },
+    },
+    "required": [
+      "amount",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "create_order": {
+    "properties": {
+      "amount": {
+        "description": "Payment amount in the smallest currency sub-unit (e.g., for ₹295, use 29500)",
+        "minimum": 100,
+        "type": "integer",
+      },
+      "currency": {
+        "description": "ISO code for the currency (e.g., INR, USD, SGD)",
+        "enum": [
+          "INR",
+        ],
+        "type": "string",
+      },
+      "customer_id": {
+        "description": "Customer ID for mandate orders. REQUIRED for mandate orders. Must start with 'cust_' followed by alphanumeric characters. Example: 'cust_xxx'. This identifies the customer for recurring payments.",
+        "type": "string",
+      },
+      "first_payment_min_amount": {
+        "description": "Minimum amount for first partial payment (only if partial_payment is true)",
+        "minimum": 100,
+        "type": "integer",
+      },
+      "method": {
+        "description": "Payment method for mandate orders. REQUIRED for mandate orders. Must be 'upi' when using token.type='single_block_multiple_debit'. This field is used only for mandate/recurring payment orders.",
+        "type": "string",
+      },
+      "notes": {
+        "description": "Key-value pairs for additional information (max 15 pairs, 256 chars each)",
+        "maxProperties": 15,
+        "properties": {},
+        "type": "object",
+      },
+      "partial_payment": {
+        "default": false,
+        "description": "Whether the customer can make partial payments",
+        "type": "boolean",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "receipt": {
+        "description": "Receipt number for internal reference (max 40 chars, must be unique)",
+        "maxLength": 40,
+        "type": "string",
+      },
+      "token": {
+        "description": "Token object for mandate orders. REQUIRED for mandate orders. Must contain: max_amount (positive number, maximum debit amount), frequency (as_presented/monthly/one_time/yearly/weekly/daily), type='single_block_multiple_debit' (only supported type), and optionally expire_at (Unix timestamp, defaults to today+60days). Example: {"max_amount": 100, "frequency": "as_presented", "type": "single_block_multiple_debit"}",
+        "properties": {},
+        "type": "object",
+      },
+      "transfers": {
+        "description": "Array of transfer objects for distributing payment amounts among multiple linked accounts. Each transfer object should contain: account (linked account ID), amount (in currency subunits), currency (ISO code), and optional fields like notes, linked_account_notes, on_hold, on_hold_until",
+        "type": "array",
+      },
+    },
+    "required": [
+      "amount",
+      "currency",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "create_payment_link": {
+    "properties": {
+      "accept_partial": {
+        "description": "Indicates whether customers can make partial payments using the Payment Link. Default: false",
+        "type": "boolean",
+      },
+      "amount": {
+        "description": "Amount to be paid using the link in smallest currency unit(e.g., ₹300, use 30000)",
+        "minimum": 100,
+        "type": "integer",
+      },
+      "callback_method": {
+        "description": "HTTP method for callback redirection. Must be 'get' if callback_url is set.",
+        "type": "string",
+      },
+      "callback_url": {
+        "description": "If specified, adds a redirect URL to the Payment Link. Customer will be redirected here after payment.",
+        "type": "string",
+      },
+      "currency": {
+        "description": "Three-letter ISO code for the currency (e.g., INR)",
+        "enum": [
+          "INR",
+        ],
+        "type": "string",
+      },
+      "customer_contact": {
+        "description": "Contact number of the customer.",
+        "type": "string",
+      },
+      "customer_email": {
+        "description": "Email address of the customer.",
+        "type": "string",
+      },
+      "customer_name": {
+        "description": "Name of the customer.",
+        "type": "string",
+      },
+      "description": {
+        "description": "A brief description of the Payment Link explaining the intent of the payment.",
+        "type": "string",
+      },
+      "expire_by": {
+        "description": "Timestamp, in Unix, when the Payment Link will expire. By default, a Payment Link will be valid for six months.",
+        "type": "number",
+      },
+      "first_min_partial_amount": {
+        "description": "Minimum amount that must be paid by the customer as the first partial payment. Default value is 100.",
+        "minimum": 1,
+        "type": "integer",
+      },
+      "notes": {
+        "description": "Key-value pairs that can be used to store additional information. Maximum 15 pairs, each value limited to 256 characters.",
+        "properties": {},
+        "type": "object",
+      },
+      "notify_email": {
+        "description": "Send email notifications for the Payment Link.",
+        "type": "boolean",
+      },
+      "notify_sms": {
+        "description": "Send SMS notifications for the Payment Link.",
+        "type": "boolean",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "reference_id": {
+        "description": "Reference number tagged to a Payment Link. Must be unique for each Payment Link. Max 40 characters.",
+        "type": "string",
+      },
+      "reminder_enable": {
+        "description": "Enable payment reminders for the Payment Link.",
+        "type": "boolean",
+      },
+    },
+    "required": [
+      "amount",
+      "currency",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "create_qr_code": {
+    "properties": {
+      "close_by": {
+        "description": "Unix timestamp at which QR Code should be automatically closed (min 2 mins after current time)",
+        "type": "number",
+      },
+      "customer_id": {
+        "description": "The unique identifier of the customer to link with the QR Code",
+        "type": "string",
+      },
+      "description": {
+        "description": "A brief description about the QR Code",
+        "type": "string",
+      },
+      "fixed_amount": {
+        "default": false,
+        "description": "Whether QR should accept only specific amount (true) or any amount (false)",
+        "type": "boolean",
+      },
+      "name": {
+        "description": "Label to identify the QR Code (e.g., 'Store Front Display')",
+        "type": "string",
+      },
+      "notes": {
+        "description": "Key-value pairs for additional information (max 15 pairs, 256 chars each)",
+        "maxProperties": 15,
+        "properties": {},
+        "type": "object",
+      },
+      "payment_amount": {
+        "description": "The specific amount allowed for transaction in smallest currency unit",
+        "minimum": 1,
+        "type": "integer",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "type": {
+        "description": "The type of the QR Code. Currently only supports 'upi_qr'",
+        "pattern": "^upi_qr$",
+        "type": "string",
+      },
+      "usage": {
+        "description": "Whether QR should accept single or multiple payments. Possible values: 'single_use', 'multiple_use'",
+        "enum": [
+          "single_use",
+          "multiple_use",
+        ],
+        "type": "string",
+      },
+    },
+    "required": [
+      "type",
+      "usage",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "create_refund": {
+    "properties": {
+      "amount": {
+        "description": "Payment amount in the smallest currency unit (e.g., for ₹295, use 29500)",
+        "minimum": 100,
+        "type": "integer",
+      },
+      "notes": {
+        "description": "Key-value pairs used to store additional information. A maximum of 15 key-value pairs can be included.",
+        "properties": {},
+        "type": "object",
+      },
+      "payment_id": {
+        "description": "Unique identifier of the payment which needs to be refunded. ID should have a pay_ prefix.",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "receipt": {
+        "description": "A unique identifier provided by you for your internal reference.",
+        "type": "string",
+      },
+      "speed": {
+        "description": "The speed at which the refund is to be processed. Default is 'normal'. For instant refunds, speed is set as 'optimum'.",
+        "type": "string",
+      },
+    },
+    "required": [
+      "payment_id",
+      "amount",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "fetch_tokens": {
+    "properties": {
+      "contact": {
+        "description": "Contact number of the customer to fetch all saved payment methods for. For example, 9876543210 or +919876543210",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "contact",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "initiate_payment": {
+    "properties": {
+      "amount": {
+        "description": "Payment amount in the smallest currency sub-unit (e.g., for ₹100, use 10000)",
+        "minimum": 100,
+        "type": "integer",
+      },
+      "contact": {
+        "description": "Customer's phone number",
+        "type": "string",
+      },
+      "currency": {
+        "description": "Currency code for the payment. Default is 'INR'",
+        "enum": [
+          "INR",
+        ],
+        "type": "string",
+      },
+      "customer_id": {
+        "description": "Customer ID for the payment. Must start with 'cust_'",
+        "type": "string",
+      },
+      "email": {
+        "description": "Customer's email address (optional)",
+        "type": "string",
+      },
+      "order_id": {
+        "description": "Order ID for which the payment is being initiated. Must start with 'order_'",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "save": {
+        "description": "Whether to save the payment method for future use",
+        "type": "boolean",
+      },
+      "token": {
+        "description": "Token ID of the saved payment method. Must start with 'token_'",
+        "type": "string",
+      },
+      "upi_intent": {
+        "description": "Enable UPI intent flow. When set to true, automatically sets method='upi' and UPI parameters with flow='intent'. The API will return a UPI URL in the response.",
+        "type": "boolean",
+      },
+      "vpa": {
+        "description": "Virtual Payment Address (VPA) for UPI payment. When provided, automatically sets method='upi' and UPI parameters with flow='collect' and expiry_time='6' (e.g., '9876543210@ptsbi')",
+        "type": "string",
+      },
+    },
+    "required": [
+      "amount",
+      "order_id",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "payment_link_notify": {
+    "properties": {
+      "medium": {
+        "description": "Medium through which to send the notification. Must be either 'sms' or 'email'.",
+        "enum": [
+          "sms",
+          "email",
+        ],
+        "type": "string",
+      },
+      "payment_link_id": {
+        "description": "ID of the payment link for which to send notification (ID should have a plink_ prefix).",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "payment_link_id",
+      "medium",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "payment_link_upi_create": {
+    "properties": {
+      "accept_partial": {
+        "description": "Indicates whether customers can make partial payments using the Payment Link. Default: false",
+        "type": "boolean",
+      },
+      "amount": {
+        "description": "Amount to be paid using the link in smallest currency unit(e.g., ₹300, use 30000), Only accepted currency is INR",
+        "minimum": 100,
+        "type": "integer",
+      },
+      "callback_method": {
+        "description": "HTTP method for callback redirection. Must be 'get' if callback_url is set.",
+        "type": "string",
+      },
+      "callback_url": {
+        "description": "If specified, adds a redirect URL to the Payment Link. Customer will be redirected here after payment.",
+        "type": "string",
+      },
+      "currency": {
+        "description": "Three-letter ISO code for the currency (e.g., INR). UPI links are only supported in INR",
+        "enum": [
+          "INR",
+        ],
+        "type": "string",
+      },
+      "customer_contact": {
+        "description": "Contact number of the customer.",
+        "type": "string",
+      },
+      "customer_email": {
+        "description": "Email address of the customer.",
+        "type": "string",
+      },
+      "customer_name": {
+        "description": "Name of the customer.",
+        "type": "string",
+      },
+      "description": {
+        "description": "A brief description of the Payment Link explaining the intent of the payment.",
+        "type": "string",
+      },
+      "expire_by": {
+        "description": "Timestamp, in Unix, when the Payment Link will expire. By default, a Payment Link will be valid for six months.",
+        "type": "number",
+      },
+      "first_min_partial_amount": {
+        "description": "Minimum amount that must be paid by the customer as the first partial payment. Default value is 100.",
+        "minimum": 1,
+        "type": "integer",
+      },
+      "notes": {
+        "description": "Key-value pairs that can be used to store additional information. Maximum 15 pairs, each value limited to 256 characters.",
+        "properties": {},
+        "type": "object",
+      },
+      "notify_email": {
+        "description": "Send email notifications for the Payment Link.",
+        "type": "boolean",
+      },
+      "notify_sms": {
+        "description": "Send SMS notifications for the Payment Link.",
+        "type": "boolean",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "reference_id": {
+        "description": "Reference number tagged to a Payment Link. Must be unique for each Payment Link. Max 40 characters.",
+        "type": "string",
+      },
+      "reminder_enable": {
+        "description": "Enable payment reminders for the Payment Link.",
+        "type": "boolean",
+      },
+    },
+    "required": [
+      "amount",
+      "currency",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "resend_otp": {
+    "properties": {
+      "payment_id": {
+        "description": "Unique identifier of the payment for which OTP needs to be generated. Must start with 'pay_'",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "payment_id",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "submit_otp": {
+    "properties": {
+      "otp_string": {
+        "description": "OTP string received from the user",
+        "type": "string",
+      },
+      "payment_id": {
+        "description": "Unique identifier of the payment for which OTP needs to be submitted. Must start with 'pay_'",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "otp_string",
+      "payment_id",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "update_order": {
+    "properties": {
+      "notes": {
+        "description": "Key-value pairs used to store additional information about the order. A maximum of 15 key-value pairs can be included, with each value not exceeding 256 characters.",
+        "properties": {},
+        "type": "object",
+      },
+      "order_id": {
+        "description": "Unique identifier of the order which needs to be updated. ID should have an order_ prefix.",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "order_id",
+      "notes",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "update_payment": {
+    "properties": {
+      "notes": {
+        "description": "Key-value pairs that can be used to store additional information about the payment. Values must be strings or integers.",
+        "properties": {},
+        "type": "object",
+      },
+      "payment_id": {
+        "description": "Unique identifier of the payment to be updated. Must start with 'pay_'",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+    },
+    "required": [
+      "payment_id",
+      "notes",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "update_payment_link": {
+    "properties": {
+      "accept_partial": {
+        "description": "Allow customers to make partial payments. Not allowed with UPI payment links.",
+        "type": "boolean",
+      },
+      "expire_by": {
+        "description": "Timestamp, in Unix format, when the payment link should expire.",
+        "type": "number",
+      },
+      "notes": {
+        "description": "Key-value pairs for additional information. Maximum 15 pairs, each value limited to 256 characters.",
+        "properties": {},
+        "type": "object",
+      },
+      "payment_link_id": {
+        "description": "ID of the payment link to update (ID should have a plink_ prefix).",
+        "type": "string",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "reference_id": {
+        "description": "Adds a unique reference number to the payment link.",
+        "type": "string",
+      },
+      "reminder_enable": {
+        "description": "Enable or disable reminders for the payment link.",
+        "type": "boolean",
+      },
+    },
+    "required": [
+      "payment_link_id",
+      "reason",
+    ],
+    "type": "object",
+  },
+  "update_refund": {
+    "properties": {
+      "notes": {
+        "description": "Key-value pairs used to store additional information. A maximum of 15 key-value pairs can be included, with each value not exceeding 256 characters.",
+        "properties": {},
+        "type": "object",
+      },
+      "reason": {
+        "description": "Explain to a human reviewer why this money action is needed (customer, order, evidence). Logged and shown to approvers; it does not authorise anything.",
+        "maxLength": 500,
+        "minLength": 10,
+        "type": "string",
+      },
+      "refund_id": {
+        "description": "Unique identifier of the refund which needs to be updated. ID should have a rfnd_ prefix.",
+        "type": "string",
+      },
+    },
+    "required": [
+      "refund_id",
+      "notes",
+      "reason",
+    ],
+    "type": "object",
+  },
+}
+`;

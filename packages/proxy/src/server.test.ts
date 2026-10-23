@@ -13,6 +13,7 @@ import {
   denyResult,
   passThroughInterceptor,
   screenResult,
+  stableStringify,
   type CallContext,
   type CallInterceptor,
   type ProxyServer,
@@ -420,6 +421,76 @@ describe("forwarding is bound to the CURRENT upstream generation", () => {
     const r = await call(h.agent, "create_refund", { payment_id: "pay_1", amount: 100 });
     expect(jsonOf(r)).toMatchObject({ decision: "deny", ruleId: "firewall.unknown_tool" });
     expect(fake.calls).toEqual([]);
+  });
+
+  it("tool schema changes between interceptor and forward() ⇒ upstream_unavailable, not sent", async () => {
+    const fake = fakeUpstream();
+    const interceptor: CallInterceptor = {
+      intercept: async (ctx, forward) => {
+        fake.setTools(
+          FAKE_TOOLS.map((t) =>
+            t.name === "create_refund"
+              ? {
+                  ...t,
+                  inputSchema: {
+                    type: "object",
+                    properties: { payment_id: { type: "string" }, amount: { type: "string" } },
+                  },
+                }
+              : t,
+          ),
+        );
+        await fake.dropConnection();
+        return forward({ ...ctx.args });
+      },
+    };
+    const h = await setup({ fake, interceptor });
+    const r = await call(h.agent, "create_refund", { payment_id: "pay_1", amount: 100 });
+    expect(r.isError).toBe(true);
+    expect(jsonOf(r)).toEqual({
+      error: "upstream_unavailable",
+      message: "tool schema changed; retry",
+      forwarded: false,
+    });
+    expect(fake.calls).toEqual([]);
+    expect(h.upstream.generation).toBe(2);
+  });
+
+  it("re-list with the same schema (keys reordered) between interceptor and forward() ⇒ forwarded", async () => {
+    const fake = fakeUpstream();
+    const reorder = (v: unknown): unknown => {
+      if (Array.isArray(v)) return v.map(reorder);
+      if (v !== null && typeof v === "object") {
+        return Object.fromEntries(
+          Object.entries(v)
+            .reverse()
+            .map(([k, x]) => [k, reorder(x)]),
+        );
+      }
+      return v;
+    };
+    const interceptor: CallInterceptor = {
+      intercept: async (ctx, forward) => {
+        fake.setTools(
+          FAKE_TOOLS.map((t) => ({
+            ...t,
+            inputSchema: reorder(t.inputSchema) as Tool["inputSchema"],
+          })),
+        );
+        await fake.dropConnection();
+        return forward({ ...ctx.args });
+      },
+    };
+    const h = await setup({ fake, interceptor });
+    const r = await call(h.agent, "create_refund", { payment_id: "pay_1", amount: 100 });
+    expect(r.isError).toBeUndefined();
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  it("stableStringify sorts object keys at every depth", () => {
+    expect(stableStringify({ b: 1, a: { d: [1, { y: 2, x: 1 }], c: null } })).toBe(
+      '{"a":{"c":null,"d":[1,{"x":1,"y":2}]},"b":1}',
+    );
   });
 
   it("list_changed then a failing re-list (same generation) ⇒ upstream_unavailable until re-listed", async () => {
