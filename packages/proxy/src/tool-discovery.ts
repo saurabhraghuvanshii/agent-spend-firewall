@@ -26,7 +26,7 @@ export const DEFAULT_RAZORPAY_MCP_IMAGE =
  */
 export const DISCOVERY_PLACEHOLDER_KEYS: TestKeys = Object.freeze({
   keyId: "rzp_test_discoveryonly",
-  keySecret: "placeholder",
+  keySecret: "discoveryPlaceholder0000",
 });
 export const DEFAULT_DISCOVERY_TIMEOUT_MS = 60_000;
 export const MAX_DISCOVERY_PAGES = 50;
@@ -37,6 +37,8 @@ export const TOOLS_FILE_SCHEMA_VERSION = 1 as const;
 // ---------------------------------------------------------------------------------------------------------------
 
 const TEST_KEY_ID = /^rzp_test_[A-Za-z0-9]+$/;
+/** Razorpay key secrets are alphanumeric (24 chars today); require 16+ so redaction can't match trivial strings. */
+const KEY_SECRET_FORMAT = /^[A-Za-z0-9]{16,}$/;
 
 export interface TestKeys {
   readonly keyId: string;
@@ -70,6 +72,12 @@ export function checkTestKeys(env: EnvLike): Result<TestKeys> {
   const keySecret = env["RAZORPAY_KEY_SECRET"];
   if (keySecret === undefined || keySecret === "") {
     return err("discover.missing_key_secret", "RAZORPAY_KEY_SECRET is not set");
+  }
+  if (!KEY_SECRET_FORMAT.test(keySecret)) {
+    return err(
+      "discover.bad_key_secret",
+      "refusing to run: RAZORPAY_KEY_SECRET does not look like a Razorpay key secret (expected 16+ letters/digits)",
+    );
   }
   return ok({ keyId, keySecret });
 }

@@ -18,7 +18,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "audit:verify": "tsx --conditions=@asf/source src/cli/audit-verify.ts",
-    "discover": "tsx --conditions=@asf/source src/cli/discover-tools.ts"
+    "discover": "tsx --conditions=@asf/source src/cli/discover-tools.ts",
+    "start": "tsx --conditions=@asf/source src/cli/proxy.ts",
+    "dev": "tsx --conditions=@asf/source src/cli/proxy.ts"
   },
   "dependencies": {
     "@asf/core": "workspace:*",

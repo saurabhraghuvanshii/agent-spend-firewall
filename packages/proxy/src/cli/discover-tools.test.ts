@@ -211,7 +211,7 @@ describe("runDiscover exit 0", () => {
 
   it("validates keys from <root>/.env (found via INIT_CWD); shell values win; real keys not passed", async () => {
     const h = harness({
-      envFile: "RAZORPAY_KEY_ID=not-a-test-key\nRAZORPAY_KEY_SECRET=fileSecret\n",
+      envFile: "RAZORPAY_KEY_ID=not-a-test-key\nRAZORPAY_KEY_SECRET=fileSecret0000000\n",
     });
     const r = await runDiscover(
       [],
@@ -220,7 +220,7 @@ describe("runDiscover exit 0", () => {
     );
     expect(r.exitCode).toBe(0);
     expect(h.spawns[0]?.env).toMatchObject(PLACEHOLDER_ENV);
-    expect(JSON.stringify(h.spawns[0])).not.toContain("fileSecret");
+    expect(JSON.stringify(h.spawns[0])).not.toContain("fileSecret0000000");
   });
 
   it("an empty shell value does not blank out the .env value", async () => {
@@ -249,6 +249,7 @@ describe("runDiscover exit 2 (refused)", () => {
     ],
     ["rzp_testX", { RAZORPAY_KEY_ID: "rzp_testXabc", RAZORPAY_KEY_SECRET: KEY_SECRET }, undefined],
     ["missing secret", { RAZORPAY_KEY_ID: KEY_ID }, undefined],
+    ["short secret", { RAZORPAY_KEY_ID: KEY_ID, RAZORPAY_KEY_SECRET: "short" }, undefined],
     ["live key elsewhere in .env", KEYS_ENV, "SOME_OTHER=rzp_live_Zzz\n"],
     ["live key id in .env", {}, "RAZORPAY_KEY_ID=rzp_live_Zzz\nRAZORPAY_KEY_SECRET=x\n"],
     ["upper-case live key in .env", KEYS_ENV, "OTHER=RZP_LIVE_Zzz\n"],

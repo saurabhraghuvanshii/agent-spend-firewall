@@ -25,7 +25,7 @@ import {
 } from "./tool-discovery.js";
 
 const KEY_ID = "rzp_test_AbC123xyz";
-const KEY_SECRET = "s3cr3tValue_DoNotPrint";
+const KEY_SECRET = "s3cr3tValueDoNotPrint";
 const KEYS = { keyId: KEY_ID, keySecret: KEY_SECRET };
 
 interface FakeTool {
@@ -140,6 +140,29 @@ describe("checkTestKeys", () => {
         expect(r.error.message).not.toContain(KEY_ID);
       }
     }
+  });
+
+  it.each([
+    ["too short", "abcDEF123"],
+    ["15 chars", "abcdefghij12345"],
+    ["underscore", "abcdefghij_klmnop"],
+    ["space", "abcdefghij klmnop"],
+    ["newline", "abcdefghijklmnop\n"],
+    ["non-ascii", "abcdefghijklmnopé"],
+  ])("refuses a malformed secret (%s) without echoing it", (_l, secret) => {
+    const r = checkTestKeys({ RAZORPAY_KEY_ID: KEY_ID, RAZORPAY_KEY_SECRET: secret });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("discover.bad_key_secret");
+      expect(r.error.message).not.toContain(secret.trim());
+      expect(r.error.message).not.toContain(KEY_ID);
+    }
+  });
+
+  it("accepts a 16-char alphanumeric secret", () => {
+    expect(
+      checkTestKeys({ RAZORPAY_KEY_ID: KEY_ID, RAZORPAY_KEY_SECRET: "abcdefghij123456" }).ok,
+    ).toBe(true);
   });
 
   it("refuses a live key in ANY environment variable, naming the variable but not the value", () => {
