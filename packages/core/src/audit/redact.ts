@@ -25,6 +25,10 @@ const DENY_EXACT: ReadonlySet<string> = new Set([
   "upiid",
   // `customer` is exact (not a substring) so `customer_id` survives; `customername` is a substring below.
   "customer",
+  // One-time passwords (e.g. Razorpay `submit_otp.otp_string`) must never be stored. Exact, so `otpstatus`-like
+  // keys are not hit by accident; `otp_string` / `OTP` / `Otp-String` normalise to these.
+  "otp",
+  "otpstring",
 ]);
 
 /**

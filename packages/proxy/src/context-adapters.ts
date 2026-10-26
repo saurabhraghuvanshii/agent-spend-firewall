@@ -1,6 +1,7 @@
 /**
  * Real adapters for the policy ports (T007): history / velocity from the audit store, payment lookups through the
- * upstream Razorpay MCP server, and system clock / timer.
+ * upstream Razorpay MCP server, and system clock / timer. Also the firewall's own order lookup (`createOrderLookup`,
+ * T008 INR invariant for order-based money tools; not a policy port).
  *
  * Semantics (D-023): an audited action counts toward history / velocity iff
  * - `countsTowardLimits({ decision, outcome })` (executed, possibly executed, or pending; never denied / not
@@ -336,81 +337,154 @@ const paymentSchema = z
 
 const lookupErr = <T>(code: string, message: string): Result<T> => err(`razorpay.${code}`, message);
 
-export function createRazorpayLookup(o: AdapterOpts): RazorpayLookupPort {
+function validTimeout(timeoutMs: number): boolean {
+  return Number.isSafeInteger(timeoutMs) && timeoutMs >= 1 && timeoutMs <= MAX_LOOKUP_TIMEOUT_MS;
+}
+
+/**
+ * Shared strict lookup through an upstream READ tool: the tool must classify as `read`, `id` must match `idPattern`,
+ * the call is bounded by `timeoutMs`, the result is credential-screened and must be exactly one JSON text item.
+ * Returns the parsed JSON (validated by the caller). `what` names the entity in error messages ("payment"/"order").
+ */
+async function strictLookup(
+  o: AdapterOpts,
+  tool: string,
+  argName: string,
+  id: string,
+  idPattern: RegExp,
+  what: string,
+): Promise<Result<unknown>> {
   const timeoutMs = o.lookupTimeoutMs ?? DEFAULT_LOOKUP_TIMEOUT_MS;
   const redact = o.redact ?? noRedact;
+  try {
+    if (!validTimeout(timeoutMs)) {
+      return lookupErr("invalid_config", `invalid ${what} lookup timeout`);
+    }
+    // Defense in depth: never route a lookup through a tool that isn't classified read-only.
+    if (classifyTool(tool) !== "read") {
+      return lookupErr("invalid_config", `${what} lookup tool is not a read tool`);
+    }
+    if (typeof id !== "string" || !idPattern.test(id)) {
+      return lookupErr("invalid_id", `${what} id is not a Razorpay ${what} id`);
+    }
+    const outcome = await o.upstream.callTool(tool, { [argName]: id }, { timeoutMs });
+    if (outcome.kind !== "ok") {
+      return lookupErr(
+        outcome.error === "upstream_timeout" ? "timeout" : "unavailable",
+        `${what} lookup did not complete`,
+      );
+    }
+    return parseSingleJson(screenResult(outcome.result, redact), what);
+  } catch {
+    return lookupErr("lookup_failed", `${what} lookup failed`);
+  }
+}
+
+function parseSingleJson(result: CallToolResult, what: string): Result<unknown> {
+  if (result === CREDENTIAL_LEAK_RESULT) {
+    return lookupErr("credential_leak", `${what} lookup result contained credential material`);
+  }
+  if (result.isError === true)
+    return lookupErr("upstream_error", `${what} lookup returned an error`);
+  const content: unknown = result.content;
+  if (!Array.isArray(content) || content.length !== 1) {
+    return lookupErr("malformed", `${what} lookup result has unexpected content`);
+  }
+  const item: unknown = content[0];
+  if (typeof item !== "object" || item === null) {
+    return lookupErr("malformed", `${what} lookup result has unexpected content`);
+  }
+  const { type, text } = item as { type?: unknown; text?: unknown };
+  if (type !== "text" || typeof text !== "string" || text.length > MAX_LOOKUP_TEXT_CHARS) {
+    return lookupErr("malformed", `${what} lookup result is not a JSON text`);
+  }
+  try {
+    return ok(JSON.parse(text) as unknown);
+  } catch {
+    // Not JSON (e.g. an upstream error message without isError): fail closed, never echo the text.
+    return lookupErr("malformed", `${what} lookup result is not valid JSON`);
+  }
+}
+
+export function createRazorpayLookup(o: AdapterOpts): RazorpayLookupPort {
   return {
     async payment(id: string): Promise<Result<PaymentInfo>> {
-      try {
-        if (
-          !Number.isSafeInteger(timeoutMs) ||
-          timeoutMs < 1 ||
-          timeoutMs > MAX_LOOKUP_TIMEOUT_MS
-        ) {
-          return lookupErr("invalid_config", "invalid payment lookup timeout");
-        }
-        // Defense in depth: never route a lookup through a tool that isn't classified read-only.
-        if (classifyTool(FETCH_PAYMENT_TOOL) !== "read") {
-          return lookupErr("invalid_config", "payment lookup tool is not a read tool");
-        }
-        if (typeof id !== "string" || !PAYMENT_ID_PATTERN.test(id)) {
-          return lookupErr("invalid_id", "payment id is not a Razorpay payment id");
-        }
-        const outcome = await o.upstream.callTool(
-          FETCH_PAYMENT_TOOL,
-          { payment_id: id },
-          { timeoutMs },
-        );
-        if (outcome.kind !== "ok") {
-          return lookupErr(
-            outcome.error === "upstream_timeout" ? "timeout" : "unavailable",
-            "payment lookup did not complete",
-          );
-        }
-        return parsePayment(id, screenResult(outcome.result, redact));
-      } catch {
-        return lookupErr("lookup_failed", "payment lookup failed");
-      }
+      const json = await strictLookup(
+        o,
+        FETCH_PAYMENT_TOOL,
+        "payment_id",
+        id,
+        PAYMENT_ID_PATTERN,
+        "payment",
+      );
+      if (!json.ok) return json;
+      const parsed = paymentSchema.safeParse(json.value);
+      if (!parsed.success) return lookupErr("malformed", "payment lookup result failed validation");
+      const p = parsed.data;
+      if (p.id !== id)
+        return lookupErr("id_mismatch", "payment lookup returned a different payment");
+      return ok({
+        id: p.id,
+        status: p.status,
+        amountPaise: p.amount,
+        amountRefundedPaise: p.amount_refunded,
+        currency: p.currency,
+      });
     },
   };
 }
 
-function parsePayment(id: string, result: CallToolResult): Result<PaymentInfo> {
-  if (result === CREDENTIAL_LEAK_RESULT) {
-    return lookupErr("credential_leak", "payment lookup result contained credential material");
-  }
-  if (result.isError === true)
-    return lookupErr("upstream_error", "payment lookup returned an error");
-  const content: unknown = result.content;
-  if (!Array.isArray(content) || content.length !== 1) {
-    return lookupErr("malformed", "payment lookup result has unexpected content");
-  }
-  const item: unknown = content[0];
-  if (typeof item !== "object" || item === null) {
-    return lookupErr("malformed", "payment lookup result has unexpected content");
-  }
-  const { type, text } = item as { type?: unknown; text?: unknown };
-  if (type !== "text" || typeof text !== "string" || text.length > MAX_LOOKUP_TEXT_CHARS) {
-    return lookupErr("malformed", "payment lookup result is not a JSON text");
-  }
-  let json: unknown;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    // Not JSON (e.g. an upstream error message without isError): fail closed, never echo the text.
-    return lookupErr("malformed", "payment lookup result is not valid JSON");
-  }
-  const parsed = paymentSchema.safeParse(json);
-  if (!parsed.success) return lookupErr("malformed", "payment lookup result failed validation");
-  const p = parsed.data;
-  if (p.id !== id) return lookupErr("id_mismatch", "payment lookup returned a different payment");
-  return ok({
-    id: p.id,
-    status: p.status,
-    amountPaise: p.amount,
-    amountRefundedPaise: p.amount_refunded,
-    currency: p.currency,
-  });
+// ---------------------------------------------------------------------------------------------------------------
+// Razorpay order lookup (via upstream MCP `fetch_order`) — firewall INR invariant for order-based money tools
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Upstream read tool used for order lookups (classified `read`, D-019). */
+export const FETCH_ORDER_TOOL = "fetch_order";
+/** Razorpay order id accepted for lookups. Anything else is refused without calling upstream. */
+export const ORDER_ID_PATTERN = /^order_[A-Za-z0-9]{1,40}$/;
+
+/** What the firewall needs from an order: its id, amount (integer paise) and currency (verbatim). */
+export interface OrderInfo {
+  readonly id: string;
+  readonly amountPaise: number;
+  /** Verbatim from Razorpay (never normalised): the INR check is an exact comparison. */
+  readonly currency: string;
+}
+
+export interface OrderLookupPort {
+  order(id: string): Promise<Result<OrderInfo>>;
+}
+
+const orderSchema = z.looseObject({
+  id: z.string(),
+  amount: z.int().nonnegative(),
+  currency: z.string(),
+});
+
+/**
+ * Order lookups with the same strictness as payment lookups: read-classified tool, `ORDER_ID_PATTERN`, bounded
+ * timeout (`lookupTimeoutMs`, ≤ `MAX_LOOKUP_TIMEOUT_MS`), credential screen, exactly one JSON text item, zod
+ * `{ id === requested, amount int ≥ 0, currency string }`. Every failure is an `err` (callers deny).
+ */
+export function createOrderLookup(o: AdapterOpts): OrderLookupPort {
+  return {
+    async order(id: string): Promise<Result<OrderInfo>> {
+      const json = await strictLookup(
+        o,
+        FETCH_ORDER_TOOL,
+        "order_id",
+        id,
+        ORDER_ID_PATTERN,
+        "order",
+      );
+      if (!json.ok) return json;
+      const parsed = orderSchema.safeParse(json.value);
+      if (!parsed.success) return lookupErr("malformed", "order lookup result failed validation");
+      const p = parsed.data;
+      if (p.id !== id) return lookupErr("id_mismatch", "order lookup returned a different order");
+      return ok({ id: p.id, amountPaise: p.amount, currency: p.currency });
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------------------------------------------

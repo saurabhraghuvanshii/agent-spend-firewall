@@ -54,8 +54,16 @@ export const AUDIT_OUTCOMES = [
 export interface RecordAttemptInput {
   sessionId: string;
   tool: string;
-  /** Raw tool arguments (with `reason` already stripped or not — it is redacted either way). */
+  /**
+   * Tool arguments exactly as FORWARDED (post-transform; `reason` stripped). Redacted before hashing. History /
+   * velocity read these (D-026).
+   */
   args: unknown;
+  /**
+   * The agent's ORIGINAL args, only when a `transform` changed them. Redacted the same way as `args` and stored as
+   * `originalArgsRedacted`. If they can't be canonicalised the whole attempt fails like invalid `args` would.
+   */
+  originalArgs?: unknown;
   reason: string;
   decision: AuditDecisionInput;
   matchedRules: readonly string[];
@@ -198,6 +206,7 @@ const attemptInputSchema = z.object({
   sessionId: nonEmpty,
   tool: nonEmpty,
   args: z.unknown(),
+  originalArgs: z.unknown().optional(),
   reason: z.string(),
   decision: z.enum(AUDIT_DECISIONS),
   matchedRules: z.array(z.string()),
@@ -244,6 +253,7 @@ const storedAttemptSchema = z.strictObject({
   sessionId: z.string(),
   tool: z.string(),
   argsRedacted: jsonValueSchema,
+  originalArgsRedacted: jsonValueSchema.optional(),
   reason: z.string(),
   decision: z.enum(AUDIT_DECISIONS),
   matchedRules: z.array(z.string()),
@@ -288,6 +298,7 @@ function toCoreBody(b: StoredBody): AuditBody {
       decision: b.decision,
       matchedRules: b.matchedRules,
     };
+    if (b.originalArgsRedacted !== undefined) body.originalArgsRedacted = b.originalArgsRedacted;
     if (b.approver !== undefined) body.approver = b.approver;
     return body;
   }
@@ -737,7 +748,10 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         const ts = resolveTs(p.ts);
         if (!ts.ok) return ts;
 
-        const args = redactArgs(p.args);
+        // `originalArgs` (transform only) is validated together with `args`: if either can't be audited, the
+        // attempt becomes an invalid-args deny trail and no original args are stored.
+        const original = p.originalArgs === undefined ? undefined : redactArgs(p.originalArgs);
+        const args = original === undefined || original.ok ? redactArgs(p.args) : original;
         const body: AuditAttemptBody = {
           kind: "attempt",
           id: id.value,
@@ -753,6 +767,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
 
         if (args.ok) {
           body.argsRedacted = args.value;
+          if (original?.ok === true) body.originalArgsRedacted = original.value;
           return appendTx.immediate({ body, callerTs: ts.value.callerTs });
         }
 

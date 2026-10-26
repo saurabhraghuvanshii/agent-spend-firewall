@@ -461,3 +461,16 @@ describe("redactText — round-2 security review findings", () => {
     expect(redactText(s)).toBe(s);
   });
 });
+
+describe("redact — OTPs (T008)", () => {
+  it("redacts otp_string but keeps payment_id", () => {
+    expect(redact({ payment_id: "pay_29QQoUBi66xm2f", otp_string: "123456" })).toEqual({
+      payment_id: "pay_29QQoUBi66xm2f",
+      otp_string: REDACTED,
+    });
+  });
+
+  it.each(["OTP", "otp", "Otp-String", "OTP_STRING"])("redacts key %s at any depth", (key) => {
+    expect(redact({ nested: [{ [key]: 123456 }] })).toEqual({ nested: [{ [key]: REDACTED }] });
+  });
+});

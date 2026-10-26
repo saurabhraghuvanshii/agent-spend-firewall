@@ -37,11 +37,38 @@ agent (Claude Code / Desktop / Inspector) ──stdio──▶ @asf/proxy ──
 
 Optional settings:
 
-| Variable                  | Default       | Notes                                                                                                   |
-| ------------------------- | ------------- | ------------------------------------------------------------------------------------------------------- |
-| `ASF_UPSTREAM_TIMEOUT_MS` | `30000`       | Per-call upstream timeout, 1000–600000. A timed-out call returns `upstream_timeout` and is not retried. |
-| `ASF_RAZORPAY_MCP_IMAGE`  | pinned digest | Image override. Read from the **shell** environment only (ignored in `.env`).                           |
-| `DOCKER_HOST`, …          | —             | Docker client settings, shell environment only.                                                         |
+| Variable                  | Default               | Notes                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ASF_UPSTREAM_TIMEOUT_MS` | `30000`               | Per-call upstream timeout, 1000–600000. A timed-out call returns `upstream_timeout` and is not retried.                                                                                                                                                                                                                                                                                      |
+| `ASF_POLICY`              | `policies/default.ts` | **Shell environment only** (a value only in `.env` is ignored with a note). Policy file (`.ts`/`.js`/`.mjs`) **inside the repo** (symlinks resolved). Must compile and use `default: "deny"`, else the proxy exits 2.                                                                                                                                                                        |
+| `ASF_AUDIT_DB`            | `data/audit.db`       | **Shell environment only** (a value only in `.env` is ignored with a note). Audit log SQLite file; must be **inside `<repo>/data/`** (relative paths resolve against the repo root; the parent directory's real path is checked, and the file must not be a symlink) ⇒ else exit 2. `<repo>/data/` is created if missing; other subdirectories must already exist. Can't be opened ⇒ exit 2. |
+| `ASF_LOCK_WAIT_MS`        | `5000`                | Max wait (1–60000 ms) for the money-path locks; a call that waits longer is denied `firewall.busy`.                                                                                                                                                                                                                                                                                          |
+| `ASF_RAZORPAY_MCP_IMAGE`  | pinned digest         | Image override. Read from the **shell** environment only (ignored in `.env`).                                                                                                                                                                                                                                                                                                                |
+| `DOCKER_HOST`, …          | —                     | Docker client settings, shell environment only.                                                                                                                                                                                                                                                                                                                                              |
+
+Why shell-only: the policy decides which money moves and the audit DB is the evidence trail, so they can't be
+redirected by editing `.env` (which is easy to change unnoticed and often copied between machines).
+
+At startup the proxy logs to stderr which policy and audit log are in force, so you can check them:
+
+```
+[asf-proxy] policy policies/default.ts sha256 <hex> loaded (<n> rules)
+[asf-proxy] audit log /…/data/audit.db: <n> records, head hash <hex>
+```
+
+The policy `sha256` covers the **entry file only** (e.g. `policies/default.ts`), not modules it imports, and is
+computed just before the file is imported. Changes in imported helper modules do not change the logged hash.
+
+It prints a `WARNING:` line when the audit DB did not exist and was created empty (payment history starts from
+zero, so duplicate / velocity limits start from zero too — stop the proxy if you expected an existing log), and when
+the audit hash chain does not verify (run `pnpm --filter @asf/proxy audit:verify`).
+
+**Broken audit chain ⇒ money actions disabled.** If the audit hash chain fails verification at startup, the proxy
+still starts and serves read tools, but it logs `WARNING: MONEY ACTIONS ARE DISABLED …` and **every money tool call is
+denied** with `audit_unavailable` ("audit log failed verification at startup; money actions disabled until it is
+repaired"); each such deny is still written to the audit log on a best-effort basis. Repair or replace the audit
+log, then restart the proxy. Attempts that have no outcome (reported by `audit:verify` as a warning) do **not**
+disable money actions. An audit DB that can't be opened or read still makes the proxy exit with code 2.
 
 ## The command
 
@@ -124,10 +151,36 @@ List tools, then try a read tool such as `fetch_all_payments` with `{ "count": 1
 
 ## What to expect
 
-- **Tools**: the same tools the Razorpay MCP server offers (41 for the pinned image), same names and schemas.
-  (Later milestones add a required `reason` field to money tools.)
+- **Tools**: the same tools the Razorpay MCP server offers (41 for the pinned image), same names. Money tools
+  (anything that isn't a known read) require a `reason` (10–500 characters), integer paise amounts and `currency: "INR"`.
+- **Money calls** go through the policy (`ASF_POLICY`) and are written to the audit log before anything is sent:
+  - allowed ⇒ forwarded (without `reason`) and the outcome is audited;
+  - denied ⇒ `isError: true` with `{"decision":"deny","ruleId":…,"message":…}`, never sent;
+  - needs approval ⇒ `{"decision":"pending_approval","approvalId":"apr_…","message":"awaiting human approval; NOT executed"}`
+    (`isError: false`). Until T011 approvals are held in memory only and **never executed**.
+  - Calls acting on a payment (`payment_id`) or an order (`order_id`, e.g. `initiate_payment`, `update_order`) are only
+    allowed for INR payments / orders (`firewall.currency_not_inr`); the proxy looks them up via `fetch_payment` /
+    `fetch_order` first and denies if the lookup fails (`firewall.payment_lookup_failed` /
+    `firewall.order_lookup_failed`).
+  - Transformed args are re-checked by the firewall for currency (INR), amount validity (positive integer paise)
+    and unchanged top-level `*_id` keys: if a transform changes / adds / removes any top-level `*_id` argument
+    (`firewall.transform_retarget`), sets a non-INR currency or an invalid amount, the call is denied. Any other
+    field a transform changes is trusted as a policy-author change (policy files are trusted code, D-013).
+  - If the audit log can't be written, money calls are denied (`audit_unavailable`); if an outcome can't be recorded
+    after a call was sent, all later money calls are denied until the proxy restarts. If the audit chain failed
+    verification at startup, all money calls are denied from the start (see above).
+- **Every tool result** the agent sees (reads and money tools alike) has card data, tokens and customer / beneficiary
+  PII (email, contact, VPA, names, bank accounts, addresses) replaced with `[REDACTED]`; non-JSON text is
+  pattern-scrubbed and non-text content is removed. Razorpay reference ids are kept only for a fixed allowlist of
+  keys (`customer_id`, `token_id`, `card_id`, `payment_id`, `order_id`, …) whose value carries the matching Razorpay
+  prefix (`cust_`, `token_`, `card_`, `pay_`, `order_`, …); other `*_id` keys and anything inside `notes` stay
+  redacted. The audit log and the proxy's own policy lookups see the unredacted upstream data.
 - **Unknown tool names** (including case variants like `Create_Refund`) are refused without contacting Razorpay:
   `isError: true` with `{"decision":"deny","ruleId":"firewall.unknown_tool","message":…}`.
+- **Not audited:** rejections that happen before a call reaches the firewall pipeline — unknown tool name,
+  arguments that aren't a JSON object (`firewall.invalid_args`), or no usable upstream tool list
+  (`upstream_unavailable`). Nothing is sent upstream in these cases, and neither the tool nor the arguments are
+  trustworthy enough to record. Every money call that does reach the pipeline (including every deny) is audited.
 - **Upstream problems** never crash the proxy. Calls return `isError: true` with
   `{"error":"upstream_unavailable"|"upstream_timeout"|"upstream_error"|"cancelled","message":…,"forwarded":…}`.
   `forwarded: true` means the request may have reached Razorpay — check the resource's status before retrying.

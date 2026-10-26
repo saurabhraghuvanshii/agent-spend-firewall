@@ -29,6 +29,12 @@ export interface AuditAttemptBody {
   tool: string;
   /** Tool arguments after `redact()`. Amounts are integer paise. */
   argsRedacted: JsonValue;
+  /**
+   * The agent's ORIGINAL tool arguments after `redact()`, present only when a `transform` decision changed them
+   * (`argsRedacted` then holds the transformed args that were forwarded). Omitted otherwise; older rows written
+   * before this field existed have no such key and still verify, since `canonicalJson` drops absent/undefined keys.
+   */
+  originalArgsRedacted?: JsonValue;
   /** Agent-supplied justification after `redactText()`. */
   reason: string;
   decision: AuditDecision;

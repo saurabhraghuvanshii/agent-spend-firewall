@@ -11,11 +11,13 @@ import {
   createProxyServer,
   CREDENTIAL_LEAK_RESULT,
   denyResult,
+  forwardReportOf,
   passThroughInterceptor,
   screenResult,
   stableStringify,
   type CallContext,
   type CallInterceptor,
+  type ForwardReport,
   type ProxyServer,
 } from "./server.js";
 import {
@@ -59,6 +61,7 @@ async function setup(
     cachedTools?: readonly DiscoveredTool[];
     callTimeoutMs?: number;
     connectFirst?: boolean;
+    resultFilter?: (tool: string, r: CallToolResult) => CallToolResult;
   } = {},
 ): Promise<Harness> {
   const fake = opts.fake ?? fakeUpstream();
@@ -89,6 +92,7 @@ async function setup(
     sessionId: "session-test",
     ...(opts.cachedTools === undefined ? {} : { cachedTools: opts.cachedTools }),
     ...(opts.callTimeoutMs === undefined ? {} : { callTimeoutMs: opts.callTimeoutMs }),
+    ...(opts.resultFilter === undefined ? {} : { resultFilter: opts.resultFilter }),
   });
   if (opts.connectFirst !== false) await upstream.connect();
   const [agentSide, proxySide] = InMemoryTransport.createLinkedPair();
@@ -748,5 +752,146 @@ describe("screenResult", () => {
     expect(out).toBe(CREDENTIAL_LEAK_RESULT);
     expect(JSON.stringify(out)).not.toMatch(/rzp_test_Key123|TopSecretValue987/);
     expect(out.isError).toBe(true);
+  });
+});
+
+describe("forward reports (T008)", () => {
+  /** Interceptor that captures the report of what `forward` returned. */
+  function capturing(
+    reports: Array<ForwardReport | undefined>,
+    run: (
+      ctx: CallContext,
+      forward: (a: Record<string, unknown>) => Promise<CallToolResult>,
+    ) => Promise<CallToolResult>,
+  ): CallInterceptor {
+    return {
+      intercept: async (ctx, forward) => {
+        const r = await run(ctx, forward);
+        reports.push(forwardReportOf(r));
+        return r;
+      },
+    };
+  }
+  const once = (
+    ctx: CallContext,
+    forward: (a: Record<string, unknown>) => Promise<CallToolResult>,
+  ) => forward({ ...ctx.args });
+
+  it("ok: sent, latency, generation; fresh object per result", async () => {
+    const reports: Array<ForwardReport | undefined> = [];
+    const h = await setup({ interceptor: capturing(reports, once) });
+    await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(reports[0]).toMatchObject({ sent: true, kind: "ok", generation: 1 });
+    expect(Number.isSafeInteger(reports[0]?.latencyMs)).toBe(true);
+    expect(Object.isFrozen(reports[0])).toBe(true);
+  });
+
+  it("credential leak: distinct kind, sent, and a fresh copy of CREDENTIAL_LEAK_RESULT", async () => {
+    const fake = fakeUpstream({
+      handler: () => Promise.resolve({ content: [{ type: "text", text: KEYS.keySecret }] }),
+    });
+    const reports: Array<ForwardReport | undefined> = [];
+    let seen: CallToolResult | undefined;
+    const h = await setup({
+      fake,
+      interceptor: capturing(reports, async (ctx, forward) => {
+        seen = await forward({ ...ctx.args });
+        return seen;
+      }),
+    });
+    const r = await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(reports[0]).toMatchObject({ sent: true, kind: "credential_leak" });
+    expect(seen).not.toBe(CREDENTIAL_LEAK_RESULT);
+    expect(seen).toEqual({ ...CREDENTIAL_LEAK_RESULT });
+    expect(forwardReportOf(CREDENTIAL_LEAK_RESULT)).toBeUndefined();
+    expect(JSON.stringify(r)).not.toContain(KEYS.keySecret);
+  });
+
+  it("upstream timeout: kind upstream_timeout, sent, with requestId", async () => {
+    const fake = fakeUpstream({ handler: (_n, _a, signal) => hang(signal) });
+    const reports: Array<ForwardReport | undefined> = [];
+    const h = await setup({ fake, callTimeoutMs: 20, interceptor: capturing(reports, once) });
+    await call(h.agent, "create_refund", { payment_id: "pay_1", amount: 100 });
+    expect(reports[0]).toMatchObject({ sent: true, kind: "upstream_timeout" });
+    expect(reports[0]?.requestId).toBeDefined();
+  });
+
+  it("refusals (forward twice, invalid args, unknown tool after re-list) are kind refused, not sent", async () => {
+    const reports: Array<ForwardReport | undefined> = [];
+    const h = await setup({
+      interceptor: capturing(reports, async (ctx, forward) => {
+        await forward({ ...ctx.args });
+        return forward({ ...ctx.args });
+      }),
+    });
+    await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(reports[0]).toEqual({ sent: false, kind: "refused", latencyMs: 0 });
+
+    const reports2: Array<ForwardReport | undefined> = [];
+    const h2 = await setup({
+      interceptor: capturing(reports2, (_ctx, forward) =>
+        forward(Object.create({ evil: true }) as Record<string, unknown>),
+      ),
+    });
+    await call(h2.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(reports2[0]).toMatchObject({ sent: false, kind: "refused" });
+  });
+
+  it("upstream unavailable before send: not sent", async () => {
+    const reports: Array<ForwardReport | undefined> = [];
+    const fake = fakeUpstream();
+    const h = await setup({
+      fake,
+      interceptor: capturing(reports, async (ctx, forward) => {
+        await h.fake.dropConnection();
+        fake.setFailing(true);
+        return forward({ ...ctx.args });
+      }),
+    });
+    await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(reports[0]?.sent).toBe(false);
+  });
+
+  it("results built by an interceptor have no report", async () => {
+    const reports: Array<ForwardReport | undefined> = [];
+    const h = await setup({
+      interceptor: capturing(reports, () => Promise.resolve(denyResult("x.y", "no"))),
+    });
+    await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(reports).toEqual([undefined]);
+  });
+});
+
+describe("resultFilter (T008)", () => {
+  it("applies to the agent-facing result only; the interceptor sees the raw one", async () => {
+    let interceptorSaw = "";
+    const h = await setup({
+      interceptor: {
+        intercept: async (ctx, forward) => {
+          const r = await forward({ ...ctx.args });
+          interceptorSaw = textOf(r);
+          return r;
+        },
+      },
+      resultFilter: (tool, r) =>
+        tool === "fetch_payment" ? { ...r, content: [{ type: "text", text: "filtered" }] } : r,
+    });
+    const r = await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(textOf(r)).toBe("filtered");
+    expect(interceptorSaw).toContain("pay_1");
+    const other = await call(h.agent, "fetch_all_payments", { count: 1 });
+    expect(textOf(other)).toContain("fetch_all_payments");
+  });
+
+  it("a throwing filter withholds the result (upstream_error, forwarded reflects the send)", async () => {
+    const h = await setup({
+      resultFilter: () => {
+        throw new Error("filter bug with pay_1 data");
+      },
+    });
+    const r = await call(h.agent, "fetch_payment", { payment_id: "pay_1" });
+    expect(r.isError).toBe(true);
+    expect(jsonOf(r)).toMatchObject({ error: "upstream_error", forwarded: true });
+    expect(h.logs.join("\n")).not.toContain("pay_1 data");
   });
 });

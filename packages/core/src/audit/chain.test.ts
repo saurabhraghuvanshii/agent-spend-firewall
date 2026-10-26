@@ -336,3 +336,50 @@ describe("verifyChain", () => {
     expect(verifyChain(hasher, rows())).toMatchObject({ ok: true, count: 4 });
   });
 });
+
+describe("originalArgsRedacted (T008)", () => {
+  const transformed = (): AuditAttemptBody =>
+    attempt("a3", {
+      decision: "transform",
+      argsRedacted: { payment_id: "pay_1", amount: 20000 },
+      originalArgsRedacted: { payment_id: "pay_1", amount: 50000 },
+    });
+
+  it("verifies a chain mixing rows with and without the field", () => {
+    const chain = chainOf([...bodies(), transformed(), outcome("o3", "a3")]);
+    expect(chain[4]).toHaveProperty("originalArgsRedacted");
+    expect(chain[0]).not.toHaveProperty("originalArgsRedacted");
+    expect(verifyChain(hasher, chain)).toMatchObject({ ok: true, count: 6 });
+  });
+
+  it("hashes an explicitly-undefined field the same as an absent one (old rows stay valid)", () => {
+    const withUndef = { ...attempt("a1"), originalArgsRedacted: undefined } as unknown as AuditBody;
+    const a = unwrap(computeHash(hasher, GENESIS_PREV_HASH, 1, attempt("a1")));
+    const b = unwrap(computeHash(hasher, GENESIS_PREV_HASH, 1, withUndef));
+    expect(b).toBe(a);
+  });
+
+  it("detects tampering with originalArgsRedacted", () => {
+    const chain = chainOf([attempt("a1"), transformed()]);
+    const r = chain[1];
+    if (!r || r.kind !== "attempt") throw new Error("missing");
+    chain[1] = { ...r, originalArgsRedacted: { payment_id: "pay_1", amount: 20000 } };
+    expect(verifyChain(hasher, chain)).toMatchObject({
+      ok: false,
+      brokenAt: { index: 1, reason: "hash_mismatch" },
+    });
+  });
+
+  it("detects removal of originalArgsRedacted", () => {
+    const chain = chainOf([transformed()]);
+    const r = chain[0];
+    if (!r || r.kind !== "attempt") throw new Error("missing");
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { originalArgsRedacted, ...stripped } = r;
+    chain[0] = stripped;
+    expect(verifyChain(hasher, chain)).toMatchObject({
+      ok: false,
+      brokenAt: { index: 0, reason: "hash_mismatch" },
+    });
+  });
+});

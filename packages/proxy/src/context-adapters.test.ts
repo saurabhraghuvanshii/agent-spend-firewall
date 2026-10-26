@@ -24,11 +24,13 @@ import {
 } from "./audit-store.js";
 import {
   createHistoryPort,
+  createOrderLookup,
   createPolicyDeps,
   createRazorpayLookup,
   createStatsPort,
   DEFAULT_LOOKUP_TIMEOUT_MS,
   DEFAULT_OPEN_LOOKBACK_MS,
+  FETCH_ORDER_TOOL,
   FETCH_PAYMENT_TOOL,
   MAX_LOOKUP_TIMEOUT_MS,
   MAX_OPEN_LOOKBACK_MS,
@@ -38,6 +40,7 @@ import {
   type AdapterOpts,
   type UpstreamPaymentPort,
 } from "./context-adapters.js";
+import { classifyTool } from "./tool-classes.js";
 import type { CallOptions, UpstreamCallOutcome } from "./upstream.js";
 
 const T0 = Date.parse("2026-10-23T10:00:00.000Z");
@@ -567,6 +570,119 @@ describe("createRazorpayLookup", () => {
       expect(up.calls).toEqual([]);
     },
   );
+});
+
+// ---------- order lookup ----------
+
+const ORDER = "order_TEST123";
+
+function okOrder(over: Record<string, unknown> = {}): UpstreamCallOutcome {
+  return textResult(
+    JSON.stringify({
+      id: ORDER,
+      entity: "order",
+      amount: 50_000,
+      amount_paid: 0,
+      currency: "INR",
+      status: "created",
+      notes: { email: "someone@example.com" },
+      ...over,
+    }),
+  );
+}
+
+describe("createOrderLookup", () => {
+  it("uses the read tool fetch_order with the lookup timeout and maps id / amount / currency", async () => {
+    expect(classifyTool(FETCH_ORDER_TOOL)).toBe("read");
+    const up = fakeUpstream(() => okOrder());
+    const o = unwrap(await createOrderLookup(opts({ upstream: up })).order(ORDER));
+    expect(o).toEqual({ id: ORDER, amountPaise: 50_000, currency: "INR" });
+    expect(up.calls).toEqual([
+      {
+        name: FETCH_ORDER_TOOL,
+        args: { order_id: ORDER },
+        opts: { timeoutMs: DEFAULT_LOOKUP_TIMEOUT_MS },
+      },
+    ]);
+  });
+
+  it("passes the currency through verbatim (USD stays USD)", async () => {
+    const up = fakeUpstream(() => okOrder({ currency: "USD" }));
+    expect(unwrap(await createOrderLookup(opts({ upstream: up })).order(ORDER)).currency).toBe(
+      "USD",
+    );
+  });
+
+  it.each<[string, UpstreamCallOutcome, string]>([
+    ["isError", textResult("not found", true), "razorpay.upstream_error"],
+    [
+      "timeout",
+      { kind: "error", error: "upstream_timeout", message: "t", forwarded: true },
+      "razorpay.timeout",
+    ],
+    ["not JSON", textResult("order created"), "razorpay.malformed"],
+    ["id mismatch", okOrder({ id: "order_OTHER" }), "razorpay.id_mismatch"],
+    ["float amount", okOrder({ amount: 1.5 }), "razorpay.malformed"],
+    ["negative amount", okOrder({ amount: -1 }), "razorpay.malformed"],
+    ["missing currency", okOrder({ currency: undefined }), "razorpay.malformed"],
+    ["no content", { kind: "ok", result: { content: [] } }, "razorpay.malformed"],
+  ])("fails closed: %s", async (_n, outcome, code) => {
+    const r = await createOrderLookup(opts({ upstream: fakeUpstream(() => outcome) })).order(ORDER);
+    expect(!r.ok && r.error.code).toBe(code);
+    if (!r.ok) expect(JSON.stringify(r.error)).not.toMatch(/example\.com/);
+  });
+
+  it("fails closed on credential material and when upstream throws", async () => {
+    const leaked = okOrder({ notes: { k: "rzp_test_LEAKEDKEY123" } });
+    const redact = (s: string): string => s.replaceAll("rzp_test_LEAKEDKEY123", "[REDACTED]");
+    const r = await createOrderLookup(opts({ upstream: fakeUpstream(() => leaked), redact })).order(
+      ORDER,
+    );
+    expect(!r.ok && r.error.code).toBe("razorpay.credential_leak");
+    const thrower: UpstreamPaymentPort = { callTool: () => Promise.reject(new Error("boom")) };
+    expect((await createOrderLookup(opts({ upstream: thrower })).order(ORDER)).ok).toBe(false);
+  });
+
+  it.each(["", "order_", "ORDER_1", "order_a-b", "pay_123", `order_${"a".repeat(41)}`])(
+    "refuses a bad id %j without calling upstream",
+    async (id) => {
+      const up = fakeUpstream(() => okOrder());
+      const r = await createOrderLookup(opts({ upstream: up })).order(id);
+      expect(!r.ok && r.error.code).toBe("razorpay.invalid_id");
+      expect(up.calls).toEqual([]);
+    },
+  );
+
+  it.each([0, 1.5, MAX_LOOKUP_TIMEOUT_MS + 1])(
+    "rejects an invalid lookup timeout %d",
+    async (t) => {
+      const up = fakeUpstream(() => okOrder());
+      const r = await createOrderLookup(opts({ upstream: up, lookupTimeoutMs: t })).order(ORDER);
+      expect(r.ok).toBe(false);
+      expect(up.calls).toEqual([]);
+    },
+  );
+});
+
+// ---------- open deny attempts ----------
+
+describe("open deny attempts never count", () => {
+  it("a deny attempt with no outcome yet is ignored by history and stats", async () => {
+    seed("deny-open", { decision: "deny", matchedRules: ["refund.hard_cap"] });
+    expect(unwrap(await stats())).toEqual({ amountPaise: 0, count: 0 });
+    expect(
+      unwrap(
+        await createHistoryPort(opts()).hasRecent({
+          tool: TOOL,
+          match: { payment_id: PAY, amount: 10_000 },
+          withinMs: HOUR,
+        }),
+      ),
+    ).toBe(false);
+    // control: the same attempt as allow (open) does count
+    seed("allow-open");
+    expect(unwrap(await stats())).toEqual({ amountPaise: 10_000, count: 1 });
+  });
 });
 
 // ---------- createPolicyDeps shared snapshot ----------

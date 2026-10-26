@@ -1011,3 +1011,55 @@ describe("concurrency", () => {
     );
   });
 });
+
+describe("originalArgs (transform audit, T008)", () => {
+  it("stores originalArgsRedacted redacted like args; round-trips and verifies", () => {
+    const s = open();
+    const a = unwrap(
+      s.recordAttempt(
+        attempt({
+          decision: "transform",
+          args: { payment_id: "pay_123", amount: 10_000 },
+          originalArgs: { payment_id: "pay_123", amount: 50_000, notes: { email: "a@b.co" } },
+        }),
+      ),
+    );
+    expect(a).toMatchObject({
+      argsRedacted: { payment_id: "pay_123", amount: 10_000 },
+      originalArgsRedacted: {
+        payment_id: "pay_123",
+        amount: 50_000,
+        notes: { email: "[REDACTED]" },
+      },
+    });
+    expect(unwrap(s.readAll())[0]).toEqual(a);
+    expect(JSON.stringify(unwrap(s.readAll()))).not.toContain("a@b.co");
+    unwrap(s.readActivitySince(0));
+    verifyOk(s);
+  });
+
+  it("omits the key when originalArgs is absent (older rows still verify)", () => {
+    const s = open();
+    const a = unwrap(s.recordAttempt(attempt()));
+    expect(Object.keys(a)).not.toContain("originalArgsRedacted");
+    const row = raw().prepare("SELECT body_json FROM audit_log WHERE seq = 1").get() as {
+      body_json: string;
+    };
+    expect(row.body_json).not.toContain("originalArgsRedacted");
+    verifyOk(s);
+  });
+
+  it("invalid originalArgs ⇒ audit.invalid_args deny trail without either args", () => {
+    const s = open();
+    const r = s.recordAttempt(
+      attempt({ decision: "transform", originalArgs: { amount: 1.5, vpa: "x@okaxis" } }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("audit.invalid_args");
+    const row = unwrap(s.readAll())[0];
+    expect(row).toMatchObject({ decision: "deny", matchedRules: ["audit.invalid_args"] });
+    expect(Object.keys(row ?? {})).not.toContain("originalArgsRedacted");
+    expect(JSON.stringify(row)).not.toContain("okaxis");
+    verifyOk(s);
+  });
+});
