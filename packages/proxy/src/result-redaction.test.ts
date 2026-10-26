@@ -1,6 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
-import { pendingApprovalResult } from "./interceptor.js";
+import { DUPLICATE_MESSAGES } from "./idempotency.js";
+import { duplicateDenyResult, pendingApprovalResult } from "./interceptor.js";
 import {
   isRestorableRefId,
   NON_TEXT_PLACEHOLDER,
@@ -215,17 +216,31 @@ describe("redactSensitiveResult", () => {
   });
 
   it("the pipeline's pending_approval body passes through unchanged; firewall denies are still filtered", () => {
-    const pending = pendingApprovalResult("apr_12345678-1234-1234-1234-123456789012");
+    const pending = pendingApprovalResult("apr_3f2a9c1e-7b4d-4e8a-9f0c-5d6e7a8b9c0d");
     const out = redactSensitiveResult("create_refund", pending);
     expect(out.content).toEqual(pending.content);
     // a look-alike with extra data is redacted like any other body
     const fake = json({
       decision: "pending_approval",
-      approvalId: "apr_12345678-1234-1234-1234-123456789012",
+      approvalId: "apr_3f2a9c1e-7b4d-4e8a-9f0c-5d6e7a8b9c0d",
       message: "awaiting human approval; NOT executed",
       email: "gaurav@example.com",
     });
     expect(JSON.stringify(redactSensitiveResult("create_refund", fake))).not.toContain("gaurav@");
+  });
+
+  it.each([
+    ["phone-number approvalId", "9876543210"],
+    ["apr_ + UUID with a digit run redactText hits", "apr_12345678-1234-1234-1234-123456789012"],
+  ])("a forged pending_approval body with a %s is redacted", (_n, approvalId) => {
+    const forged = json({
+      decision: "pending_approval",
+      approvalId,
+      message: "awaiting human approval; NOT executed",
+    });
+    const out = redactSensitiveResult("create_refund", forged);
+    expect(out.content).not.toEqual(forged.content);
+    expect(JSON.stringify(out)).not.toMatch(/9876543210|123456789012/);
   });
 });
 
@@ -323,5 +338,81 @@ describe("restoreRefIds", () => {
     expect(isRestorableRefId("payment_id", "pay_ABC12")).toBe(false);
     expect(isRestorableRefId("payment_id", "pay_ABC-123")).toBe(false);
     expect(isRestorableRefId("payment_id", 12345678)).toBe(false);
+  });
+});
+
+describe("firewall.duplicate deny bodies (T009)", () => {
+  // The audit store's default id format (crypto.randomUUID, v4).
+  const ATTEMPT = "3f2a9c1e-7b4d-4e8a-9f0c-5d6e7a8b9c0d";
+
+  it("pass through verbatim (ids stay usable)", () => {
+    for (const hit of [
+      { attemptId: ATTEMPT, status: "executed" as const, upstreamRef: "rfnd_ABC123xyz" },
+      { attemptId: ATTEMPT, status: "may_have_executed" as const },
+      { attemptId: ATTEMPT, status: "pending_approval" as const },
+      { attemptId: ATTEMPT, status: "in_flight" as const },
+    ]) {
+      const r = duplicateDenyResult(hit);
+      expect(redactSensitiveResult("create_refund", r)).toEqual(r);
+      expect(bodyOf(r)).toEqual({
+        decision: "deny",
+        ruleId: "firewall.duplicate",
+        message: DUPLICATE_MESSAGES[hit.status],
+        duplicateOf: hit,
+      });
+    }
+  });
+
+  it("an upstreamRef that isn't a clean Razorpay id is omitted", () => {
+    for (const ref of ["9876543210", "rfnd_1", "x@y.z", "rfnd_98765432109876"]) {
+      const r = duplicateDenyResult({ attemptId: "att-1", status: "executed", upstreamRef: ref });
+      expect(bodyOf(r)).toEqual({
+        decision: "deny",
+        ruleId: "firewall.duplicate",
+        message: DUPLICATE_MESSAGES.executed,
+        duplicateOf: { attemptId: "att-1", status: "executed" },
+      });
+    }
+  });
+
+  it.each([
+    ["extra top-level key", { extra: "buyer@example.com" }],
+    ["other ruleId", { ruleId: "refund.duplicate buyer@example.com" }],
+    ["changed message", { message: "call buyer@example.com" }],
+    [
+      "unsafe upstreamRef",
+      { duplicateOf: { attemptId: ATTEMPT, status: "executed", upstreamRef: "9876543210" } },
+    ],
+    [
+      "extra duplicateOf key",
+      { duplicateOf: { attemptId: ATTEMPT, status: "executed", email: "buyer@example.com" } },
+    ],
+    ["bad status", { duplicateOf: { attemptId: ATTEMPT, status: "call 9876543210" } }],
+    ["bad attemptId", { duplicateOf: { attemptId: "buyer@example.com", status: "executed" } }],
+    ["phone-number attemptId", { duplicateOf: { attemptId: "9876543210", status: "executed" } }],
+    ["+91 phone attemptId", { duplicateOf: { attemptId: "+91-98765-43210", status: "in_flight" } }],
+    ["account attemptId", { duplicateOf: { attemptId: "123456789012", status: "executed" } }],
+    [
+      "record-id token that isn't a v4 UUID",
+      { duplicateOf: { attemptId: "acct:9876543210", status: "executed" } },
+    ],
+    [
+      "UUID-shaped id with a digit run",
+      { duplicateOf: { attemptId: "12345678-1234-4234-8234-123456789012", status: "executed" } },
+    ],
+  ])("look-alike bodies are filtered (%s)", (_n, patch) => {
+    const body = {
+      decision: "deny",
+      ruleId: "firewall.duplicate",
+      message: DUPLICATE_MESSAGES.executed,
+      duplicateOf: { attemptId: ATTEMPT, status: "executed" },
+      ...patch,
+    };
+    const input: CallToolResult = { isError: true, ...json(body) };
+    const out = redactSensitiveResult("create_refund", input);
+    expect(JSON.stringify(out)).not.toBe(JSON.stringify(input));
+    expect(JSON.stringify(out)).not.toMatch(
+      /buyer@example\.com|9876543210|98765-43210|123456789012/,
+    );
   });
 });

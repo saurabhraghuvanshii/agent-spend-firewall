@@ -13,7 +13,6 @@
  * `reasonForDisplay` (`formatUntrustedReason` over the PII-scrubbed reason). Never render `finalArgs` or
  * `untrustedReason` directly: they may contain customer PII, and the reason is attacker-controllable text.
  */
-import { randomUUID } from "node:crypto";
 import {
   canonicalJson,
   err,
@@ -27,6 +26,7 @@ import {
   type JsonValue,
   type Result,
 } from "@asf/core";
+import { redactionSafeUuid } from "./ids.js";
 import { nodeHasher } from "./node-hasher.js";
 
 export interface PendingApprovalRequest {
@@ -100,7 +100,7 @@ export function createInMemoryApprovalStub(): InMemoryApprovalStub {
       requests.push(req);
       if (requests.length > STUB_MAX_REQUESTS)
         requests.splice(0, requests.length - STUB_MAX_REQUESTS);
-      return Promise.resolve(ok({ approvalId: `apr_${randomUUID()}` }));
+      return Promise.resolve(ok({ approvalId: redactionSafeUuid("apr_") }));
     },
   };
 }

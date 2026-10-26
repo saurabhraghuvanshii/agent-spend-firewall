@@ -151,7 +151,7 @@ function nowMs(clock: Clock): Result<number> {
 }
 
 /** Reads audit activity since a cutoff (epoch ms). */
-type ActivityReader = (sinceMs: number) => Result<AuditActivity[]>;
+export type ActivityReader = (sinceMs: number) => Result<AuditActivity[]>;
 
 function directReader(store: ActivitySource): ActivityReader {
   return (sinceMs) => store.readActivitySince(sinceMs);
@@ -163,7 +163,7 @@ function directReader(store: ActivitySource): ActivityReader {
  * too, so one evaluation never sees a mix of failed and successful reads. A cutoff earlier than the snapshot (a
  * window longer than the snapshot, or a clock regression) re-reads and replaces the snapshot.
  */
-function memoisedReader(store: ActivitySource): ActivityReader {
+export function memoisedReader(store: ActivitySource): ActivityReader {
   let cached: { sinceMs: number; result: Result<AuditActivity[]> } | undefined;
   return (sinceMs) => {
     if (cached !== undefined && (!cached.result.ok || sinceMs >= cached.sinceMs)) {
@@ -497,8 +497,17 @@ export function createOrderLookup(o: AdapterOpts): OrderLookupPort {
  * across evaluations would serve stale activity. The engine caches payment lookups per evaluation itself;
  * `excludeAttemptIds` is usually per call.
  */
-export function createPolicyDeps(o: AdapterOpts & { readonly timer: Timer }): PolicyDeps {
-  const read = memoisedReader(o.store);
+export function createPolicyDeps(
+  o: AdapterOpts & {
+    readonly timer: Timer;
+    /**
+     * Shared memoised reader (`memoisedReader`) so the firewall's duplicate check (T009) and the policy use ONE
+     * audit read per call. Must be fresh per call. Default: a new `memoisedReader(o.store)`.
+     */
+    readonly read?: ActivityReader;
+  },
+): PolicyDeps {
+  const read = o.read ?? memoisedReader(o.store);
   return {
     history: historyPort(o, read),
     stats: statsPort(o, read),

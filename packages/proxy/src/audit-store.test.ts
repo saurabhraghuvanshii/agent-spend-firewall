@@ -1063,3 +1063,79 @@ describe("originalArgs (transform audit, T008)", () => {
     verifyOk(s);
   });
 });
+
+describe("idempotencyKey (T009)", () => {
+  const KEY = "a".repeat(63) + "0";
+
+  it("round-trips through readAll / readActivitySince and verifies", () => {
+    const s = open();
+    const a = unwrap(s.recordAttempt(attempt({ idempotencyKey: KEY })));
+    expect(a).toMatchObject({ kind: "attempt", idempotencyKey: KEY });
+    expect(unwrap(s.readAll())[0]).toEqual(a);
+    expect(unwrap(s.readActivitySince(0))[0]?.attempt.idempotencyKey).toBe(KEY);
+    verifyOk(s);
+  });
+
+  it.each([
+    "A".repeat(64),
+    "a".repeat(63),
+    "a".repeat(65),
+    "g".repeat(64),
+    "",
+    " " + "a".repeat(63),
+  ])("rejects malformed key %j (audit.invalid_input, nothing written)", (bad) => {
+    const s = open();
+    const r = s.recordAttempt(attempt({ idempotencyKey: bad }));
+    expect(!r.ok && r.error.code).toBe("audit.invalid_input");
+    expect(unwrap(s.readAll())).toEqual([]);
+  });
+
+  it("is not stored on an audit.invalid_args trail row", () => {
+    const s = open();
+    const r = s.recordAttempt(attempt({ args: { amount: 1.5 }, idempotencyKey: KEY }));
+    expect(!r.ok && r.error.code).toBe("audit.invalid_args");
+    expect(Object.keys(unwrap(s.readAll())[0] ?? {})).not.toContain("idempotencyKey");
+    verifyOk(s);
+  });
+
+  it("legacy rows without a key still read and verify alongside keyed rows", () => {
+    const s = open();
+    const legacy = unwrap(s.recordAttempt(attempt({ id: "att-legacy" })));
+    expect(Object.keys(legacy)).not.toContain("idempotencyKey");
+    unwrap(s.recordAttempt(attempt({ id: "att-keyed", idempotencyKey: KEY })));
+    const row = raw().prepare("SELECT body_json FROM audit_log WHERE seq = 1").get() as {
+      body_json: string;
+    };
+    expect(row.body_json).not.toContain("idempotencyKey");
+    const acts = unwrap(s.readActivitySince(0));
+    expect(acts.map((x) => x.attempt.idempotencyKey)).toEqual([undefined, KEY]);
+    verifyOk(s);
+  });
+
+  it("a stored row with a malformed key (inserted behind the store's back) fails closed", () => {
+    const s = open();
+    unwrap(s.recordAttempt(attempt({ id: "att-1" })));
+    const db = raw();
+    const head = db.prepare("SELECT hash FROM audit_log WHERE seq = 1").get() as { hash: string };
+    const body: Record<string, unknown> = {
+      kind: "attempt",
+      id: "att-bad",
+      ts: "2026-10-23T10:00:00.000Z",
+      sessionId: "s",
+      tool: "create_refund",
+      argsRedacted: { amount: 1 },
+      reason: "r",
+      decision: "allow",
+      matchedRules: [],
+      idempotencyKey: "NOT-HEX",
+    };
+    const canon = unwrap(canonicalJson(body));
+    const hash = nodeHasher.sha256Hex(head.hash + unwrap(canonicalJson({ ...body, seq: 2 })));
+    db.prepare(
+      "INSERT INTO audit_log (seq, id, kind, body_json, prev_hash, hash) VALUES (2, 'att-bad', 'attempt', ?, ?, ?)",
+    ).run(canon, head.hash, hash);
+    expect(s.readActivitySince(0).ok).toBe(false);
+    const v = unwrap(s.verify());
+    expect(v.ok).toBe(false);
+  });
+});

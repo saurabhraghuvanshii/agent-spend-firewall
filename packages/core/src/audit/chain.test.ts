@@ -383,3 +383,104 @@ describe("originalArgsRedacted (T008)", () => {
     });
   });
 });
+
+describe("idempotencyKey (T009)", () => {
+  const KEY = "a".repeat(32) + "0123456789abcdef".repeat(2);
+  const keyed = (key: string = KEY): AuditAttemptBody => attempt("a1", { idempotencyKey: key });
+  // Hash of `attempt("a1")` at seq 1 / genesis, computed with the pre-T009 build (no idempotencyKey support).
+  const LEGACY_A1_HASH = "c9a6cc62cacebb7d00e0413adc91c43e4da9f7186b3d15c830b0d39cbb15c4e2";
+
+  it("builds and verifies an attempt carrying a key, and the key is hashed", () => {
+    const chain = chainOf([keyed(), outcome("o1", "a1")]);
+    expect(chain[0]).toHaveProperty("idempotencyKey", KEY);
+    expect(chain[0]?.hash).not.toBe(LEGACY_A1_HASH);
+    expect(verifyChain(hasher, chain)).toMatchObject({ ok: true, count: 2 });
+  });
+
+  it("legacy attempt without the key hashes exactly as before and verifies", () => {
+    expect(unwrap(computeHash(hasher, GENESIS_PREV_HASH, 1, attempt("a1")))).toBe(LEGACY_A1_HASH);
+    const withUndef = { ...attempt("a1"), idempotencyKey: undefined } as unknown as AuditBody;
+    expect(unwrap(computeHash(hasher, GENESIS_PREV_HASH, 1, withUndef))).toBe(LEGACY_A1_HASH);
+    const chain = chainOf([attempt("a1"), outcome("o1", "a1")]);
+    expect(chain[0]?.hash).toBe(LEGACY_A1_HASH);
+    expect(verifyChain(hasher, chain)).toMatchObject({ ok: true, count: 2 });
+  });
+
+  it("detects changing the key after hashing", () => {
+    const chain = chainOf([keyed(), outcome("o1", "a1")]);
+    const r = chain[0];
+    if (!r || r.kind !== "attempt") throw new Error("missing");
+    chain[0] = { ...r, idempotencyKey: "b".repeat(64) };
+    expect(verifyChain(hasher, chain)).toMatchObject({
+      ok: false,
+      brokenAt: { index: 0, reason: "hash_mismatch" },
+    });
+  });
+
+  it("detects removing the key after hashing", () => {
+    const chain = chainOf([keyed()]);
+    const r = chain[0];
+    if (!r || r.kind !== "attempt") throw new Error("missing");
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { idempotencyKey, ...stripped } = r;
+    chain[0] = stripped;
+    expect(verifyChain(hasher, chain)).toMatchObject({
+      ok: false,
+      brokenAt: { index: 0, reason: "hash_mismatch" },
+    });
+  });
+
+  const bad: [string, unknown][] = [
+    ["uppercase", "A".repeat(64)],
+    ["mixed case", "a".repeat(63) + "F"],
+    ["non-hex", "g".repeat(64)],
+    ["63 chars", "a".repeat(63)],
+    ["65 chars", "a".repeat(65)],
+    ["empty", ""],
+    ["trailing newline", "a".repeat(64) + "\n"],
+    ["number", 123],
+    ["null", null],
+  ];
+
+  it.each(bad)("buildRecord rejects a %s key", (_label, key) => {
+    const body = { ...attempt("a1"), idempotencyKey: key } as unknown as AuditBody;
+    const r = buildRecord(hasher, null, body);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("audit.invalid_idempotency_key");
+  });
+
+  it.each(bad)("verifyChain reports invalid_row for a stored %s key", (_label, key) => {
+    // Simulate a row that bypassed buildRecord: valid-looking hash computed over the bad body.
+    const body = { ...attempt("a1"), idempotencyKey: key } as unknown as AuditBody;
+    const canonHash = hasher.sha256Hex(GENESIS_PREV_HASH + JSON.stringify(body));
+    const row = { ...body, seq: 1, prevHash: GENESIS_PREV_HASH, hash: canonHash };
+    expect(verifyChain(hasher, [row])).toMatchObject({
+      ok: false,
+      brokenAt: { index: 0, seq: 1, id: "a1", reason: "invalid_row" },
+    });
+  });
+
+  it("rejects an outcome record carrying a key (build and verify)", () => {
+    const badOutcome = { ...outcome("o1", "a1"), idempotencyKey: KEY } as unknown as AuditBody;
+    const prev = unwrap(buildRecord(hasher, null, keyed()));
+    const built = buildRecord(hasher, prev, badOutcome);
+    expect(built.ok).toBe(false);
+    if (!built.ok) expect(built.error.code).toBe("audit.invalid_idempotency_key");
+
+    const row = {
+      ...badOutcome,
+      seq: 2,
+      prevHash: prev.hash,
+      hash: hasher.sha256Hex(prev.hash + JSON.stringify(badOutcome)),
+    };
+    expect(verifyChain(hasher, [prev, row])).toMatchObject({
+      ok: false,
+      brokenAt: { index: 1, id: "o1", reason: "invalid_row" },
+    });
+  });
+
+  it("an outcome with an explicitly-undefined key is treated as absent", () => {
+    const o = { ...outcome("o1", "a1"), idempotencyKey: undefined } as unknown as AuditBody;
+    expect(verifyChain(hasher, chainOf([keyed(), o]))).toMatchObject({ ok: true, count: 2 });
+  });
+});

@@ -499,10 +499,17 @@ describe("require_approval", () => {
     });
   });
 
-  it("the pending approval blocks an identical refund (duplicate)", async () => {
+  it("the pending approval blocks an identical refund (firewall duplicate, T009)", async () => {
     const h = await setup();
     await refund(h, { payment_id: "pay_A1", amount: 300_000 });
-    expectDeny(await refund(h, { payment_id: "pay_A1", amount: 300_000 }), "refund.duplicate");
+    const r = await refund(h, { payment_id: "pay_A1", amount: 300_000 });
+    expect(r.isError).toBe(true);
+    expect(jsonOf(r)).toMatchObject({
+      decision: "deny",
+      ruleId: "firewall.duplicate",
+      duplicateOf: { status: "pending_approval" },
+    });
+    expect(h.approvals.requests).toHaveLength(1);
   });
 
   it("approval store failure ⇒ not_forwarded outcome + firewall.approval_unavailable", async () => {
@@ -919,7 +926,7 @@ describe("sensitive data and money-meaningful flags (default policy)", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("concurrency", () => {
-  it("two identical refunds at once ⇒ exactly one create_refund, the other refund.duplicate", async () => {
+  it("two identical refunds at once ⇒ exactly one create_refund, the other firewall.duplicate", async () => {
     const h = await setup();
     const results = await Promise.all([
       refund(h, { payment_id: "pay_A1", amount: 5_000 }),
@@ -928,7 +935,7 @@ describe("concurrency", () => {
     expect(upstreamCalls(h, "create_refund")).toHaveLength(1);
     const denied = results.filter((r) => r.isError === true);
     expect(denied).toHaveLength(1);
-    expect(jsonOf(denied[0])).toMatchObject({ ruleId: "refund.duplicate" });
+    expect(jsonOf(denied[0])).toMatchObject({ ruleId: "firewall.duplicate" });
   });
 
   it("velocity spans payments: 9 recent refunds + two concurrent ⇒ one forwarded, one refund.velocity", async () => {

@@ -2,6 +2,7 @@ import { err, ok, type Result } from "../result.js";
 import { canonicalJson } from "./canonical-json.js";
 import {
   GENESIS_PREV_HASH,
+  IDEMPOTENCY_KEY_RE,
   type AuditBody,
   type AuditRecord,
   type Hasher,
@@ -19,13 +20,39 @@ function bodyOf(record: AuditRecord): AuditBody {
   return body;
 }
 
-/** `hash = sha256Hex(prevHash + canonicalJson({ ...body, seq }))`. Never throws. */
+/**
+ * `idempotencyKey` shape check (T009). Absent/undefined is fine (dropped by `canonicalJson`, so legacy rows hash
+ * unchanged). On an attempt it must be 64 lowercase hex chars; an outcome must never carry one.
+ * Reads the field at runtime because rows come from storage and may not match the static type.
+ */
+function checkIdempotencyKey(body: AuditBody): Result<true> {
+  const key: unknown = (body as { idempotencyKey?: unknown }).idempotencyKey;
+  if (key === undefined) return ok(true);
+  const kind: string = body.kind;
+  if (kind !== "attempt") {
+    return err("audit.invalid_idempotency_key", "only attempt records may carry idempotencyKey");
+  }
+  if (typeof key !== "string" || !IDEMPOTENCY_KEY_RE.test(key)) {
+    return err(
+      "audit.invalid_idempotency_key",
+      "idempotencyKey must be exactly 64 lowercase hex chars",
+    );
+  }
+  return ok(true);
+}
+
+/**
+ * `hash = sha256Hex(prevHash + canonicalJson({ ...body, seq }))`. Never throws.
+ * Rejects (`audit.invalid_idempotency_key`) a malformed `idempotencyKey` or one on an outcome record.
+ */
 export function computeHash(
   h: Hasher,
   prevHash: string,
   seq: number,
   body: AuditBody,
 ): Result<string> {
+  const keyCheck = checkIdempotencyKey(body);
+  if (!keyCheck.ok) return keyCheck;
   const canon = canonicalJson({ ...body, seq });
   if (!canon.ok) return canon;
   let digest: string;

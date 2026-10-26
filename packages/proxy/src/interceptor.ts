@@ -21,14 +21,23 @@
  *     (`initiate_payment`, `update_order`, …) looks the order up via upstream `fetch_order` (`createOrderLookup`);
  *     failure ⇒ deny `firewall.order_lookup_failed`. Currency ≠ exactly "INR" ⇒ deny `firewall.currency_not_inr`.
  *     (`currency` ARGS are already checked by `moneyArgsStage`.)
- *  3. Global money lock (bounded wait `lockWaitMs` ⇒ deny `firewall.busy`) around `evaluate` + `recordAttempt`, since
- *     velocity spans payments. Deps are built fresh per evaluation. For a non-deny decision the args to forward are
+ *  3. Global money lock (bounded wait `lockWaitMs` ⇒ deny `firewall.busy`) around the duplicate check + `evaluate` +
+ *     `recordAttempt`, since velocity spans payments.
+ *     DUPLICATE CHECK (T009, firewall invariant, not disable-able by a policy, every money tool): before `evaluate`
+ *     the idempotency key of the agent's args (`idempotency.ts`) is matched against recent audit activity
+ *     (`findDuplicate`: closed actions within `duplicateWindowMs`, open ones within 24 h). A hit ⇒ deny
+ *     `firewall.duplicate` with `duplicateOf: {attemptId, status, upstreamRef?}` (status executed /
+ *     may_have_executed / pending_approval / in_flight) — no upstream call, no approval, audited as a deny. In-flight
+ *     duplicates are denied at once (never queued). If a transform changed the args, the key of `finalArgs` is
+ *     checked too (after `checkFinalArgs`). Key error ⇒ `firewall.invalid_args`; audit read error / too many rows /
+ *     invalid clock ⇒ `firewall.duplicate_check_failed`. The check and the policy share ONE memoised audit read.
+ *     Deps are built fresh per evaluation. For a non-deny decision the args to forward are
  *     re-checked (`checkFinalArgs`), since a `transform` may have rewritten them: any top-level `*_id` key added,
  *     removed or changed ⇒ `firewall.transform_retarget`; unsafe keys / a `reason` key ⇒ `firewall.invalid_args`;
  *     a non-INR currency at any depth ⇒ `firewall.currency_not_inr`; an invalid amount at any depth ⇒
  *     `firewall.invalid_amount` (all audited as deny). Attempts record the FORWARDED (post-transform) args, plus
- *     `originalArgs` when a transform changed them (D-026). Deny attempts record the agent's args (nothing is
- *     forwarded).
+ *     `originalArgs` when a transform changed them (D-026), and the `idempotencyKey` of the recorded args (T010 uses
+ *     it for verify-before-retry). Deny attempts record the agent's args (nothing is forwarded).
  *  4. `recordAttempt` error ⇒ never forward: `audit.invalid_args` ⇒ outcome `denied` on its trail row + deny
  *     `audit.invalid_args`; anything else ⇒ deny `audit_unavailable`.
  *  5. deny ⇒ outcome `denied` ⇒ `{ decision: "deny", ruleId, message }` (`isError: true`). Never echoes the reason.
@@ -66,9 +75,21 @@ import {
   createOrderLookup,
   createPolicyDeps,
   createRazorpayLookup,
+  DEFAULT_OPEN_LOOKBACK_MS,
+  memoisedReader,
+  type ActivityReader,
   type UpstreamPaymentPort,
 } from "./context-adapters.js";
 import { composeInterceptors, firewallChain, type Next, type Stage } from "./interceptor-chain.js";
+import {
+  DEFAULT_DUPLICATE_WINDOW_MS,
+  DUPLICATE_MESSAGES,
+  findDuplicate,
+  idempotencyKey,
+  MAX_DUPLICATE_WINDOW_MS,
+  MIN_DUPLICATE_WINDOW_MS,
+  type DuplicateHit,
+} from "./idempotency.js";
 import { createKeyedMutex, createMutex, type Release } from "./locks.js";
 import {
   allCurrenciesInr,
@@ -76,7 +97,7 @@ import {
   hasSafeTopLevelKeys,
   isBounded,
 } from "./money-args.js";
-import { PENDING_APPROVAL_MESSAGE } from "./result-redaction.js";
+import { isSafeUpstreamRef, PENDING_APPROVAL_MESSAGE } from "./result-redaction.js";
 import { rewriteMoneySchema } from "./schema-rewrite.js";
 import {
   denyResult,
@@ -108,6 +129,8 @@ export const FIREWALL_RULES = {
   forwardThrew: "firewall.forward_threw",
   approvalUnavailable: "firewall.approval_unavailable",
   notImplemented: "firewall.not_implemented",
+  duplicate: "firewall.duplicate",
+  duplicateCheckFailed: "firewall.duplicate_check_failed",
 } as const;
 
 /** Store surface the pipeline needs. */
@@ -138,6 +161,12 @@ export interface MoneyPipelineOptions {
   /** Payment lookup timeout (see `AdapterOpts.lookupTimeoutMs`). */
   readonly lookupTimeoutMs?: number;
   /**
+   * Duplicate window for CLOSED (executed / possibly executed) actions, integer ms in
+   * `[MIN_DUPLICATE_WINDOW_MS, MAX_DUPLICATE_WINDOW_MS]` (default `DEFAULT_DUPLICATE_WINDOW_MS`, 10 min); anything
+   * else ⇒ `createMoneyPipeline` throws. Open actions (in flight / pending approval) block for 24 h regardless.
+   */
+  readonly duplicateWindowMs?: number;
+  /**
    * T012 seam (kill switch / shadow mode): runs after the guards and before any lock. Returning a deny audits and
    * returns it; throwing ⇒ deny `firewall.internal_error`.
    */
@@ -165,6 +194,11 @@ export interface MoneyPipeline {
   /**
    * T011 seam — NOT IMPLEMENTED: always denies `firewall.not_implemented`.
    *
+   * T009 duplicate check (must be kept when implementing): run `findDuplicate` inside the global lock with
+   * `excludeAttemptIds: new Set([attemptId])` (the approved attempt is open and would otherwise match itself), using
+   * the attempt's STORED `idempotencyKey` (recompute from its `argsRedacted` for legacy rows) as the key; a hit ⇒
+   * deny `firewall.duplicate`.
+   *
    * Intended behaviour: take the same locks as a live call (sorted resource keys (`order:` / `payment:`) → global),
    * re-evaluate the approved attempt's `finalArgs` with `excludeAttemptIds: {attemptId}` (so the pending attempt
    * doesn't count against itself), require the re-evaluated args to hash to `argsHash` (else deny), require a non-deny decision, then forward and record the
@@ -190,6 +224,8 @@ interface DenyRecord {
   readonly args: unknown;
   readonly reason: string;
   readonly matchedRules?: readonly string[];
+  /** Idempotency key of `args`, when known (stored on the deny attempt for forensics). */
+  readonly idempotencyKey?: string;
 }
 
 /** Symbol-keyed slot on `CallContext` holding the envelope's per-call token (module-private). */
@@ -399,10 +435,45 @@ function withRuleId(d: Decision): string[] {
   return d.matchedRules.includes(d.ruleId) ? [...d.matchedRules] : [...d.matchedRules, d.ruleId];
 }
 
+/** Structured `firewall.duplicate` deny (shape passed through verbatim by `redactSensitiveResult`). */
+export function duplicateDenyResult(hit: DuplicateHit): CallToolResult {
+  return jsonErrorResult({
+    decision: "deny",
+    ruleId: FIREWALL_RULES.duplicate,
+    message: DUPLICATE_MESSAGES[hit.status],
+    duplicateOf: {
+      attemptId: hit.attemptId,
+      status: hit.status,
+      // Only a Razorpay-shaped id nothing would redact is shown (else omitted).
+      ...(isSafeUpstreamRef(hit.upstreamRef) ? { upstreamRef: hit.upstreamRef } : {}),
+    },
+  });
+}
+
+/** Valid `duplicateWindowMs` (integer ms within bounds). */
+export function isValidDuplicateWindowMs(v: unknown): v is number {
+  return (
+    typeof v === "number" &&
+    Number.isSafeInteger(v) &&
+    v >= MIN_DUPLICATE_WINDOW_MS &&
+    v <= MAX_DUPLICATE_WINDOW_MS
+  );
+}
+
+/**
+ * @throws RangeError if `o.duplicateWindowMs` is out of range (a configuration error: refuse to build a pipeline
+ * that would silently use a different window).
+ */
 export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
   const log: Logger = o.logger ?? (() => undefined);
   const redact = o.redact ?? noRedact;
   const lockWaitMs = o.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;
+  const duplicateWindowMs = o.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS;
+  if (!isValidDuplicateWindowMs(duplicateWindowMs)) {
+    throw new RangeError(
+      `duplicateWindowMs must be an integer between ${String(MIN_DUPLICATE_WINDOW_MS)} and ${String(MAX_DUPLICATE_WINDOW_MS)}`,
+    );
+  }
   const resourceLocks = createKeyedMutex();
   const globalLock = createMutex();
   const calls = new WeakMap<object, CallInfo>();
@@ -460,6 +531,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       reason: rec.reason,
       decision: "deny",
       matchedRules: rec.matchedRules ?? [ruleId],
+      ...(rec.idempotencyKey === undefined ? {} : { idempotencyKey: rec.idempotencyKey }),
     });
     if (att.ok) {
       recordOutcome(att.value.id, { outcome: "denied", latencyMs: 0 });
@@ -490,6 +562,49 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     info.audited.add(r);
     return r;
   };
+
+  /** Audit a `firewall.duplicate` deny and return it. */
+  const duplicateDenied = (info: CallInfo, rec: DenyRecord, hit: DuplicateHit): CallToolResult => {
+    recordDenied(info, rec, FIREWALL_RULES.duplicate);
+    return mark(info, duplicateDenyResult(hit));
+  };
+
+  /**
+   * Everything `findDuplicate` needs, read once per call through the call's shared memoised reader. `undefined` +
+   * a log line on any failure (caller denies `firewall.duplicate_check_failed`).
+   */
+  const duplicateScope = (
+    read: ActivityReader,
+  ): { rows: Parameters<typeof findDuplicate>[0]; nowMs: number } | { failed: string } => {
+    let now: number;
+    try {
+      now = o.clock.nowMs();
+    } catch (e: unknown) {
+      return { failed: `clock threw ${e instanceof Error ? e.name : typeof e}` };
+    }
+    if (!Number.isSafeInteger(now) || now < 0) return { failed: "clock returned an invalid time" };
+    const rows = read(now - Math.max(duplicateWindowMs, DEFAULT_OPEN_LOOKBACK_MS));
+    if (!rows.ok) return { failed: `audit activity read failed: ${rows.error.code}` };
+    return { rows: rows.value, nowMs: now };
+  };
+
+  const duplicateCheckFailed = (info: CallInfo, base: DenyRecord, why: string): CallToolResult => {
+    log(`duplicate check failed for ${escapeForTerminal(info.tool)}: ${why}; denied`);
+    return auditedDeny(
+      info,
+      base,
+      FIREWALL_RULES.duplicateCheckFailed,
+      "the firewall could not check for a duplicate of this action; the call was not sent",
+    );
+  };
+
+  const keyDenied = (info: CallInfo, base: DenyRecord): CallToolResult =>
+    auditedDeny(
+      info,
+      base,
+      FIREWALL_RULES.invalidArgs,
+      "the arguments could not be keyed for duplicate detection (only integers, strings, booleans, null, arrays and objects); the call was not sent",
+    );
 
   const stage: Stage = async (ctx: CallContext, next: Next): Promise<CallToolResult> => {
     const token = callTokenOf(ctx);
@@ -672,22 +787,67 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     let res: EvalResult;
     let attempt: Result<{ id: string }>;
     try {
-      const deps = createPolicyDeps({ ...adapterBase, timer: o.timer });
+      // 3a. Duplicate check (T009) on the agent's args, sharing one audit read with the policy.
+      const agentKey = idempotencyKey(info.tool, ctx.args);
+      if (!agentKey.ok) return keyDenied(info, base);
+      const read = memoisedReader(o.store);
+      const scope = duplicateScope(read);
+      if ("failed" in scope) return duplicateCheckFailed(info, base, scope.failed);
+      const dupOpts = {
+        nowMs: scope.nowMs,
+        windowMs: duplicateWindowMs,
+        openLookbackMs: DEFAULT_OPEN_LOOKBACK_MS,
+      };
+      const keyedBase: DenyRecord = { ...base, idempotencyKey: agentKey.value };
+      const dup = findDuplicate(scope.rows, info.tool, new Set([agentKey.value]), dupOpts);
+      if (!dup.ok) return duplicateCheckFailed(info, keyedBase, dup.error.code);
+      if (dup.value !== undefined) return duplicateDenied(info, keyedBase, dup.value);
+
+      const deps = createPolicyDeps({ ...adapterBase, timer: o.timer, read });
       res = await evaluate(
         o.policy,
         { tool: info.tool, args: ctx.args, reason, sessionId: ctx.sessionId },
         deps,
       );
+      let recordedKey = agentKey.value;
       if (res.decision.type !== "deny") {
         const bad = checkFinalArgs(ctx, res.finalArgs);
         if (bad !== undefined) {
           return auditedDeny(
             info,
-            { ...base, matchedRules: [...res.decision.matchedRules, bad.ruleId] },
+            { ...keyedBase, matchedRules: [...res.decision.matchedRules, bad.ruleId] },
             bad.ruleId,
             bad.message,
           );
         }
+        // 3b. A transform changed the args: the forwarded action must not duplicate an earlier one either.
+        const finalKey = idempotencyKey(info.tool, res.finalArgs);
+        if (!finalKey.ok) {
+          return keyDenied(info, {
+            ...keyedBase,
+            matchedRules: [...res.decision.matchedRules, FIREWALL_RULES.invalidArgs],
+          });
+        }
+        if (finalKey.value !== agentKey.value) {
+          const dup2 = findDuplicate(
+            scope.rows,
+            info.tool,
+            new Set([agentKey.value, finalKey.value]),
+            dupOpts,
+          );
+          if (!dup2.ok) return duplicateCheckFailed(info, keyedBase, dup2.error.code);
+          if (dup2.value !== undefined) {
+            return duplicateDenied(
+              info,
+              {
+                ...keyedBase,
+                matchedRules: [...res.decision.matchedRules, FIREWALL_RULES.duplicate],
+              },
+              dup2.value,
+            );
+          }
+        }
+        recordedKey = finalKey.value;
       }
       const d = res.decision;
       const transformed = d.type !== "deny" && !sameJson(res.finalArgs, ctx.args);
@@ -699,6 +859,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         reason,
         decision: d.type,
         matchedRules: withRuleId(d),
+        // Key of the recorded args (the forwarded ones for a non-deny decision).
+        idempotencyKey: recordedKey,
       });
     } finally {
       got.value();
@@ -819,7 +981,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       });
       return mark(info, denyResult(FIREWALL_RULES.auditUnavailable, degradedMessage));
     }
-    // T009 seam: `beforeForward(finalArgs, attemptId)` attaches the idempotency key here (before the send).
+    // The attempt's `idempotencyKey` (recorded above) identifies this logical action; T010 uses it to look the
+    // resource up before any retry. Razorpay's MCP tools take no idempotency header, so nothing is attached here.
     let r: CallToolResult;
     try {
       r = await next({ ...ctx, args: res.finalArgs });

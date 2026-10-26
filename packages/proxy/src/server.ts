@@ -106,10 +106,21 @@ export const passThroughInterceptor: CallInterceptor = {
 // Structured results
 // ---------------------------------------------------------------------------------------------------------------
 
+/** The earlier action a `firewall.duplicate` deny refers to (T009). */
+export interface DuplicateOfBody {
+  /** Audit attempt id of the earlier action. */
+  readonly attemptId: string;
+  readonly status: "executed" | "may_have_executed" | "pending_approval" | "in_flight";
+  /** Razorpay id of the executed resource (e.g. `rfnd_…`), when known. */
+  readonly upstreamRef?: string;
+}
+
 export interface DenyBody {
   readonly decision: "deny";
   readonly ruleId: string;
   readonly message: string;
+  /** Only on `firewall.duplicate` denies. */
+  readonly duplicateOf?: DuplicateOfBody;
 }
 
 export interface UpstreamErrorBody {

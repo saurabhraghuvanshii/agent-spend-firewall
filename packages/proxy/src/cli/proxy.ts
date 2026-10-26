@@ -14,6 +14,9 @@
  *   `<repo>/data/` is created if missing; other parent directories must already exist. A value only in `.env` is
  *   ignored (stderr note).
  * - `ASF_LOCK_WAIT_MS` — max wait for the money-path locks, 1..60000, default 5000.
+ * - `ASF_DUPLICATE_WINDOW_MS` — SHELL env only: how long an executed / possibly executed money action blocks an
+ *   identical one (T009), integer ms 60000..86400000, default 600000 (10 min) ⇒ else exit 2. In-flight actions and
+ *   pending approvals block for 24 h regardless.
  * - `ASF_RAZORPAY_MCP_IMAGE` — image override, SHELL env only (like discovery); default is the pinned digest.
  *
  * Why shell-only: the policy decides what money moves and the audit DB is the evidence trail; a `.env` file is
@@ -50,6 +53,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createInMemoryApprovalStub, type ApprovalPort } from "../approval-port.js";
 import { openAuditStore, type AuditStore } from "../audit-store.js";
 import { systemClock, systemTimer } from "../context-adapters.js";
+import {
+  DEFAULT_DUPLICATE_WINDOW_MS,
+  MAX_DUPLICATE_WINDOW_MS,
+  MIN_DUPLICATE_WINDOW_MS,
+} from "../idempotency.js";
 import {
   createFirewallInterceptor,
   createMoneyPipeline,
@@ -100,6 +108,7 @@ export const SHELL_ONLY_SETTINGS = [
   "ASF_RAZORPAY_MCP_IMAGE",
   "ASF_POLICY",
   "ASF_AUDIT_DB",
+  "ASF_DUPLICATE_WINDOW_MS",
 ] as const;
 export const MIN_LOCK_WAIT_MS = 1;
 export const MAX_LOCK_WAIT_MS_CONFIG = 60_000;
@@ -119,6 +128,8 @@ export interface ProxyConfig {
   /** Absolute audit DB path, lexically inside `<repoRoot>/data/` (realpath-confined again by `openFirewall`). */
   readonly auditDbPath: string;
   readonly lockWaitMs: number;
+  /** `ASF_DUPLICATE_WINDOW_MS` (shell env only). */
+  readonly duplicateWindowMs: number;
   /** Non-fatal notes for the log (secret-free). */
   readonly notes: readonly string[];
 }
@@ -161,6 +172,24 @@ export function parseLockWaitMs(raw: string | undefined): Result<number> {
     return err(
       "proxy.bad_lock_wait",
       `ASF_LOCK_WAIT_MS must be between ${String(MIN_LOCK_WAIT_MS)} and ${String(MAX_LOCK_WAIT_MS_CONFIG)}`,
+    );
+  }
+  return ok(n);
+}
+
+export function parseDuplicateWindowMs(raw: string | undefined): Result<number> {
+  if (raw === undefined || raw === "") return ok(DEFAULT_DUPLICATE_WINDOW_MS);
+  if (!/^[0-9]{1,8}$/.test(raw)) {
+    return err(
+      "proxy.bad_duplicate_window",
+      "ASF_DUPLICATE_WINDOW_MS must be an integer number of milliseconds",
+    );
+  }
+  const n = Number(raw);
+  if (n < MIN_DUPLICATE_WINDOW_MS || n > MAX_DUPLICATE_WINDOW_MS) {
+    return err(
+      "proxy.bad_duplicate_window",
+      `ASF_DUPLICATE_WINDOW_MS must be between ${String(MIN_DUPLICATE_WINDOW_MS)} and ${String(MAX_DUPLICATE_WINDOW_MS)}`,
     );
   }
   return ok(n);
@@ -239,6 +268,8 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
     return err("proxy.bad_audit_db", `ASF_AUDIT_DB must be a file inside <repo>/${AUDIT_DB_DIR}/`);
   }
   const rawPolicy = shellValue("ASF_POLICY");
+  const duplicateWindow = parseDuplicateWindowMs(shellValue("ASF_DUPLICATE_WINDOW_MS"));
+  if (!duplicateWindow.ok) return duplicateWindow;
 
   const image = validateImageRef(
     shellValue("ASF_RAZORPAY_MCP_IMAGE") ?? DEFAULT_RAZORPAY_MCP_IMAGE,
@@ -263,6 +294,7 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
     policyPath: rawPolicy,
     auditDbPath,
     lockWaitMs: lockWait.value,
+    duplicateWindowMs: duplicateWindow.value,
     notes,
   });
 }
@@ -488,6 +520,7 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
     redact,
     logger,
     lockWaitMs: config.lockWaitMs,
+    duplicateWindowMs: config.duplicateWindowMs,
     ...(opts.startDegraded === undefined ? {} : { startDegraded: opts.startDegraded }),
   });
   const proxy = createProxyServer({

@@ -24,6 +24,7 @@ import {
   firewallReportLines,
   loadCachedTools,
   openFirewall,
+  parseDuplicateWindowMs,
   parseLockWaitMs,
   parseTimeoutMs,
   resolveProxyConfig,
@@ -882,5 +883,45 @@ describe("startup audit verification ⇒ money pipeline latch (owner decision)",
     expect(r.degraded).toBe(false);
     expect(jsonOf(r.refund)).toMatchObject({ id: "rfnd_LATCH1" });
     expect(r.refundsSent).toHaveLength(1);
+  });
+});
+
+describe("T009 config: ASF_DUPLICATE_WINDOW_MS (shell env only)", () => {
+  it.each([
+    [undefined, 600_000],
+    ["", 600_000],
+    ["60000", 60_000],
+    ["86400000", 86_400_000],
+    ["900000", 900_000],
+  ])("%j ⇒ %d", (raw, n) => {
+    expect(parseDuplicateWindowMs(raw)).toEqual({ ok: true, value: n });
+  });
+
+  it.each(["0", "59999", "86400001", "1.5", "-1", " 60000", "6e4", "123456789"])(
+    "rejects %j",
+    (raw) => {
+      const r = parseDuplicateWindowMs(raw);
+      expect(!r.ok && r.error.code).toBe("proxy.bad_duplicate_window");
+    },
+  );
+
+  it("default, shell override, bad shell value refuses to start", () => {
+    const d = resolveProxyConfig(SHELL, deps());
+    expect(d.ok && d.value.duplicateWindowMs).toBe(600_000);
+    const s = resolveProxyConfig({ ...SHELL, ASF_DUPLICATE_WINDOW_MS: "120000" }, deps());
+    expect(s.ok && s.value.duplicateWindowMs).toBe(120_000);
+    const bad = resolveProxyConfig({ ...SHELL, ASF_DUPLICATE_WINDOW_MS: "10" }, deps());
+    expect(!bad.ok && bad.error.code).toBe("proxy.bad_duplicate_window");
+  });
+
+  it("a value only in .env is ignored with a note", () => {
+    const r = resolveProxyConfig(
+      SHELL,
+      deps({ [`${ROOT}/.env`]: "ASF_DUPLICATE_WINDOW_MS=60000\n" }),
+    );
+    expect(r.ok && r.value.duplicateWindowMs).toBe(600_000);
+    expect(r.ok && r.value.notes.join(" ")).toMatch(
+      /ASF_DUPLICATE_WINDOW_MS from \.env is ignored/,
+    );
   });
 });

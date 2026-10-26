@@ -17,7 +17,6 @@
  *   in `warnings` (the chain itself is still verified by hashes).
  */
 import { mkdirSync } from "node:fs";
-import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -25,6 +24,7 @@ import {
   buildRecord,
   canonicalJson,
   err,
+  IDEMPOTENCY_KEY_RE,
   ok,
   redact,
   redactText,
@@ -40,6 +40,7 @@ import {
   type Result,
   type VerifyResult,
 } from "@asf/core";
+import { redactionSafeUuid } from "./ids.js";
 import { nodeHasher } from "./node-hasher.js";
 
 export const AUDIT_DECISIONS = ["allow", "deny", "require_approval", "transform"] as const;
@@ -72,6 +73,12 @@ export interface RecordAttemptInput {
    * phone number — the audit log is append-only, so PII written here can never be erased.
    */
   approver?: string;
+  /**
+   * Idempotency key of the forwarded args (T009, `idempotency.ts`): exactly 64 lowercase hex chars
+   * (`IDEMPOTENCY_KEY_RE`), else `audit.invalid_input`. Stored verbatim and hashed; omitted when absent. Not stored
+   * on an `audit.invalid_args` trail row (its args were not recorded).
+   */
+  idempotencyKey?: string;
   /** Defaults to `idGen()`. Must match `recordIdSchema`. */
   id?: string;
   /** ISO-8601; defaults to `clock().toISOString()`. */
@@ -199,6 +206,8 @@ export const approverSchema = z
   .regex(/^(?:telegram:[0-9]{1,20}|dashboard:[a-z0-9_-]{1,32})$/);
 /** Upstream resource id, e.g. `rfnd_ABC123xyz` or a UUID. Stored verbatim. */
 export const upstreamRefSchema = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
+/** Idempotency key: 64 lowercase hex chars (core `IDEMPOTENCY_KEY_RE`). */
+export const idempotencyKeySchema = z.string().regex(IDEMPOTENCY_KEY_RE);
 /** Lowercase machine code, e.g. `upstream.timeout`, `bad_request_error`. Stored verbatim. */
 export const errorCodeSchema = z.string().regex(/^[a-z0-9_.:-]{1,64}$/);
 
@@ -211,6 +220,7 @@ const attemptInputSchema = z.object({
   decision: z.enum(AUDIT_DECISIONS),
   matchedRules: z.array(z.string()),
   approver: approverSchema.optional(),
+  idempotencyKey: idempotencyKeySchema.optional(),
   id: recordIdSchema.optional(),
   ts: isoTs.optional(),
 });
@@ -258,6 +268,8 @@ const storedAttemptSchema = z.strictObject({
   decision: z.enum(AUDIT_DECISIONS),
   matchedRules: z.array(z.string()),
   approver: z.string().optional(),
+  // Legacy rows have no key; a present key must be well-formed (core verify reports it otherwise).
+  idempotencyKey: idempotencyKeySchema.optional(),
 });
 
 const storedOutcomeSchema = z.strictObject({
@@ -300,6 +312,7 @@ function toCoreBody(b: StoredBody): AuditBody {
     };
     if (b.originalArgsRedacted !== undefined) body.originalArgsRedacted = b.originalArgsRedacted;
     if (b.approver !== undefined) body.approver = b.approver;
+    if (b.idempotencyKey !== undefined) body.idempotencyKey = b.idempotencyKey;
     return body;
   }
   const body: AuditOutcomeBody = {
@@ -408,7 +421,7 @@ interface ResolvedTs {
 export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> {
   const hasher = opts.hasher ?? nodeHasher;
   const clock = opts.clock ?? (() => new Date());
-  const idGen = opts.idGen ?? (() => randomUUID());
+  const idGen = opts.idGen ?? (() => redactionSafeUuid());
   const isReadonly = opts.readonly ?? false;
   const busyTimeoutMs = opts.busyTimeoutMs ?? 5000;
   const maxActivityRows = opts.maxActivityRows ?? DEFAULT_MAX_ACTIVITY_ROWS;
@@ -768,6 +781,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         if (args.ok) {
           body.argsRedacted = args.value;
           if (original?.ok === true) body.originalArgsRedacted = original.value;
+          if (p.idempotencyKey !== undefined) body.idempotencyKey = p.idempotencyKey;
           return appendTx.immediate({ body, callerTs: ts.value.callerTs });
         }
 
