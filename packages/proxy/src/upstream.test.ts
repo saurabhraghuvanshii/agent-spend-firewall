@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ok } from "@asf/core";
-import { fakeUpstream, hang, lateUpstream } from "./test-support/fake-upstream.js";
+import {
+  fakeUpstream,
+  hang,
+  lateUpstream,
+  scriptedUpstream,
+  type ScriptedReply,
+} from "./test-support/fake-upstream.js";
 import { DEFAULT_RAZORPAY_MCP_IMAGE, redactSecrets } from "./tool-discovery.js";
 import {
   backoffDelayMs,
@@ -8,6 +14,7 @@ import {
   dockerSpawnFor,
   dockerUpstreamFactory,
   formatStderrTail,
+  responseFailure,
   Upstream,
   upstreamContainerName,
   upstreamDockerRmArgs,
@@ -352,6 +359,37 @@ describe("late responses and transport errors (no payload in logs)", () => {
     '"result"',
   ];
 
+  it("T010: late answers carry ONLY a failure boolean (JSON-RPC error, or result.isError === true)", async () => {
+    const replies: ScriptedReply[] = [
+      { delayMs: 40, result: { content: [{ type: "text", text: "ok" }] } },
+      {
+        delayMs: 40,
+        result: { isError: true, content: [{ type: "text", text: "BAD 4111111111111111" }] },
+      },
+      { delayMs: 40, error: { code: -32603, message: "boom bob@example.com" } },
+    ];
+    const up = scriptedUpstream({ tools: [], handler: () => replies.shift() ?? { never: true } });
+    const logs: string[] = [];
+    const u = new Upstream({ factory: up.factory, logger: (l) => logs.push(l) });
+    open.push(u);
+    const events: LateResponse[] = [];
+    u.onLateResponse((e) => events.push(e));
+    for (let i = 0; i < 3; i++) {
+      await u.callTool("create_refund", { amount: 100 }, { timeoutMs: 10 });
+    }
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(3);
+    });
+    expect(events.map((e) => [e.responseType, e.isError])).toEqual([
+      ["result", false],
+      ["result", true],
+      ["error", true],
+    ]);
+    const all = logs.join("\n");
+    expect(all).not.toContain("4111111111111111");
+    expect(all).not.toContain("bob@example.com");
+  });
+
   it("a response after timeout logs only a fixed category and emits payload-free metadata", async () => {
     const late = lateUpstream({ delayMs: 60, result: PII });
     const logs: string[] = [];
@@ -386,11 +424,70 @@ describe("late responses and transport errors (no payload in logs)", () => {
     expect(typeof e?.sentAt).toBe("number");
     expect(e?.receivedAt).toBeGreaterThan(e?.sentAt ?? Infinity);
     expect(Object.keys(e ?? {}).sort()).toEqual(
-      ["generation", "receivedAt", "requestId", "responseType", "sentAt", "tool"].sort(),
+      [
+        "failure",
+        "generation",
+        "isError",
+        "receivedAt",
+        "requestId",
+        "responseType",
+        "sentAt",
+        "tool",
+      ].sort(),
     );
     const all = logs.join("\n");
     expect(all).toContain("late/unknown response id");
     for (const f of PII_FRAGMENTS) expect(all).not.toContain(f);
+  });
+
+  it.each([
+    ["context canceled", "ambiguous"],
+    ["BAD_REQUEST_ERROR: The refund amount is invalid", "definite_rejection"],
+    ["BAD_REQUEST_ERROR then GATEWAY_ERROR", "ambiguous"],
+  ] as const)(
+    "a late isError result (%s) carries only its failure classification (%s)",
+    async (text, failure) => {
+      const late = lateUpstream({
+        delayMs: 40,
+        result: { isError: true, content: [{ type: "text", text }] },
+      });
+      const logs: string[] = [];
+      const u = new Upstream({ factory: late.factory, logger: (l) => logs.push(l), redact });
+      open.push(u);
+      const events: LateResponse[] = [];
+      u.onLateResponse((e) => events.push(e));
+      await u.callTool("create_refund", { payment_id: "pay_1", amount: 100 }, { timeoutMs: 10 });
+      await vi.waitFor(() => {
+        expect(events).toHaveLength(1);
+      });
+      expect(events[0]).toMatchObject({ isError: true, failure, responseType: "result" });
+      expect(JSON.stringify(events[0])).not.toContain(text);
+      expect(logs.join("\n")).not.toContain(text);
+    },
+  );
+
+  it("responseFailure: JSON-RPC error ⇒ ambiguous; success ⇒ none", () => {
+    expect(
+      responseFailure({
+        jsonrpc: "2.0",
+        id: 1,
+        error: { code: -32603, message: "BAD_REQUEST_ERROR" },
+      }),
+    ).toBe("ambiguous");
+    expect(
+      responseFailure({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { content: [{ type: "text", text: "{}" }] },
+      }),
+    ).toBe("none");
+    expect(
+      responseFailure({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { isError: true, content: [{ type: "text", text: "BAD_REQUEST_ERROR" }] },
+      }),
+    ).toBe("definite_rejection");
   });
 
   it("a stdio parse error logs the class and category, never the message", async () => {

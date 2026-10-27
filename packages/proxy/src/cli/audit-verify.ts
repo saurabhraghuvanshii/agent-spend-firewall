@@ -7,6 +7,9 @@
  *
  * Exit codes: 0 chain OK, 1 chain broken, 2 cannot open/read the DB, bad usage, or any unexpected error.
  *
+ * T010: the chain check covers `verification` records and attempt `retryOf` links (core `verifyChain`); an OK report
+ * also counts verifications / retries and lists actions whose latest verification is `unknown` (flagged for a human).
+ *
  * Every dynamic value printed (path, ids, error messages, warnings) goes through `escapeForTerminal`, so a
  * crafted id or path cannot inject newlines or ANSI escape sequences and forge the verdict.
  */
@@ -131,6 +134,26 @@ function runVerifyUnsafe(argv: readonly string[], env: CliEnv, cwd: string): Run
       `head: ${esc(v.headHash)}`,
       ...storeWarnings,
     ];
+    // T010: verification records (settling timeouts / upstream errors) and actions still flagged for a human.
+    const all = store.readAll();
+    if (all.ok) {
+      let verifications = 0;
+      let retries = 0;
+      for (const r of all.value) {
+        if ("invalid" in r) continue;
+        if (r.kind === "verification") verifications++;
+        else if (r.kind === "attempt" && r.retryOf !== undefined) retries++;
+      }
+      lines.push(`verifications: ${String(verifications)}; retries: ${String(retries)}`);
+    }
+    const flagged = store.listNeedsHuman();
+    if (!flagged.ok) {
+      lines.push(`WARNING: could not list actions flagged for a human: ${esc(flagged.error.code)}`);
+    } else if (flagged.value.length > 0) {
+      lines.push(
+        `WARNING: ${String(flagged.value.length)} money action(s) may have executed and need a human (verification unknown): ${flagged.value.map((a) => `${esc(a.attempt.id)} (${esc(a.attempt.tool)})`).join(", ")}`,
+      );
+    }
     if (v.danglingAttempts.length > 0) {
       lines.push(
         `WARNING: ${String(v.danglingAttempts.length)} attempt(s) without an outcome: ${v.danglingAttempts.map(esc).join(", ")}`,

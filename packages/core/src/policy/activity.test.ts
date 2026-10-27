@@ -1,7 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { redact, REDACTED } from "../audit/redact.js";
-import type { AuditDecision, AuditOutcome, JsonValue } from "../audit/types.js";
-import { activityTs, argsMatch, countsTowardLimits } from "./activity.js";
+import type {
+  AuditDecision,
+  AuditOutcome,
+  AuditVerificationResult,
+  JsonValue,
+} from "../audit/types.js";
+import {
+  activityStatus,
+  activityTs,
+  argsMatch,
+  blocksIndefinitely,
+  countsTowardLimits,
+  latestVerifications,
+  type Countable,
+} from "./activity.js";
 import type { Args } from "./types.js";
 
 describe("countsTowardLimits", () => {
@@ -195,5 +208,101 @@ describe("activityTs", () => {
 
   it("non-string input ⇒ undefined", () => {
     expect(activityTs(123 as unknown as string)).toBeUndefined();
+  });
+});
+
+describe("verification-aware counting (T010, D-023 amendment)", () => {
+  const counted: AuditDecision[] = ["allow", "transform", "require_approval"];
+  const unclear: AuditOutcome[] = ["timeout", "upstream_error"];
+
+  it.each(counted.flatMap((d) => unclear.map((o) => [d, o] as const)))(
+    "%s × %s: not_happened ⇒ not counted; happened ⇒ executed; unknown ⇒ unknown, blocks indefinitely",
+    (decision, outcome) => {
+      const c = (verification?: AuditVerificationResult): Countable =>
+        verification === undefined ? { decision, outcome } : { decision, outcome, verification };
+      expect(activityStatus(c())).toBe("may_have_executed");
+      expect(blocksIndefinitely(c())).toBe(false);
+      expect(countsTowardLimits(c("not_happened"))).toBe(false);
+      expect(activityStatus(c("not_happened"))).toBe("not_counted");
+      expect(activityStatus(c("happened"))).toBe("executed");
+      expect(countsTowardLimits(c("happened"))).toBe(true);
+      expect(blocksIndefinitely(c("happened"))).toBe(false);
+      expect(activityStatus(c("unknown"))).toBe("unknown");
+      expect(countsTowardLimits(c("unknown"))).toBe(true);
+      expect(blocksIndefinitely(c("unknown"))).toBe(true);
+    },
+  );
+
+  it("no verification keeps D-023 statuses", () => {
+    expect(activityStatus({ decision: "allow" })).toBe("open");
+    expect(activityStatus({ decision: "allow", outcome: "success" })).toBe("executed");
+    expect(activityStatus({ decision: "allow", outcome: "denied" })).toBe("not_counted");
+    expect(activityStatus({ decision: "allow", outcome: "not_forwarded" })).toBe("not_counted");
+    expect(activityStatus({ decision: "deny" })).toBe("not_counted");
+  });
+
+  it("a success outcome is authoritative: a not_happened verification cannot uncount it", () => {
+    const a: Countable = { decision: "allow", outcome: "success", verification: "not_happened" };
+    expect(activityStatus(a)).toBe("executed");
+    expect(countsTowardLimits(a)).toBe(true);
+  });
+
+  it("deny never counts, whatever the verification", () => {
+    for (const v of ["happened", "not_happened", "unknown"] as const) {
+      expect(countsTowardLimits({ decision: "deny", outcome: "timeout", verification: v })).toBe(
+        false,
+      );
+    }
+  });
+
+  it("happened / unknown count even on an outcome that would not (fail closed)", () => {
+    expect(
+      activityStatus({ decision: "allow", outcome: "not_forwarded", verification: "happened" }),
+    ).toBe("executed");
+    expect(activityStatus({ decision: "allow", outcome: "denied", verification: "unknown" })).toBe(
+      "unknown",
+    );
+  });
+
+  it("a verification value outside the schema is treated as unknown (keeps blocking)", () => {
+    const a: Countable = {
+      decision: "allow",
+      outcome: "timeout",
+      verification: "weird" as AuditVerificationResult,
+    };
+    expect(activityStatus(a)).toBe("unknown");
+    expect(blocksIndefinitely(a)).toBe(true);
+  });
+
+  it("latestVerifications picks the highest seq per attempt, in any order", () => {
+    const m = latestVerifications([
+      { attemptId: "a1", seq: 9, result: "happened" },
+      { attemptId: "a1", seq: 4, result: "unknown" },
+      { attemptId: "a2", seq: 5, result: "unknown" },
+      { attemptId: "a2", seq: 7, result: "not_happened" },
+      { attemptId: "a3", seq: 6, result: "unknown" },
+    ]);
+    expect(Object.fromEntries(m)).toEqual({
+      a1: "happened",
+      a2: "not_happened",
+      a3: "unknown",
+    });
+    expect(latestVerifications([]).size).toBe(0);
+  });
+});
+
+describe("activityTs with a verification timestamp (T010)", () => {
+  const A = "2026-10-23T10:00:00.000Z";
+  const O = "2026-10-23T10:00:10.000Z";
+  const V = "2026-10-23T11:00:00.000Z";
+
+  it("uses the latest of attempt, outcome and verification", () => {
+    expect(activityTs(A, O, V)).toBe(Date.parse(V));
+    expect(activityTs(A, V, O)).toBe(Date.parse(V));
+    expect(activityTs(A, undefined, V)).toBe(Date.parse(V));
+  });
+
+  it("an unparseable verification timestamp ⇒ undefined (inside every window)", () => {
+    expect(activityTs(A, O, "not a date")).toBeUndefined();
   });
 });

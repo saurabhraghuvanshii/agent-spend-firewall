@@ -311,7 +311,7 @@ function rows(h: Harness): { attempts: AuditAttemptRecord[]; outcomes: AuditOutc
   for (const r of all) {
     if ("invalid" in r) throw new Error("invalid row");
     if (r.kind === "attempt") attempts.push(r);
-    else outcomes.push(r);
+    else if (r.kind === "outcome") outcomes.push(r);
   }
   return { attempts, outcomes };
 }
@@ -339,15 +339,17 @@ describe("allow", () => {
     const r = await refund(h, { payment_id: "pay_A1", amount: 5_000 });
     expect(r.isError).not.toBe(true);
     expect(jsonOf(r)).toMatchObject({ id: "rfnd_T" + String(refundSeq), entity: "refund" });
-    expect(upstreamCalls(h, "create_refund").map((c) => c.args)).toEqual([
-      { payment_id: "pay_A1", amount: 5_000 },
-    ]);
     const { attempts, outcomes } = rows(h);
+    // T010: the forwarded (and recorded) refund carries the attempt id as its notes marker.
+    const marker = { asf_attempt: attempts[0]?.id };
+    expect(upstreamCalls(h, "create_refund").map((c) => c.args)).toEqual([
+      { payment_id: "pay_A1", amount: 5_000, notes: marker },
+    ]);
     expect(attempts).toHaveLength(1);
     expect(attempts[0]).toMatchObject({
       tool: "create_refund",
       decision: "allow",
-      argsRedacted: { payment_id: "pay_A1", amount: 5_000 },
+      argsRedacted: { payment_id: "pay_A1", amount: 5_000, notes: marker },
       reason: REASON,
       sessionId: "sess-test",
       matchedRules: ["refund.allow"],
@@ -422,13 +424,13 @@ describe("transform", () => {
     const h = await setup({ policy: CLAMP });
     const r = await refund(h, { payment_id: "pay_A1", amount: 5_000 });
     expect(r.isError).not.toBe(true);
-    expect(upstreamCalls(h, "create_refund").map((c) => c.args)).toEqual([
-      { payment_id: "pay_A1", amount: 1_000 },
-    ]);
     const a = rows(h).attempts[0];
+    expect(upstreamCalls(h, "create_refund").map((c) => c.args)).toEqual([
+      { payment_id: "pay_A1", amount: 1_000, notes: { asf_attempt: a?.id } },
+    ]);
     expect(a).toMatchObject({
       decision: "transform",
-      argsRedacted: { payment_id: "pay_A1", amount: 1_000 },
+      argsRedacted: { payment_id: "pay_A1", amount: 1_000, notes: { asf_attempt: a?.id } },
       originalArgsRedacted: { payment_id: "pay_A1", amount: 5_000 },
     });
     expect(outcomeOf(h, a?.id ?? "")?.outcome).toBe("success");
@@ -597,6 +599,8 @@ function failing(s: AuditStore, flags: { attempt?: boolean; outcome?: boolean })
       flags.attempt === true ? err("audit.write_failed", "disk full") : s.recordAttempt(i),
     recordOutcome: (i) =>
       flags.outcome === true ? err("audit.write_failed", "disk full") : s.recordOutcome(i),
+    recordVerification: (i) => s.recordVerification(i),
+    readUnsettled: () => s.readUnsettled(),
     readActivitySince: (ms) => s.readActivitySince(ms),
   };
 }
@@ -685,24 +689,27 @@ describe("startDegraded (audit chain failed verification at startup)", () => {
 });
 
 describe("upstream failures are audited", () => {
-  it("tool-level error (isError) ⇒ upstream_error upstream.tool_error", async () => {
-    const h = await setup({ policy: ALLOW_REFUNDS });
-    h.refundHandler.fn = () =>
-      Promise.resolve({ isError: true, content: [{ type: "text", text: "BAD_REQUEST_ERROR" }] });
-    const r = await refund(h, { payment_id: "pay_A1", amount: 1_000 });
-    expect(r.isError).toBe(true);
-    const a = rows(h).attempts[0];
-    expect(outcomeOf(h, a?.id ?? "")).toMatchObject({
-      outcome: "upstream_error",
-      errorCode: "upstream.tool_error",
-    });
+  it("tool-level error (isError): definite rejection ⇒ upstream.rejected; anything else ⇒ upstream.tool_error", async () => {
+    for (const [text, errorCode] of [
+      ["BAD_REQUEST_ERROR", "upstream.rejected"],
+      ["context canceled", "upstream.tool_error"],
+      ["BAD_REQUEST_ERROR after SERVER_ERROR", "upstream.tool_error"],
+    ] as const) {
+      const h = await setup({ policy: ALLOW_REFUNDS });
+      h.refundHandler.fn = () =>
+        Promise.resolve({ isError: true, content: [{ type: "text", text }] });
+      const r = await refund(h, { payment_id: "pay_A1", amount: 1_000 });
+      expect(r.isError).toBe(true);
+      const a = rows(h).attempts[0];
+      expect(outcomeOf(h, a?.id ?? "")).toMatchObject({ outcome: "upstream_error", errorCode });
+    }
   });
 
-  it("timeout ⇒ timeout outcome (forwarded: true for the agent)", async () => {
+  it("timeout ⇒ timeout outcome, then verified (unverifiable here ⇒ unknown, flagged)", async () => {
     const h = await setup({ policy: ALLOW_REFUNDS, callTimeoutMs: 30 });
     h.refundHandler.fn = (_a, signal) => hang(signal);
     const r = await refund(h, { payment_id: "pay_A1", amount: 1_000 });
-    expect(jsonOf(r)).toMatchObject({ error: "upstream_timeout", forwarded: true });
+    expect(jsonOf(r)).toMatchObject({ outcome: "unknown", flaggedForHuman: true });
     const a = rows(h).attempts[0];
     expect(outcomeOf(h, a?.id ?? "")).toMatchObject({
       outcome: "timeout",
@@ -1418,6 +1425,8 @@ describe("pipeline failure paths", () => {
           return r;
         },
         recordOutcome: (i) => s.recordOutcome(i),
+        recordVerification: (i) => s.recordVerification(i),
+        readUnsettled: () => s.readUnsettled(),
         readActivitySince: (ms) => s.readActivitySince(ms),
       }),
     });
@@ -1448,7 +1457,8 @@ describe("pipeline failure paths", () => {
       () => Promise.reject(new Error("socket hang up")),
     );
     expect(r.isError).toBe(true);
-    expect(jsonOf(r)).toMatchObject({ error: "upstream_error", forwarded: true });
+    // T010: it may have been sent ⇒ verified; the refund list is unreadable here ⇒ unknown, flagged.
+    expect(jsonOf(r)).toMatchObject({ outcome: "unknown", flaggedForHuman: true });
     const a = rows(h).attempts[0];
     expect(outcomeOf(h, a?.id ?? "")).toMatchObject({
       outcome: "upstream_error",

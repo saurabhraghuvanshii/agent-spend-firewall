@@ -908,3 +908,60 @@ describe("defaultPolicy with real adapters", () => {
     expect(r.decision.type).toBe("allow");
   });
 });
+
+describe("T010: verifications in history / stats", () => {
+  it("not_happened is not counted; happened counts; unknown counts even outside the window", async () => {
+    const s = unwrap(openAuditStore({ path: ":memory:" }));
+    const now = Date.now();
+    const iso = (ago: number): string => new Date(now - ago).toISOString();
+    const add = (
+      id: string,
+      ago: number,
+      amount: number,
+      result: "happened" | "not_happened" | "unknown",
+    ): void => {
+      unwrap(
+        s.recordAttempt({
+          id,
+          ts: iso(ago),
+          sessionId: "s",
+          tool: TOOL,
+          args: { payment_id: PAY, amount },
+          reason: "r",
+          decision: "allow",
+          matchedRules: [],
+        }),
+      );
+      unwrap(s.recordOutcome({ attemptId: id, ts: iso(ago), outcome: "timeout", latencyMs: 1 }));
+      unwrap(
+        s.recordVerification({
+          attemptId: id,
+          ts: iso(ago),
+          trigger: "timeout",
+          result,
+          method: "refund_notes_marker",
+          needsHuman: result === "unknown",
+        }),
+      );
+    };
+    add("u-old", 3 * HOUR, 300, "unknown"); // outside a 1 h window, still counted
+    add("n1", 10 * MIN, 1_000, "not_happened");
+    add("h1", 5 * MIN, 50, "happened");
+    const upstream: UpstreamPaymentPort = {
+      callTool: () => Promise.reject(new Error("unused")),
+    };
+    const stats = createStatsPort({ store: s, upstream, clock: systemClock });
+    expect(unwrap(await stats.sumLast({ tools: [TOOL], windowMs: HOUR }))).toEqual({
+      amountPaise: 350,
+      count: 2,
+    });
+    const history = createHistoryPort({ store: s, upstream, clock: systemClock });
+    expect(
+      unwrap(await history.hasRecent({ tool: TOOL, match: { amount: 1_000 }, withinMs: HOUR })),
+    ).toBe(false);
+    expect(
+      unwrap(await history.hasRecent({ tool: TOOL, match: { amount: 300 }, withinMs: MIN })),
+    ).toBe(true);
+    s.close();
+  });
+});

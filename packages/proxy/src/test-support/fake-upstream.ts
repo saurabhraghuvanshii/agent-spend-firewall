@@ -260,3 +260,95 @@ export function lateUpstream(opts: { delayMs: number; result: CallToolResult }):
     },
   };
 }
+
+/** What a scripted upstream does with one `tools/call`. */
+export interface ScriptedReply {
+  /** Answer after this many ms (default 0). */
+  readonly delayMs?: number;
+  /** JSON-RPC result (a `CallToolResult`). */
+  readonly result?: CallToolResult;
+  /** JSON-RPC error response instead of a result. */
+  readonly error?: { readonly code: number; readonly message: string };
+  /** Never answer. */
+  readonly never?: true;
+}
+
+export type ScriptedHandler = (name: string, args: Record<string, unknown>) => ScriptedReply;
+
+export interface ScriptedUpstream {
+  readonly factory: UpstreamTransportFactory;
+  readonly calls: ReceivedCall[];
+  /** Number of `notifications/cancelled` received. */
+  cancellations(): number;
+  setHandler(h: ScriptedHandler): void;
+}
+
+/**
+ * Raw JSON-RPC fake (no SDK Server) for T010: answers each `tools/call` as the handler scripts it — possibly AFTER the
+ * client gave up, and IGNORING `notifications/cancelled` (like a Razorpay call that completed or failed late).
+ */
+export function scriptedUpstream(opts: {
+  readonly tools: Tool[];
+  readonly handler: ScriptedHandler;
+}): ScriptedUpstream {
+  let handler = opts.handler;
+  let cancellations = 0;
+  const calls: ReceivedCall[] = [];
+  const factory: UpstreamTransportFactory = () => {
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    const reply = (m: JSONRPCMessage): void => {
+      void serverSide.send(m).catch(() => undefined);
+    };
+    serverSide.onmessage = (m) => {
+      if (!isJSONRPCRequest(m)) {
+        if ("method" in m && m.method === "notifications/cancelled") cancellations++;
+        return;
+      }
+      if (m.method === "initialize") {
+        reply({
+          jsonrpc: "2.0",
+          id: m.id,
+          result: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: { name: "scripted-fake", version: "1.0.0" },
+          },
+        });
+      } else if (m.method === "tools/list") {
+        reply({ jsonrpc: "2.0", id: m.id, result: { tools: opts.tools } });
+      } else if (m.method === "tools/call") {
+        const params = m.params ?? {};
+        const name = typeof params["name"] === "string" ? params["name"] : "";
+        const rawArgs: unknown = params["arguments"];
+        const args =
+          typeof rawArgs === "object" && rawArgs !== null && !Array.isArray(rawArgs)
+            ? (rawArgs as Record<string, unknown>)
+            : {};
+        calls.push({ name, args });
+        const r = handler(name, args);
+        if (r.never === true) return;
+        const send = (): void => {
+          if (r.error !== undefined) reply({ jsonrpc: "2.0", id: m.id, error: { ...r.error } });
+          else reply({ jsonrpc: "2.0", id: m.id, result: { ...(r.result ?? { content: [] }) } });
+        };
+        if ((r.delayMs ?? 0) <= 0) send();
+        else setTimeout(send, r.delayMs);
+      }
+    };
+    void serverSide.start();
+    return {
+      transport: clientSide,
+      dispose: async () => {
+        await clientSide.close();
+      },
+    };
+  };
+  return {
+    factory,
+    calls,
+    cancellations: () => cancellations,
+    setHandler: (h) => {
+      handler = h;
+    },
+  };
+}

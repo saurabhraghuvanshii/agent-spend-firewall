@@ -17,8 +17,8 @@
  *   re-serialised; any other text goes through `redactText`;
  * - `structuredContent` is redacted the same way;
  * - non-text content (images, resources, …) is replaced by a placeholder text item (can't be inspected ⇒ removed).
- * Firewall-generated `pending_approval` bodies and `firewall.duplicate` denies (T009) of the exact shape the pipeline
- * emits are passed through (they carry no upstream data beyond an allowlisted reference id, and the ids must stay
+ * Firewall-generated `pending_approval` bodies, `firewall.duplicate` denies (T009) and the T010 verify-before-retry
+ * bodies (`verifiedAfterTimeout` success, `outcome: "unknown"`) of the exact shape the pipeline emits are passed through (they carry no upstream data beyond an allowlisted reference id, and the ids must stay
  * usable).
  *
  * Kept on purpose: Razorpay reference ids — ONLY the allowlisted keys in `REF_ID_KEY_PREFIXES` (`token_id`,
@@ -122,6 +122,77 @@ function isFirewallId(format: RegExp, v: unknown): v is string {
 /** Message of the pipeline's `pending_approval` result (shared with `interceptor.ts`). */
 export const PENDING_APPROVAL_MESSAGE = "awaiting human approval; NOT executed";
 
+/** T010: message of the `verifiedAfterTimeout` success body. */
+export const VERIFIED_AFTER_TIMEOUT_MESSAGE =
+  "the upstream call did not answer in time (or failed after it was sent), but the firewall verified with Razorpay that the action WAS executed; do not repeat it";
+
+/** T010: message of the `verifiedAfterTimeout` body when the refund exists but is still `pending` at Razorpay. */
+export const VERIFIED_AFTER_TIMEOUT_PENDING_MESSAGE =
+  "the upstream call did not answer in time (or failed after it was sent), but the firewall verified with Razorpay that the refund WAS created; its status is pending (Razorpay is still processing it); do not repeat it";
+
+/** T010: message of the `outcome: "unknown"` body. */
+export const UNKNOWN_OUTCOME_MESSAGE =
+  "the action may have executed: the firewall could not verify it with Razorpay and flagged it for a human. Do NOT retry it; ask a human to check the attemptId";
+
+/** T010 `verifiedAfterTimeout` success body (`isError: false`). */
+export interface VerifiedSuccessBody {
+  readonly outcome: "success";
+  readonly verifiedAfterTimeout: true;
+  readonly attemptId: string;
+  readonly upstreamRef?: string;
+  readonly message: string;
+}
+
+/** T010 unknown-outcome body (`isError: true`). */
+export interface UnknownOutcomeBody {
+  readonly outcome: "unknown";
+  readonly attemptId: string;
+  readonly flaggedForHuman: true;
+  readonly message: string;
+}
+
+function hasExactKeys(
+  body: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): boolean {
+  for (const k of required) if (!Object.hasOwn(body, k)) return false;
+  for (const k of Object.keys(body)) {
+    if (!required.includes(k) && !optional.includes(k)) return false;
+  }
+  return true;
+}
+
+/** True iff `body` is exactly the pipeline's T010 `verifiedAfterTimeout` body. */
+export function isVerifiedSuccessBody(body: unknown): boolean {
+  if (!isRecord(body)) return false;
+  return (
+    hasExactKeys(
+      body,
+      ["outcome", "verifiedAfterTimeout", "attemptId", "message"],
+      ["upstreamRef"],
+    ) &&
+    body["outcome"] === "success" &&
+    body["verifiedAfterTimeout"] === true &&
+    isFirewallId(ATTEMPT_ID, body["attemptId"]) &&
+    (body["message"] === VERIFIED_AFTER_TIMEOUT_MESSAGE ||
+      body["message"] === VERIFIED_AFTER_TIMEOUT_PENDING_MESSAGE) &&
+    (!Object.hasOwn(body, "upstreamRef") || isSafeUpstreamRef(body["upstreamRef"]))
+  );
+}
+
+/** True iff `body` is exactly the pipeline's T010 `outcome: "unknown"` body. */
+export function isUnknownOutcomeBody(body: unknown): boolean {
+  if (!isRecord(body)) return false;
+  return (
+    hasExactKeys(body, ["outcome", "attemptId", "flaggedForHuman", "message"], []) &&
+    body["outcome"] === "unknown" &&
+    body["flaggedForHuman"] === true &&
+    isFirewallId(ATTEMPT_ID, body["attemptId"]) &&
+    body["message"] === UNKNOWN_OUTCOME_MESSAGE
+  );
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -212,7 +283,7 @@ function isDuplicateDenyBody(body: unknown): boolean {
   return !Object.hasOwn(dup, "upstreamRef") || isSafeUpstreamRef(dup["upstreamRef"]);
 }
 
-function redactJsonText(text: string): string {
+function redactJsonText(text: string, isError: boolean | undefined): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -220,21 +291,32 @@ function redactJsonText(text: string): string {
     // Not JSON (plain message): scrub patterns in the free text instead.
     return redactText(text);
   }
-  if (isPendingApprovalBody(parsed) || isDuplicateDenyBody(parsed)) return text;
+  if (
+    isPendingApprovalBody(parsed) ||
+    isDuplicateDenyBody(parsed) ||
+    // T010 bodies pass only with the `isError` the pipeline gives them (a mismatch is not ours: redact normally).
+    (isError === false && isVerifiedSuccessBody(parsed)) ||
+    (isError === true && isUnknownOutcomeBody(parsed))
+  ) {
+    return text;
+  }
   return JSON.stringify(redactResultJson(parsed));
 }
 
 type ContentItem = CallToolResult["content"][number];
 
-function redactItem(item: ContentItem): ContentItem {
-  if (item.type === "text") return { ...item, text: redactJsonText(item.text) };
+function redactItem(item: ContentItem, isError: boolean | undefined): ContentItem {
+  if (item.type === "text") return { ...item, text: redactJsonText(item.text, isError) };
   return { type: "text", text: NON_TEXT_PLACEHOLDER };
 }
 
 /** See module doc. Pure; never mutates `result`. Exempt tools ⇒ the same object. */
 export function redactSensitiveResult(tool: string, result: CallToolResult): CallToolResult {
   if (REDACTION_EXEMPT_TOOLS.has(tool)) return result;
-  const out: CallToolResult = { ...result, content: result.content.map(redactItem) };
+  const out: CallToolResult = {
+    ...result,
+    content: result.content.map((item) => redactItem(item, result.isError)),
+  };
   if (result.structuredContent !== undefined) {
     const red = redactResultJson(result.structuredContent);
     if (isRecord(red)) {

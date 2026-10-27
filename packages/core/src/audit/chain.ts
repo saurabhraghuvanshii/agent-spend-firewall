@@ -1,8 +1,16 @@
 import { err, ok, type Result } from "../result.js";
 import { canonicalJson } from "./canonical-json.js";
 import {
+  APPROVER_RE,
+  AUDIT_VERIFICATION_METHODS,
+  AUDIT_VERIFICATION_RESULTS,
+  AUDIT_VERIFICATION_TRIGGERS,
+  ERROR_CODE_RE,
   GENESIS_PREV_HASH,
   IDEMPOTENCY_KEY_RE,
+  RECORD_ID_RE,
+  UPSTREAM_REF_RE,
+  type AuditVerificationResult,
   type AuditBody,
   type AuditRecord,
   type Hasher,
@@ -42,8 +50,84 @@ function checkIdempotencyKey(body: AuditBody): Result<true> {
 }
 
 /**
+ * `retryOf` shape check (T010). Absent/undefined is fine (legacy rows hash unchanged). On an attempt it must match
+ * `RECORD_ID_RE`; any other record kind must not carry it.
+ */
+function checkRetryOf(body: AuditBody): Result<true> {
+  const v: unknown = (body as { retryOf?: unknown }).retryOf;
+  if (v === undefined) return ok(true);
+  const kind: string = body.kind;
+  if (kind !== "attempt") {
+    return err("audit.invalid_retry_of", "only attempt records may carry retryOf");
+  }
+  if (typeof v !== "string" || !RECORD_ID_RE.test(v)) {
+    return err("audit.invalid_retry_of", "retryOf must be a record id");
+  }
+  return ok(true);
+}
+
+const VERIFICATION_KEYS: ReadonlySet<string> = new Set([
+  "kind",
+  "id",
+  "attemptId",
+  "ts",
+  "trigger",
+  "result",
+  "method",
+  "needsHuman",
+  "upstreamRef",
+  "errorCode",
+  "resolver",
+]);
+
+function optionalMatches(v: unknown, re: RegExp): boolean {
+  return v === undefined || (typeof v === "string" && re.test(v));
+}
+
+/**
+ * Strict shape check for `verification` records (T010). Reads every field as `unknown` because rows come from
+ * storage. Other kinds pass through unchanged.
+ */
+function checkVerification(body: AuditBody): Result<true> {
+  const kind: string = body.kind;
+  if (kind !== "verification") return ok(true);
+  const bad = (msg: string): Result<true> => err("audit.invalid_verification", msg);
+  const b = body as unknown as Record<string, unknown>;
+  for (const k of Object.keys(b)) {
+    if (!VERIFICATION_KEYS.has(k) && b[k] !== undefined) return bad("unexpected field");
+  }
+  if (typeof b["id"] !== "string" || !RECORD_ID_RE.test(b["id"])) return bad("invalid id");
+  if (typeof b["attemptId"] !== "string" || !RECORD_ID_RE.test(b["attemptId"])) {
+    return bad("invalid attemptId");
+  }
+  if (typeof b["ts"] !== "string" || b["ts"] === "") return bad("invalid ts");
+  if (!(AUDIT_VERIFICATION_TRIGGERS as readonly unknown[]).includes(b["trigger"])) {
+    return bad("invalid trigger");
+  }
+  if (!(AUDIT_VERIFICATION_RESULTS as readonly unknown[]).includes(b["result"])) {
+    return bad("invalid result");
+  }
+  if (!(AUDIT_VERIFICATION_METHODS as readonly unknown[]).includes(b["method"])) {
+    return bad("invalid method");
+  }
+  if (typeof b["needsHuman"] !== "boolean") return bad("needsHuman must be a boolean");
+  if (!optionalMatches(b["upstreamRef"], UPSTREAM_REF_RE)) return bad("invalid upstreamRef");
+  if (!optionalMatches(b["errorCode"], ERROR_CODE_RE)) return bad("invalid errorCode");
+  if (b["trigger"] === "human") {
+    if (typeof b["resolver"] !== "string" || !APPROVER_RE.test(b["resolver"])) {
+      return bad("a human verification requires a valid resolver");
+    }
+  } else if (b["resolver"] !== undefined) {
+    return bad("resolver is only allowed when trigger is human");
+  }
+  return ok(true);
+}
+
+/**
  * `hash = sha256Hex(prevHash + canonicalJson({ ...body, seq }))`. Never throws.
- * Rejects (`audit.invalid_idempotency_key`) a malformed `idempotencyKey` or one on an outcome record.
+ * Rejects (`audit.invalid_idempotency_key`) a malformed `idempotencyKey` or one on a non-attempt record,
+ * (`audit.invalid_retry_of`) a malformed `retryOf` or one on a non-attempt record, and
+ * (`audit.invalid_verification`) a malformed `verification` record (see `AuditVerificationBody`).
  */
 export function computeHash(
   h: Hasher,
@@ -53,6 +137,10 @@ export function computeHash(
 ): Result<string> {
   const keyCheck = checkIdempotencyKey(body);
   if (!keyCheck.ok) return keyCheck;
+  const retryCheck = checkRetryOf(body);
+  if (!retryCheck.ok) return retryCheck;
+  const verificationCheck = checkVerification(body);
+  if (!verificationCheck.ok) return verificationCheck;
   const canon = canonicalJson({ ...body, seq });
   if (!canon.ok) return canon;
   let digest: string;
@@ -90,7 +178,13 @@ function isInvalid(r: AuditRecord | InvalidAuditRow): r is InvalidAuditRow {
  * Verify an ordered chain (seq ascending). Returns the first broken record, checking per record in order:
  * invalid row → seq gap → genesis → prev-hash link → recomputed hash → id not seen before (`duplicate_id`) →
  * outcome references an earlier attempt (`orphan_outcome`) → attempt has no earlier outcome (`duplicate_outcome`).
- * The id/outcome checks catch tampered rows that otherwise chain correctly.
+ * T010 verification records: must reference an earlier attempt (`orphan_verification`) that already has an outcome
+ * (`verification_before_outcome`) and no earlier `happened` / `not_happened` verification
+ * (`verification_after_settled`; only `unknown` may be followed by more verifications).
+ * T010 retries: an attempt with `retryOf` must reference an earlier attempt of the same tool whose latest
+ * verification so far is `not_happened`, that is not itself a retry, and that has not been retried already
+ * (`bad_retry_of`).
+ * The id/outcome/verification checks catch tampered rows that otherwise chain correctly.
  * Attempts with no outcome are reported in `danglingAttempts` (a warning, not a break).
  */
 export function verifyChain(
@@ -103,6 +197,10 @@ export function verifyChain(
   const answered = new Set<string>();
   const seenIds = new Set<string>();
   const attemptOrder: string[] = [];
+  const attemptTool = new Map<string, string>();
+  const isRetry = new Set<string>();
+  const retried = new Set<string>();
+  const latestVerification = new Map<string, AuditVerificationResult>();
 
   const broken = (seq: number, id: string | null, reason: VerifyBreakReason): VerifyResult => ({
     ok: false,
@@ -113,7 +211,9 @@ export function verifyChain(
     if (isInvalid(r)) return broken(r.seq, null, "invalid_row");
     // Rows come from storage; re-check the discriminant at runtime rather than trusting the type.
     const kind: string = r.kind;
-    if (kind !== "attempt" && kind !== "outcome") return broken(r.seq, null, "invalid_row");
+    if (kind !== "attempt" && kind !== "outcome" && kind !== "verification") {
+      return broken(r.seq, null, "invalid_row");
+    }
     const id = typeof r.id === "string" ? r.id : null;
     if (r.seq !== index + 1) return broken(r.seq, id, "seq_gap");
     if (index === 0 && r.prevHash !== GENESIS_PREV_HASH)
@@ -134,8 +234,30 @@ export function verifyChain(
     seenIds.add(r.id);
 
     if (r.kind === "attempt") {
+      if (r.retryOf !== undefined) {
+        const original = r.retryOf;
+        if (
+          attemptTool.get(original) !== r.tool ||
+          latestVerification.get(original) !== "not_happened" ||
+          isRetry.has(original) ||
+          retried.has(original)
+        ) {
+          return broken(r.seq, id, "bad_retry_of");
+        }
+        retried.add(original);
+        isRetry.add(r.id);
+      }
       attempts.add(r.id);
       attemptOrder.push(r.id);
+      attemptTool.set(r.id, r.tool);
+    } else if (r.kind === "verification") {
+      if (!attempts.has(r.attemptId)) return broken(r.seq, id, "orphan_verification");
+      if (!answered.has(r.attemptId)) return broken(r.seq, id, "verification_before_outcome");
+      const prior = latestVerification.get(r.attemptId);
+      if (prior !== undefined && prior !== "unknown") {
+        return broken(r.seq, id, "verification_after_settled");
+      }
+      latestVerification.set(r.attemptId, r.result);
     } else {
       if (!attempts.has(r.attemptId)) return broken(r.seq, id, "orphan_outcome");
       if (answered.has(r.attemptId)) return broken(r.seq, id, "duplicate_outcome");

@@ -262,3 +262,67 @@ describe("resolveDbPath", () => {
     expect(resolveDbPath(undefined, { ASF_AUDIT_DB: "" }, "/x")).toBe(join("/x", DEFAULT_AUDIT_DB));
   });
 });
+
+describe("T010 verification rows", () => {
+  it("counts verifications / retries and lists actions flagged for a human", () => {
+    const r = openAuditStore({ path: dbPath });
+    if (!r.ok) throw new Error(r.error.message);
+    const s = r.value;
+    const must = (x: { ok: boolean }): void => {
+      if (!x.ok) throw new Error("seed failed");
+    };
+    for (const id of ["att-a", "att-b"]) {
+      must(
+        s.recordAttempt({
+          id,
+          sessionId: "sess",
+          tool: "create_refund",
+          args: { payment_id: "pay_1", amount: 100 },
+          reason: "duplicate charge refund",
+          decision: "allow",
+          matchedRules: [],
+        }),
+      );
+      must(s.recordOutcome({ attemptId: id, outcome: "timeout", latencyMs: 3 }));
+    }
+    must(
+      s.recordVerification({
+        attemptId: "att-a",
+        trigger: "timeout",
+        result: "not_happened",
+        method: "refund_notes_marker",
+        needsHuman: false,
+      }),
+    );
+    must(
+      s.recordAttempt({
+        id: "att-r",
+        retryOf: "att-a",
+        sessionId: "sess",
+        tool: "create_refund",
+        args: { payment_id: "pay_1", amount: 100 },
+        reason: "duplicate charge refund",
+        decision: "allow",
+        matchedRules: [],
+      }),
+    );
+    must(s.recordOutcome({ attemptId: "att-r", outcome: "success", latencyMs: 3 }));
+    must(
+      s.recordVerification({
+        attemptId: "att-b",
+        trigger: "startup",
+        result: "unknown",
+        method: "refund_notes_marker",
+        needsHuman: true,
+      }),
+    );
+    s.close();
+    const out = runVerify(["--db", dbPath], {});
+    expect(out.exitCode).toBe(0);
+    expect(out.output).toContain("verifications: 2; retries: 1");
+    expect(out.output).toContain(
+      "WARNING: 1 money action(s) may have executed and need a human (verification unknown): att-b (create_refund)",
+    );
+    expectNoControlChars(out.output);
+  });
+});

@@ -250,7 +250,7 @@ function rows(h: Harness): { attempts: AuditAttemptRecord[]; outcomes: AuditOutc
   for (const r of unwrap(h.store.readAll())) {
     if ("invalid" in r) throw new Error("invalid row");
     if (r.kind === "attempt") attempts.push(r);
-    else outcomes.push(r);
+    else if (r.kind === "outcome") outcomes.push(r);
   }
   return { attempts, outcomes };
 }
@@ -335,11 +335,12 @@ describe("repeats", () => {
     expect(upstreamCalls(h, "create_refund")).toHaveLength(1);
   });
 
-  it("after a timeout ⇒ blocked may_have_executed", async () => {
+  it("after a timeout that can't be verified ⇒ unknown (flagged), then blocked may_have_executed", async () => {
     const h = await setup({ callTimeoutMs: 30 });
     h.handlers.set("create_refund", (_a, signal) => hang(signal));
     const first = await refund(h, A1);
-    expect(jsonOf(first)).toMatchObject({ error: "upstream_timeout", forwarded: true });
+    // T010: the refund list lookup is unreadable here ⇒ unknown, flagged for a human.
+    expect(jsonOf(first)).toMatchObject({ outcome: "unknown", flaggedForHuman: true });
     expect(rows(h).outcomes[0]?.outcome).toBe("timeout");
     expectDuplicate(await refund(h, A1), "may_have_executed");
     expect(upstreamCalls(h, "create_refund")).toHaveLength(1);
@@ -446,7 +447,7 @@ describe("transforms", () => {
     const h = await setup({ policy: CLAMP });
     expect((await refund(h, A1)).isError).not.toBe(true);
     expect(upstreamCalls(h, "create_refund").map((c) => c.args)).toEqual([
-      { payment_id: "pay_A1", amount: 1_000 },
+      { payment_id: "pay_A1", amount: 1_000, notes: { asf_attempt: rows(h).attempts[0]?.id } },
     ]);
     expectDuplicate(await refund(h, A1), "executed");
     expectDuplicate(await refund(h, { payment_id: "pay_A1", amount: 1_000 }), "executed");
@@ -529,6 +530,8 @@ describe("fail closed", () => {
       wrapStore: (s) => ({
         recordAttempt: (i) => s.recordAttempt(i),
         recordOutcome: (i) => s.recordOutcome(i),
+        recordVerification: (i) => s.recordVerification(i),
+        readUnsettled: () => s.readUnsettled(),
         readActivitySince: () => err("audit.read_failed", "disk gone"),
       }),
     });
@@ -601,6 +604,8 @@ describe("audit trail", () => {
       wrapStore: (s) => ({
         recordAttempt: (i) => s.recordAttempt(i),
         recordOutcome: (i) => s.recordOutcome(i),
+        recordVerification: (i) => s.recordVerification(i),
+        readUnsettled: () => s.readUnsettled(),
         readActivitySince: (ms) => {
           reads++;
           return s.readActivitySince(ms);

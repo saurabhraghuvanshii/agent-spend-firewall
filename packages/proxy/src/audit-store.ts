@@ -29,7 +29,14 @@ import {
   redact,
   redactText,
   verifyChain,
+  AUDIT_VERIFICATION_METHODS,
+  AUDIT_VERIFICATION_RESULTS,
+  AUDIT_VERIFICATION_TRIGGERS,
   type AuditAttemptBody,
+  type AuditVerificationBody,
+  type AuditVerificationMethod,
+  type AuditVerificationResult,
+  type AuditVerificationTrigger,
   type AuditBody,
   type AuditOutcomeBody,
   type AuditRecord,
@@ -79,9 +86,31 @@ export interface RecordAttemptInput {
    * on an `audit.invalid_args` trail row (its args were not recorded).
    */
   idempotencyKey?: string;
-  /** Defaults to `idGen()`. Must match `recordIdSchema`. */
+  /**
+   * T010: id of the earlier attempt this one retries. Checked in the write transaction: the original must exist, be
+   * an attempt of the same tool, have a LATEST verification `not_happened`, not be a retry itself and not have been
+   * retried already ⇒ else `audit.invalid_retry_of` (nothing written). Hashed only when present.
+   */
+  retryOf?: string;
+  /** Defaults to `idGen()`. Must match `recordIdSchema` (T010: the pipeline pre-generates it for the notes marker). */
   id?: string;
   /** ISO-8601; defaults to `clock().toISOString()`. */
+  ts?: string;
+}
+
+/** T010: a verification of an attempt whose outcome left it unclear whether upstream applied it. */
+export interface RecordVerificationInput {
+  attemptId: string;
+  trigger: AuditVerificationTrigger;
+  result: AuditVerificationResult;
+  method: AuditVerificationMethod;
+  /** True iff a human must settle it (always true for `unknown` written by the pipeline). */
+  needsHuman: boolean;
+  upstreamRef?: string;
+  errorCode?: string;
+  /** Required iff `trigger === "human"` (`approverSchema`); forbidden otherwise. */
+  resolver?: string;
+  id?: string;
   ts?: string;
 }
 
@@ -99,15 +128,19 @@ export interface RecordOutcomeInput {
 export type AuditDecisionInput = (typeof AUDIT_DECISIONS)[number];
 export type AuditAttemptRecord = Extract<AuditRecord, { kind: "attempt" }>;
 export type AuditOutcomeRecord = Extract<AuditRecord, { kind: "outcome" }>;
+export type AuditVerificationRecord = Extract<AuditRecord, { kind: "verification" }>;
 
-/** An attempt joined with its outcome record, if one has been written. */
+/** An attempt joined with its outcome record, if one has been written, and its LATEST verification (T010), if any. */
 export interface AuditActivity {
   readonly attempt: AuditAttemptRecord;
   readonly outcome?: AuditOutcomeRecord;
+  readonly verification?: AuditVerificationRecord;
 }
 
 /** Default cap on rows `readActivitySince` scans before failing closed. */
 export const DEFAULT_MAX_ACTIVITY_ROWS = 10_000;
+/** Default cap on rows the full scans (`readUnsettled`, `listNeedsHuman`) read before failing closed. */
+export const DEFAULT_MAX_SCAN_ROWS = 100_000;
 export type AuditOutcomeInput = (typeof AUDIT_OUTCOMES)[number];
 
 export interface AuditStore {
@@ -134,6 +167,22 @@ export interface AuditStore {
    * range, a non-finite `sinceMs`, or any read failure. Hashes are NOT re-verified here (use `verify()`).
    */
   readActivitySince(sinceMs: number): Result<AuditActivity[]>;
+  /**
+   * T010: append a verification record. Checked in the write transaction: the attempt exists, is not a `deny`, has an
+   * outcome, and its latest verification (if any) is `unknown` (`happened` / `not_happened` are final) ⇒ else
+   * `audit.invalid_verification` (nothing written).
+   */
+  recordVerification(input: RecordVerificationInput): Result<AuditRecord>;
+  /**
+   * T010: every UNSETTLED money action in the whole log (scans ALL rows, oldest first, at most `maxScanRows` ⇒ else
+   * `err` `audit.scan_too_large`; any unreadable row ⇒ `err`), ordered by attempt seq:
+   * - `open`: decision allow / transform with no outcome (orphaned by a crash; `require_approval` is NOT included);
+   * - `unsettled`: decision allow / transform / require_approval, outcome `timeout` / `upstream_error`, and no
+   *   verification or a latest verification `unknown`.
+   */
+  readUnsettled(): Result<{ open: AuditActivity[]; unsettled: AuditActivity[] }>;
+  /** T010: actions whose latest verification is `unknown` (flagged for a human), full scan like `readUnsettled`. */
+  listNeedsHuman(): Result<AuditActivity[]>;
   /** `verifyChain` over `readAll()`. `err` only if the DB cannot be read. */
   verify(): Result<VerifyResult>;
   /** Idempotent. */
@@ -152,6 +201,8 @@ export interface OpenAuditStoreOptions {
   busyTimeoutMs?: number;
   /** Max rows `readActivitySince` may scan (default `DEFAULT_MAX_ACTIVITY_ROWS`); more ⇒ `err`. */
   maxActivityRows?: number;
+  /** Max rows `readUnsettled` / `listNeedsHuman` may scan (default `DEFAULT_MAX_SCAN_ROWS`); more ⇒ `err`. */
+  maxScanRows?: number;
 }
 
 /** Expected trigger SQL exactly as SQLite stores it in `sqlite_master.sql` (no IF NOT EXISTS, no `;`). */
@@ -221,9 +272,34 @@ const attemptInputSchema = z.object({
   matchedRules: z.array(z.string()),
   approver: approverSchema.optional(),
   idempotencyKey: idempotencyKeySchema.optional(),
+  retryOf: recordIdSchema.optional(),
   id: recordIdSchema.optional(),
   ts: isoTs.optional(),
 });
+
+const verificationInputSchema = z
+  .object({
+    attemptId: recordIdSchema,
+    trigger: z.enum(AUDIT_VERIFICATION_TRIGGERS),
+    result: z.enum(AUDIT_VERIFICATION_RESULTS),
+    method: z.enum(AUDIT_VERIFICATION_METHODS),
+    needsHuman: z.boolean(),
+    upstreamRef: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:-]{1,128}$/)
+      .optional(),
+    errorCode: z
+      .string()
+      .regex(/^[a-z0-9_.:-]{1,64}$/)
+      .optional(),
+    resolver: approverSchema.optional(),
+    id: recordIdSchema.optional(),
+    ts: isoTs.optional(),
+  })
+  .refine((v) => (v.trigger === "human") === (v.resolver !== undefined), {
+    message: "resolver is required iff trigger is human",
+    path: ["resolver"],
+  });
 
 const outcomeInputSchema = z.object({
   attemptId: recordIdSchema,
@@ -270,6 +346,7 @@ const storedAttemptSchema = z.strictObject({
   approver: z.string().optional(),
   // Legacy rows have no key; a present key must be well-formed (core verify reports it otherwise).
   idempotencyKey: idempotencyKeySchema.optional(),
+  retryOf: recordIdSchema.optional(),
 });
 
 const storedOutcomeSchema = z.strictObject({
@@ -283,7 +360,25 @@ const storedOutcomeSchema = z.strictObject({
   upstreamRef: z.string().optional(),
 });
 
-const storedBodySchema = z.discriminatedUnion("kind", [storedAttemptSchema, storedOutcomeSchema]);
+const storedVerificationSchema = z.strictObject({
+  kind: z.literal("verification"),
+  id: recordIdSchema,
+  attemptId: recordIdSchema,
+  ts: z.string(),
+  trigger: z.enum(AUDIT_VERIFICATION_TRIGGERS),
+  result: z.enum(AUDIT_VERIFICATION_RESULTS),
+  method: z.enum(AUDIT_VERIFICATION_METHODS),
+  needsHuman: z.boolean(),
+  upstreamRef: z.string().optional(),
+  errorCode: z.string().optional(),
+  resolver: z.string().optional(),
+});
+
+const storedBodySchema = z.discriminatedUnion("kind", [
+  storedAttemptSchema,
+  storedOutcomeSchema,
+  storedVerificationSchema,
+]);
 
 const rowSchema = z.object({
   seq: z.int().positive(),
@@ -313,7 +408,24 @@ function toCoreBody(b: StoredBody): AuditBody {
     if (b.originalArgsRedacted !== undefined) body.originalArgsRedacted = b.originalArgsRedacted;
     if (b.approver !== undefined) body.approver = b.approver;
     if (b.idempotencyKey !== undefined) body.idempotencyKey = b.idempotencyKey;
+    if (b.retryOf !== undefined) body.retryOf = b.retryOf;
     return body;
+  }
+  if (b.kind === "verification") {
+    const v: AuditVerificationBody = {
+      kind: "verification",
+      id: b.id,
+      attemptId: b.attemptId,
+      ts: b.ts,
+      trigger: b.trigger,
+      result: b.result,
+      method: b.method,
+      needsHuman: b.needsHuman,
+    };
+    if (b.upstreamRef !== undefined) v.upstreamRef = b.upstreamRef;
+    if (b.errorCode !== undefined) v.errorCode = b.errorCode;
+    if (b.resolver !== undefined) v.resolver = b.resolver;
+    return v;
   }
   const body: AuditOutcomeBody = {
     kind: "outcome",
@@ -381,6 +493,12 @@ const headRowSchema = z.object({
 });
 const tsOnlySchema = z.object({ ts: isoTs });
 const decisionOnlySchema = z.object({ decision: z.enum(AUDIT_DECISIONS) });
+const attemptToolSchema = z.object({
+  tool: z.string(),
+  decision: z.enum(AUDIT_DECISIONS),
+  retryOf: recordIdSchema.optional(),
+});
+const verificationResultSchema = z.object({ result: z.enum(AUDIT_VERIFICATION_RESULTS) });
 const bodyJsonRowSchema = z.object({ body_json: z.string() });
 const tableInfoRowSchema = z.object({ name: z.string() });
 const triggerRowSchema = z.object({ name: z.string(), sql: z.string().nullable() });
@@ -418,6 +536,18 @@ interface ResolvedTs {
 
 // ---------- store ----------
 
+function joinActivity(
+  attempt: AuditAttemptRecord,
+  outcome: AuditOutcomeRecord | undefined,
+  verification: AuditVerificationRecord | undefined,
+): AuditActivity {
+  return {
+    attempt,
+    ...(outcome === undefined ? {} : { outcome }),
+    ...(verification === undefined ? {} : { verification }),
+  };
+}
+
 export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> {
   const hasher = opts.hasher ?? nodeHasher;
   const clock = opts.clock ?? (() => new Date());
@@ -427,6 +557,10 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   const maxActivityRows = opts.maxActivityRows ?? DEFAULT_MAX_ACTIVITY_ROWS;
   if (!Number.isSafeInteger(maxActivityRows) || maxActivityRows < 1) {
     return err("audit.open_failed", "maxActivityRows must be a positive integer");
+  }
+  const maxScanRows = opts.maxScanRows ?? DEFAULT_MAX_SCAN_ROWS;
+  if (!Number.isSafeInteger(maxScanRows) || maxScanRows < 1) {
+    return err("audit.open_failed", "maxScanRows must be a positive integer");
   }
 
   let db: Database.Database;
@@ -489,6 +623,10 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   let outcomeExistsStmt: Database.Statement;
   let recentStmt: Database.Statement;
   let attemptRowStmt: Database.Statement;
+  let outcomeRowStmt: Database.Statement;
+  let latestVerificationStmt: Database.Statement;
+  let retriedStmt: Database.Statement;
+  let ascStmt: Database.Statement;
   let warnings: string[] = [];
   try {
     db.pragma(`busy_timeout = ${String(Math.max(0, Math.trunc(busyTimeoutMs)))}`);
@@ -548,6 +686,18 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     attemptRowStmt = db.prepare(
       "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE id = ?",
     );
+    outcomeRowStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE kind = 'outcome' AND json_extract(body_json, '$.attemptId') = ?",
+    );
+    latestVerificationStmt = db.prepare(
+      "SELECT body_json FROM audit_log WHERE kind = 'verification' AND json_extract(body_json, '$.attemptId') = ? ORDER BY seq DESC LIMIT 1",
+    );
+    retriedStmt = db.prepare(
+      "SELECT 1 AS present FROM audit_log WHERE kind = 'attempt' AND json_extract(body_json, '$.retryOf') = ? LIMIT 1",
+    );
+    ascStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log ORDER BY seq ASC",
+    );
   } catch (e: unknown) {
     if (db.open) db.close();
     return err("audit.open_failed", "could not initialise audit database", describeError(e));
@@ -561,9 +711,59 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     return ok(parsed.data);
   }
 
+  /** Latest verification result of `attemptId` (inside a transaction), `undefined` if none, `null` if unreadable. */
+  function latestVerificationOf(attemptId: string): AuditVerificationResult | undefined | null {
+    const raw: unknown = latestVerificationStmt.get(attemptId);
+    if (raw === undefined) return undefined;
+    const row = bodyJsonRowSchema.safeParse(raw);
+    if (!row.success) return null;
+    return parseJsonAs(verificationResultSchema, row.data.body_json)?.result ?? null;
+  }
+
+  /** The referenced attempt's tool / decision / retryOf (inside a transaction); `undefined` if absent / unreadable. */
+  function attemptInfo(attemptId: string): z.infer<typeof attemptToolSchema> | undefined {
+    const raw: unknown = attemptBodyStmt.get(attemptId);
+    if (raw === undefined) return undefined;
+    const row = bodyJsonRowSchema.safeParse(raw);
+    if (!row.success) return undefined;
+    return parseJsonAs(attemptToolSchema, row.data.body_json) ?? undefined;
+  }
+
+  /** T010 checks for an attempt's `retryOf` and for verification records (mirror core `verifyChain`). */
+  function checkT010(body: AuditBody): Result<null> {
+    if (body.kind === "attempt" && body.retryOf !== undefined) {
+      const bad = (why: string): Result<null> =>
+        err("audit.invalid_retry_of", `retryOf is not allowed: ${why}`);
+      const original = attemptInfo(body.retryOf);
+      if (original === undefined) return bad("the original attempt does not exist");
+      if (original.tool !== body.tool) return bad("the original attempt is for another tool");
+      if (original.retryOf !== undefined) return bad("a retry cannot be retried");
+      if (latestVerificationOf(body.retryOf) !== "not_happened") {
+        return bad("the original attempt is not verified as not executed");
+      }
+      if (retriedStmt.get(body.retryOf) !== undefined)
+        return bad("the original was already retried");
+    }
+    if (body.kind === "verification") {
+      const bad = (why: string): Result<null> =>
+        err("audit.invalid_verification", `verification is not allowed: ${why}`);
+      const attempt = attemptInfo(body.attemptId);
+      if (attempt === undefined) return bad("the attempt does not exist");
+      if (attempt.decision === "deny") return bad("the attempt was denied");
+      if (outcomeExistsStmt.get(body.attemptId) === undefined)
+        return bad("the attempt has no outcome");
+      const prior = latestVerificationOf(body.attemptId);
+      if (prior === null) return bad("an earlier verification is unreadable");
+      if (prior !== undefined && prior !== "unknown") return bad("the attempt is already settled");
+    }
+    return ok(null);
+  }
+
   /** Runs inside BEGIN IMMEDIATE. Returning `err` before the insert leaves the DB unchanged. */
   function appendInTx(req: AppendRequest): Result<AuditRecord> {
     const { body } = req;
+    const t010 = checkT010(body);
+    if (!t010.ok) return t010;
     if (body.kind === "outcome") {
       const attemptRow: unknown = attemptBodyStmt.get(body.attemptId);
       if (attemptRow === undefined) {
@@ -633,10 +833,24 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
 
   const appendTx = db.transaction(appendInTx);
 
+  /** Parsed record by row, or a fail-closed error message. */
+  function lookupRecord(
+    stmt: Database.Statement,
+    key: string,
+  ): AuditRecord | "missing" | "unreadable" {
+    const raw: unknown = stmt.get(key);
+    if (raw === undefined) return "missing";
+    const rec = parseRow(raw, 0);
+    if ("invalid" in rec || !Number.isFinite(Date.parse(rec.ts))) return "unreadable";
+    return rec;
+  }
+
   /** Runs inside a (deferred) read transaction. See `AuditStore.readActivitySince`. */
   function readActivityInTx(sinceMs: number): Result<AuditActivity[]> {
     const attempts = new Map<string, AuditAttemptRecord>();
     const outcomes = new Map<string, AuditOutcomeRecord>();
+    /** Latest (first seen newest-first) verification per attempt. */
+    const verifications = new Map<string, AuditVerificationRecord>();
     const invalid = (message: string, seq: number): Result<AuditActivity[]> =>
       err("audit.activity_invalid", message, { seq });
     let scanned = 0;
@@ -658,36 +872,99 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
       if (rec.kind === "attempt") {
         if (attempts.has(rec.id)) return invalid("duplicate attempt id in audit log", rec.seq);
         attempts.set(rec.id, rec);
-      } else {
+      } else if (rec.kind === "outcome") {
         if (outcomes.has(rec.attemptId)) return invalid("duplicate outcome in audit log", rec.seq);
         outcomes.set(rec.attemptId, rec);
+      } else if (!verifications.has(rec.attemptId)) {
+        verifications.set(rec.attemptId, rec);
       }
     }
     const all = new Map(attempts);
-    for (const [attemptId, outcome] of outcomes) {
-      let attempt = attempts.get(attemptId);
+    // Outcomes / verifications in the window for attempts older than the cutoff: indexed lookups by UNIQUE id.
+    for (const [attemptId, later] of [...outcomes, ...verifications]) {
+      let attempt = all.get(attemptId);
       if (attempt === undefined) {
-        // Outcome in the window for an attempt older than the cutoff: indexed lookup by UNIQUE id.
-        const raw: unknown = attemptRowStmt.get(attemptId);
-        if (raw === undefined) return invalid("outcome references a missing attempt", outcome.seq);
-        const rec = parseRow(raw, 0);
-        if ("invalid" in rec) return invalid("attempt for an outcome is unreadable", rec.seq);
+        const rec = lookupRecord(attemptRowStmt, attemptId);
+        if (rec === "missing") return invalid("record references a missing attempt", later.seq);
+        if (rec === "unreadable") return invalid("attempt for a record is unreadable", later.seq);
         if (rec.kind !== "attempt")
-          return invalid("outcome references a non-attempt record", outcome.seq);
-        if (!Number.isFinite(Date.parse(rec.ts))) {
-          return invalid("audit record has an unparseable timestamp", rec.seq);
-        }
+          return invalid("record references a non-attempt record", later.seq);
         attempt = rec;
         all.set(attemptId, rec);
       }
-      if (attempt.seq >= outcome.seq) return invalid("outcome precedes its attempt", outcome.seq);
+      if (attempt.seq >= later.seq) return invalid("record precedes its attempt", later.seq);
+    }
+    for (const [attemptId, v] of verifications) {
+      if (outcomes.has(attemptId)) continue;
+      const rec = lookupRecord(outcomeRowStmt, attemptId);
+      if (rec === "missing") return invalid("verification of an attempt without outcome", v.seq);
+      if (rec === "unreadable" || rec.kind !== "outcome") {
+        return invalid("outcome for a verification is unreadable", v.seq);
+      }
+      if (rec.seq >= v.seq) return invalid("verification precedes its outcome", v.seq);
+      outcomes.set(attemptId, rec);
     }
     const result: AuditActivity[] = [];
     for (const attempt of [...all.values()].sort((a, b) => a.seq - b.seq)) {
-      const outcome = outcomes.get(attempt.id);
-      result.push(outcome === undefined ? { attempt } : { attempt, outcome });
+      result.push(joinActivity(attempt, outcomes.get(attempt.id), verifications.get(attempt.id)));
     }
     return ok(result);
+  }
+
+  /** Runs inside a read transaction: a full scan (oldest first), bounded by `maxScanRows`. */
+  function scanAllInTx(): Result<AuditActivity[]> {
+    const attempts = new Map<string, AuditAttemptRecord>();
+    const outcomes = new Map<string, AuditOutcomeRecord>();
+    const verifications = new Map<string, AuditVerificationRecord>();
+    let scanned = 0;
+    for (const raw of ascStmt.iterate() as Iterable<unknown>) {
+      scanned++;
+      if (scanned > maxScanRows) {
+        return err("audit.scan_too_large", "too many audit records to scan", {
+          maxRows: maxScanRows,
+        });
+      }
+      const rec = parseRow(raw, 0);
+      if ("invalid" in rec) {
+        return err("audit.activity_invalid", "audit record is unreadable", { seq: rec.seq });
+      }
+      if (rec.kind === "attempt") {
+        if (attempts.has(rec.id)) {
+          return err("audit.activity_invalid", "duplicate attempt id", { seq: rec.seq });
+        }
+        attempts.set(rec.id, rec);
+        continue;
+      }
+      if (!attempts.has(rec.attemptId)) {
+        return err("audit.activity_invalid", "record references a missing attempt", {
+          seq: rec.seq,
+        });
+      }
+      if (rec.kind === "outcome") {
+        if (outcomes.has(rec.attemptId)) {
+          return err("audit.activity_invalid", "duplicate outcome", { seq: rec.seq });
+        }
+        outcomes.set(rec.attemptId, rec);
+      } else {
+        verifications.set(rec.attemptId, rec); // ascending ⇒ the last one wins (latest)
+      }
+    }
+    return ok(
+      [...attempts.values()].map((a) =>
+        joinActivity(a, outcomes.get(a.id), verifications.get(a.id)),
+      ),
+    );
+  }
+
+  const scanAllTx = db.transaction(scanAllInTx);
+
+  function scanAll(): Result<AuditActivity[]> {
+    if (!db.open) return err("audit.read_failed", "audit store is closed");
+    try {
+      return scanAllTx();
+    } catch (e: unknown) {
+      return err("audit.read_failed", "could not scan the audit log", describeError(e));
+    }
   }
 
   const readActivityTx = db.transaction(readActivityInTx);
@@ -777,6 +1054,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
           matchedRules: [...p.matchedRules],
         };
         if (p.approver !== undefined) body.approver = p.approver;
+        if (p.retryOf !== undefined) body.retryOf = p.retryOf;
 
         if (args.ok) {
           body.argsRedacted = args.value;
@@ -786,6 +1064,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         }
 
         // Invalid args (e.g. float amount): still leave a trail, as a deny, then report the error.
+        delete body.retryOf;
         const rawPath = args.error.details?.["path"];
         const path = typeof rawPath === "string" ? redactText(rawPath) : null;
         body.argsRedacted = { _invalid: args.error.code, _path: path };
@@ -832,6 +1111,60 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         if (p.upstreamRef !== undefined) body.upstreamRef = p.upstreamRef;
         return appendTx.immediate({ body, callerTs: ts.value.callerTs });
       });
+    },
+
+    recordVerification(input: RecordVerificationInput): Result<AuditRecord> {
+      return guardedWrite(() => {
+        const parsed = verificationInputSchema.safeParse(input);
+        if (!parsed.success) {
+          return err("audit.invalid_input", "invalid verification input", {
+            issues: zodIssuePaths(parsed.error),
+          });
+        }
+        const p = parsed.data;
+        const id = resolveId(p.id);
+        if (!id.ok) return id;
+        const ts = resolveTs(p.ts);
+        if (!ts.ok) return ts;
+        const body: AuditVerificationBody = {
+          kind: "verification",
+          id: id.value,
+          attemptId: p.attemptId,
+          ts: ts.value.ts,
+          trigger: p.trigger,
+          result: p.result,
+          method: p.method,
+          needsHuman: p.needsHuman,
+        };
+        if (p.upstreamRef !== undefined) body.upstreamRef = p.upstreamRef;
+        if (p.errorCode !== undefined) body.errorCode = p.errorCode;
+        if (p.resolver !== undefined) body.resolver = p.resolver;
+        return appendTx.immediate({ body, callerTs: ts.value.callerTs });
+      });
+    },
+
+    readUnsettled(): Result<{ open: AuditActivity[]; unsettled: AuditActivity[] }> {
+      const all = scanAll();
+      if (!all.ok) return all;
+      const open: AuditActivity[] = [];
+      const unsettled: AuditActivity[] = [];
+      for (const a of all.value) {
+        const d = a.attempt.decision;
+        if (a.outcome === undefined) {
+          if (d === "allow" || d === "transform") open.push(a);
+          continue;
+        }
+        if (d === "deny") continue;
+        if (a.outcome.outcome !== "timeout" && a.outcome.outcome !== "upstream_error") continue;
+        if (a.verification === undefined || a.verification.result === "unknown") unsettled.push(a);
+      }
+      return ok({ open, unsettled });
+    },
+
+    listNeedsHuman(): Result<AuditActivity[]> {
+      const all = scanAll();
+      if (!all.ok) return all;
+      return ok(all.value.filter((a) => a.verification?.result === "unknown"));
     },
 
     readAll(): Result<Array<AuditRecord | InvalidAuditRow>> {

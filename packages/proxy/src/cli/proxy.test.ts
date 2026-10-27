@@ -25,6 +25,8 @@ import {
   loadCachedTools,
   openFirewall,
   parseDuplicateWindowMs,
+  parseMoneyCallTimeoutMs,
+  parseVerifyWaitMs,
   parseLockWaitMs,
   parseTimeoutMs,
   resolveProxyConfig,
@@ -639,12 +641,18 @@ describe("startProxy money pipeline wiring (T008)", () => {
     const r = resolveProxyConfig(SHELL, deps());
     if (!r.ok) throw new Error("config");
     const firewall = memFirewall();
+    const logs: string[] = [];
     const running = startProxy({
       config: r.value,
-      logger: () => undefined,
+      logger: (l) => logs.push(l),
       factory: fake.factory,
       firewall,
     });
+    // T010: startup reconciliation runs at once (empty log ⇒ nothing to verify) and ends the reconciling state.
+    const summary = await running.reconciled;
+    expect(summary.ok && summary.value.unresolved).toEqual([]);
+    expect(running.pipeline.isReconciling()).toBe(false);
+    expect(logs.join("\n")).toContain("startup reconciliation: 0 orphaned");
     const [a, b] = InMemoryTransport.createLinkedPair();
     await running.proxy.connect(b);
     const agent = new Client({ name: "t", version: "0" }, { capabilities: {} });
@@ -665,7 +673,11 @@ describe("startProxy money pipeline wiring (T008)", () => {
     );
     expect(jsonOf(refund)).toMatchObject({ id: "rfnd_CLI1" });
     const sent = fake.calls.find((c) => c.name === "create_refund");
-    expect(sent?.args).toEqual({ payment_id: "pay_CLI1", amount: 5_000 });
+    expect(sent?.args).toEqual({
+      payment_id: "pay_CLI1",
+      amount: 5_000,
+      notes: { asf_attempt: expect.any(String) as string },
+    });
     const rows = firewall.store.readAll();
     expect(rows.ok && rows.value).toMatchObject([
       { kind: "attempt", decision: "allow", tool: "create_refund" },
@@ -923,5 +935,43 @@ describe("T009 config: ASF_DUPLICATE_WINDOW_MS (shell env only)", () => {
     expect(r.ok && r.value.notes.join(" ")).toMatch(
       /ASF_DUPLICATE_WINDOW_MS from \.env is ignored/,
     );
+  });
+});
+
+describe("T010 settings: ASF_MONEY_CALL_TIMEOUT_MS / ASF_VERIFY_WAIT_MS (shell env only)", () => {
+  it("defaults, bounds, non-integers", () => {
+    expect(parseMoneyCallTimeoutMs(undefined)).toEqual({ ok: true, value: 10_000 });
+    expect(parseVerifyWaitMs("")).toEqual({ ok: true, value: 15_000 });
+    expect(parseMoneyCallTimeoutMs("1000")).toEqual({ ok: true, value: 1_000 });
+    expect(parseVerifyWaitMs("120000")).toEqual({ ok: true, value: 120_000 });
+    for (const bad of ["999", "120001", "1e4", "-5", "10.5", " 5000", "abc"]) {
+      expect(parseMoneyCallTimeoutMs(bad).ok).toBe(false);
+      expect(parseVerifyWaitMs(bad).ok).toBe(false);
+    }
+  });
+
+  it("shell values are used; .env values are ignored with a note; a bad shell value refuses to start", () => {
+    const r = resolveProxyConfig(
+      { ...SHELL, ASF_MONEY_CALL_TIMEOUT_MS: "2500", ASF_VERIFY_WAIT_MS: "3000" },
+      deps(),
+    );
+    expect(r.ok && [r.value.moneyCallTimeoutMs, r.value.verifyWaitMs]).toEqual([2_500, 3_000]);
+    const fromFile = resolveProxyConfig(
+      SHELL,
+      deps({ [`${ROOT}/.env`]: "ASF_MONEY_CALL_TIMEOUT_MS=1000\nASF_VERIFY_WAIT_MS=1000\n" }),
+    );
+    expect(fromFile.ok && [fromFile.value.moneyCallTimeoutMs, fromFile.value.verifyWaitMs]).toEqual(
+      [10_000, 15_000],
+    );
+    expect(fromFile.ok && fromFile.value.notes.join(" ")).toMatch(
+      /ASF_MONEY_CALL_TIMEOUT_MS from \.env is ignored/,
+    );
+    expect(fromFile.ok && fromFile.value.notes.join(" ")).toMatch(
+      /ASF_VERIFY_WAIT_MS from \.env is ignored/,
+    );
+    const bad = resolveProxyConfig({ ...SHELL, ASF_VERIFY_WAIT_MS: "5" }, deps());
+    expect(bad.ok === false && bad.error.code).toBe("proxy.bad_verify_wait");
+    const bad2 = resolveProxyConfig({ ...SHELL, ASF_MONEY_CALL_TIMEOUT_MS: "999999" }, deps());
+    expect(bad2.ok === false && bad2.error.code).toBe("proxy.bad_money_timeout");
   });
 });

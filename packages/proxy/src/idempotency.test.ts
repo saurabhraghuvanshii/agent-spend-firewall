@@ -15,6 +15,8 @@ import {
   IDEMPOTENCY_KEY_VERSION,
   idempotencyKey,
   idempotencyKeyFromRedacted,
+  mergeActivity,
+  statusOf,
   type FindDuplicateOpts,
 } from "./idempotency.js";
 import { nodeHasher } from "./node-hasher.js";
@@ -441,5 +443,81 @@ describe("findDuplicate", () => {
       "may_have_executed",
       "pending_approval",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T010: verifications
+// ---------------------------------------------------------------------------------------------------------------
+
+function verified(
+  a: AuditActivity,
+  result: "happened" | "not_happened" | "unknown",
+  agoMin = 1,
+  upstreamRef?: string,
+): AuditActivity {
+  return {
+    ...a,
+    verification: {
+      kind: "verification",
+      id: `ver-${a.attempt.id}`,
+      attemptId: a.attempt.id,
+      ts: new Date(NOW - agoMin * MIN).toISOString(),
+      trigger: "timeout",
+      result,
+      method: "refund_notes_marker",
+      needsHuman: result === "unknown",
+      ...(upstreamRef === undefined ? {} : { upstreamRef }),
+      seq: a.attempt.seq + 5,
+      prevHash: "0".repeat(64),
+      hash: "3".repeat(64),
+    },
+  };
+}
+
+describe("findDuplicate with T010 verifications", () => {
+  it("latest verification not_happened ⇒ not counted; happened ⇒ executed with the verified ref", () => {
+    expect(find([verified(row({ outcome: "timeout" }), "not_happened")])).toBeUndefined();
+    const h = verified(row({ outcome: "timeout" }), "happened", 1, "rfnd_VERIFIED1");
+    expect(find([h])).toEqual({
+      attemptId: h.attempt.id,
+      status: "executed",
+      upstreamRef: "rfnd_VERIFIED1",
+    });
+    // An upstream success stays executed whatever a later verification says.
+    expect(find([verified(row({ outcome: "success" }), "not_happened")])?.status).toBe("executed");
+  });
+
+  it("happened ages out with the executed window (measured from the verification)", () => {
+    const old = verified(row({ outcome: "timeout", attemptAgoMin: 60 }), "happened", 11);
+    expect(find([old])).toBeUndefined();
+    const recent = verified(row({ outcome: "timeout", attemptAgoMin: 60 }), "happened", 9);
+    expect(find([recent])?.status).toBe("executed");
+  });
+
+  it("unknown NEVER ages out (25 h, 30 days): may_have_executed", () => {
+    for (const ago of [25 * 60, 30 * 24 * 60]) {
+      const u = verified(row({ outcome: "timeout", attemptAgoMin: ago }), "unknown", ago);
+      expect(find([u])).toEqual({ attemptId: u.attempt.id, status: "may_have_executed" });
+    }
+    // Without a verification the same row ages out after 24 h.
+    expect(find([row({ outcome: "timeout", attemptAgoMin: 25 * 60 })])).toBeUndefined();
+  });
+
+  it("mergeActivity adds in-memory rows not in the scan; scan rows win", () => {
+    const scanned = verified(row({ outcome: "timeout", id: "same" }), "not_happened");
+    const memory = verified(row({ outcome: "timeout", id: "same" }), "unknown");
+    const extra = verified(
+      row({ outcome: "timeout", id: "extra", attemptAgoMin: 3000 }),
+      "unknown",
+      3000,
+    );
+    const merged = mergeActivity([scanned], [memory, extra]);
+    expect(merged.map((m) => [m.attempt.id, m.verification?.result])).toEqual([
+      ["same", "not_happened"],
+      ["extra", "unknown"],
+    ]);
+    expect(statusOf(extra)).toBe("may_have_executed");
+    expect(find(merged)?.attemptId).toBe("extra");
   });
 });

@@ -7,6 +7,7 @@ import {
   type AuditBody,
   type AuditOutcomeBody,
   type AuditRecord,
+  type AuditVerificationBody,
   type Hasher,
   type InvalidAuditRow,
 } from "./types.js";
@@ -482,5 +483,298 @@ describe("idempotencyKey (T009)", () => {
   it("an outcome with an explicitly-undefined key is treated as absent", () => {
     const o = { ...outcome("o1", "a1"), idempotencyKey: undefined } as unknown as AuditBody;
     expect(verifyChain(hasher, chainOf([keyed(), o]))).toMatchObject({ ok: true, count: 2 });
+  });
+});
+
+describe("verification records and retryOf (T010)", () => {
+  const LEGACY_A1_HASH = "c9a6cc62cacebb7d00e0413adc91c43e4da9f7186b3d15c830b0d39cbb15c4e2";
+
+  function verification(
+    id: string,
+    attemptId: string,
+    extra: Partial<AuditVerificationBody> = {},
+  ): AuditVerificationBody {
+    return {
+      kind: "verification",
+      id,
+      attemptId,
+      ts: "2026-10-23T10:00:20.000Z",
+      trigger: "timeout",
+      result: "not_happened",
+      method: "refund_notes_marker",
+      needsHuman: false,
+      ...extra,
+    };
+  }
+  const timeoutOutcome = (id: string, attemptId: string): AuditOutcomeBody => ({
+    kind: "outcome",
+    id,
+    attemptId,
+    ts: "2026-10-23T10:00:10.000Z",
+    outcome: "timeout",
+    errorCode: "upstream.timeout",
+    latencyMs: 10000,
+  });
+  const brokenReason = (r: ReturnType<typeof verifyChain>): string | undefined =>
+    r.ok ? undefined : r.brokenAt.reason;
+  /** Build every body as a valid chain (hash-wise) so only the semantic rule can break. */
+  const verify = (bs: AuditBody[]): ReturnType<typeof verifyChain> =>
+    verifyChain(hasher, chainOf(bs));
+  const asBody = (o: object): AuditBody => o as unknown as AuditBody;
+  const codeOf = (b: AuditBody): string | undefined => {
+    const r = computeHash(hasher, GENESIS_PREV_HASH, 1, b);
+    return r.ok ? undefined : r.error.code;
+  };
+
+  it("legacy attempt (no retryOf) keeps its known hash; explicit undefined is the same", () => {
+    expect(unwrap(computeHash(hasher, GENESIS_PREV_HASH, 1, attempt("a1")))).toBe(LEGACY_A1_HASH);
+    const undef = asBody({ ...attempt("a1"), retryOf: undefined });
+    expect(unwrap(computeHash(hasher, GENESIS_PREV_HASH, 1, undef))).toBe(LEGACY_A1_HASH);
+  });
+
+  it("retryOf is hashed when present (tampering detected)", () => {
+    const chain = chainOf([
+      attempt("a1"),
+      timeoutOutcome("o1", "a1"),
+      verification("v1", "a1"),
+      attempt("a2", { retryOf: "a1" }),
+    ]);
+    expect(verifyChain(hasher, chain)).toMatchObject({ ok: true, count: 4 });
+    const tampered = chain.map((r) => (r.id === "a2" ? { ...r, retryOf: "a0" } : r));
+    expect(brokenReason(verifyChain(hasher, tampered))).toBe("hash_mismatch");
+    const removed = chain.map((r) => {
+      if (r.id !== "a2") return r;
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { retryOf, ...rest } = r as AuditAttemptBody & AuditRecord;
+      return rest;
+    });
+    expect(brokenReason(verifyChain(hasher, removed))).toBe("hash_mismatch");
+  });
+
+  it("rejects a malformed retryOf or one on a non-attempt record", () => {
+    expect(codeOf(attempt("a1", { retryOf: "bad id!" }))).toBe("audit.invalid_retry_of");
+    expect(codeOf(asBody({ ...attempt("a1"), retryOf: 7 }))).toBe("audit.invalid_retry_of");
+    expect(codeOf(asBody({ ...outcome("o1", "a1"), retryOf: "a0" }))).toBe(
+      "audit.invalid_retry_of",
+    );
+    expect(codeOf(asBody({ ...verification("v1", "a1"), retryOf: "a0" }))).toBe(
+      "audit.invalid_retry_of",
+    );
+  });
+
+  it("verifies a full timeout → verify not_happened → single retry → success chain", () => {
+    const r = verify([
+      attempt("a1"),
+      timeoutOutcome("o1", "a1"),
+      verification("v1", "a1", { trigger: "late_response" }),
+      attempt("a2", { retryOf: "a1" }),
+      outcome("o2", "a2"),
+    ]);
+    expect(r).toMatchObject({ ok: true, count: 5, danglingAttempts: [] });
+  });
+
+  it("hashes verification records (tampering with result detected)", () => {
+    const chain = chainOf([attempt("a1"), timeoutOutcome("o1", "a1"), verification("v1", "a1")]);
+    const tampered = chain.map((r) => (r.id === "v1" ? { ...r, result: "happened" } : r));
+    expect(brokenReason(verifyChain(hasher, tampered as AuditRecord[]))).toBe("hash_mismatch");
+  });
+
+  it("accepts all valid enum values and optional fields", () => {
+    const ok1 = verification("v1", "a1", {
+      trigger: "startup",
+      result: "unknown",
+      method: "none",
+      needsHuman: true,
+      errorCode: "verify.lookup_failed",
+    });
+    expect(codeOf(ok1)).toBeUndefined();
+    const ok2 = verification("v1", "a1", {
+      trigger: "human",
+      result: "happened",
+      method: "none",
+      resolver: "telegram:12345",
+      upstreamRef: "rfnd_ABC123",
+    });
+    expect(codeOf(ok2)).toBeUndefined();
+    expect(codeOf(verification("v1", "a1", { method: "payment_status" }))).toBeUndefined();
+    expect(
+      codeOf(
+        asBody({ ...verification("v1", "a1", { trigger: "upstream_error" }), resolver: undefined }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it.each<[string, object]>([
+    ["unknown trigger", { trigger: "cron" }],
+    ["unknown result", { result: "maybe" }],
+    ["unknown method", { method: "guess" }],
+    ["non-boolean needsHuman", { needsHuman: "yes" }],
+    ["missing needsHuman", { needsHuman: undefined }],
+    ["bad upstreamRef", { upstreamRef: "rfnd 1" }],
+    ["non-string upstreamRef", { upstreamRef: 5 }],
+    ["bad errorCode (uppercase)", { errorCode: "Upstream.Timeout" }],
+    ["resolver without human trigger", { resolver: "telegram:1" }],
+    ["human trigger without resolver", { trigger: "human" }],
+    ["human trigger with PII resolver", { trigger: "human", resolver: "ops@example.com" }],
+    ["extra field", { note: "x" }],
+    ["bad id", { id: "v 1" }],
+    ["bad attemptId", { attemptId: "" }],
+    ["empty ts", { ts: "" }],
+    ["idempotencyKey", { idempotencyKey: "a".repeat(64) }],
+  ])("rejects a verification with %s (build and verify)", (_name, patch) => {
+    const body = asBody({ ...verification("v1", "a1"), ...patch });
+    const built = buildRecord(hasher, null, body);
+    expect(built.ok).toBe(false);
+    if (!built.ok) expect(built.error.code).toMatch(/^audit\.invalid_/);
+    // A stored row with the same body (hash computed elsewhere) is reported as invalid_row.
+    const chain = chainOf([attempt("a1"), timeoutOutcome("o1", "a1")]);
+    const prev = chain[1];
+    if (prev === undefined) throw new Error("unreachable");
+    const row = { ...body, seq: 3, prevHash: prev.hash, hash: "0".repeat(64) };
+    expect(brokenReason(verifyChain(hasher, [...chain, row]))).toBe("invalid_row");
+  });
+
+  it("orphan_verification: no earlier attempt with that id", () => {
+    expect(
+      brokenReason(verify([attempt("a1"), outcome("o1", "a1"), verification("v1", "zz")])),
+    ).toBe("orphan_verification");
+  });
+
+  it("orphan_verification: verification before its attempt", () => {
+    expect(brokenReason(verify([verification("v1", "a1"), attempt("a1")]))).toBe(
+      "orphan_verification",
+    );
+  });
+
+  it("verification_before_outcome: attempt has no outcome yet", () => {
+    const r = verify([attempt("a1"), verification("v1", "a1"), timeoutOutcome("o1", "a1")]);
+    expect(r).toMatchObject({ ok: false, brokenAt: { seq: 2, id: "v1" } });
+    expect(brokenReason(r)).toBe("verification_before_outcome");
+  });
+
+  it.each<[AuditVerificationBody["result"], AuditVerificationBody["result"]]>([
+    ["happened", "unknown"],
+    ["happened", "happened"],
+    ["not_happened", "happened"],
+    ["not_happened", "unknown"],
+  ])("verification_after_settled: %s then %s", (first, second) => {
+    const r = verify([
+      attempt("a1"),
+      timeoutOutcome("o1", "a1"),
+      verification("v1", "a1", { result: first }),
+      verification("v2", "a1", { result: second }),
+    ]);
+    expect(r).toMatchObject({ ok: false, brokenAt: { seq: 4, id: "v2" } });
+    expect(brokenReason(r)).toBe("verification_after_settled");
+  });
+
+  it("unknown may be followed by more verifications until settled", () => {
+    const r = verify([
+      attempt("a1"),
+      timeoutOutcome("o1", "a1"),
+      verification("v1", "a1", { result: "unknown", needsHuman: true, method: "none" }),
+      verification("v2", "a1", { result: "unknown", needsHuman: true, trigger: "startup" }),
+      verification("v3", "a1", { result: "happened", trigger: "late_response" }),
+    ]);
+    expect(r).toMatchObject({ ok: true, count: 5 });
+  });
+
+  it("a verification id colliding with another id is duplicate_id", () => {
+    expect(
+      brokenReason(verify([attempt("a1"), timeoutOutcome("o1", "a1"), verification("o1", "a1")])),
+    ).toBe("duplicate_id");
+  });
+
+  it("verifications are not outcomes: dangling attempts are unaffected", () => {
+    const r = verify([
+      attempt("a1"),
+      timeoutOutcome("o1", "a1"),
+      verification("v1", "a1"),
+      attempt("a2"),
+    ]);
+    expect(r).toMatchObject({ ok: true, danglingAttempts: ["a2"] });
+  });
+
+  describe("bad_retry_of", () => {
+    const base = (): AuditBody[] => [attempt("a1"), timeoutOutcome("o1", "a1")];
+
+    it("retryOf references no earlier attempt", () => {
+      expect(brokenReason(verify([...base(), attempt("a2", { retryOf: "nope" })]))).toBe(
+        "bad_retry_of",
+      );
+    });
+
+    it("retryOf references itself", () => {
+      expect(brokenReason(verify([...base(), attempt("a2", { retryOf: "a2" })]))).toBe(
+        "bad_retry_of",
+      );
+    });
+
+    it("original has no verification", () => {
+      expect(brokenReason(verify([...base(), attempt("a2", { retryOf: "a1" })]))).toBe(
+        "bad_retry_of",
+      );
+    });
+
+    it.each<AuditVerificationBody["result"]>(["happened", "unknown"])(
+      "original's latest verification is %s",
+      (result) => {
+        const r = verify([
+          ...base(),
+          verification("v1", "a1", { result }),
+          attempt("a2", { retryOf: "a1" }),
+        ]);
+        expect(brokenReason(r)).toBe("bad_retry_of");
+      },
+    );
+
+    it("original's verification comes after the retry", () => {
+      const r = verify([...base(), attempt("a2", { retryOf: "a1" }), verification("v1", "a1")]);
+      expect(brokenReason(r)).toBe("bad_retry_of");
+    });
+
+    it("original is a different tool", () => {
+      const r = verify([
+        ...base(),
+        verification("v1", "a1"),
+        attempt("a2", { retryOf: "a1", tool: "capture_payment" }),
+      ]);
+      expect(brokenReason(r)).toBe("bad_retry_of");
+    });
+
+    it("second retry of the same original", () => {
+      const r = verify([
+        ...base(),
+        verification("v1", "a1"),
+        attempt("a2", { retryOf: "a1" }),
+        timeoutOutcome("o2", "a2"),
+        attempt("a3", { retryOf: "a1" }),
+      ]);
+      expect(r).toMatchObject({ ok: false, brokenAt: { id: "a3" } });
+      expect(brokenReason(r)).toBe("bad_retry_of");
+    });
+
+    it("retry of a retry (never a second retry)", () => {
+      const r = verify([
+        ...base(),
+        verification("v1", "a1"),
+        attempt("a2", { retryOf: "a1" }),
+        timeoutOutcome("o2", "a2"),
+        verification("v2", "a2"),
+        attempt("a3", { retryOf: "a2" }),
+      ]);
+      expect(brokenReason(r)).toBe("bad_retry_of");
+    });
+
+    it("a retry that times out may itself be verified", () => {
+      const r = verify([
+        ...base(),
+        verification("v1", "a1"),
+        attempt("a2", { retryOf: "a1" }),
+        timeoutOutcome("o2", "a2"),
+        verification("v2", "a2", { result: "unknown", needsHuman: true }),
+      ]);
+      expect(r).toMatchObject({ ok: true, count: 6 });
+    });
   });
 });

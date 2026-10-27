@@ -24,17 +24,19 @@
  * only ever over-deny (fail closed, D-026).
  *
  * MATCHING (`findDuplicate`): a row is a duplicate of the call iff it is for the same exact tool, counts toward
- * limits (D-023: decision allow / transform / require_approval with outcome none / success / timeout /
- * upstream_error), is inside the time window (`t = max(attempt.ts, outcome.ts)`; executed (`success`):
- * `t ≥ now − windowMs`; open, or `timeout` / `upstream_error` (may have executed, unsettled until T010's
- * verify-before-retry): `t ≥ now − max(windowMs, openLookbackMs)`; an unparseable time is inside every window), is not excluded, and either its
+ * limits (core `activityStatus`, D-023 as amended by T010: executed = outcome `success` or latest verification
+ * `happened`; may have executed = `timeout` / `upstream_error` not yet verified; unknown = latest verification
+ * `unknown`; open = no outcome; a latest verification `not_happened` is NOT counted), is inside the time window
+ * (`t = max(attempt.ts, outcome.ts, verification.ts)`; executed: `t ≥ now − windowMs`; open / may have executed:
+ * `t ≥ now − max(windowMs, openLookbackMs)`; UNKNOWN: no age-out at all (it blocks until a human or a later
+ * verification settles it); an unparseable time is inside every window), is not excluded, and either its
  * stored `idempotencyKey` or the key recomputed from its `argsRedacted` / `originalArgsRedacted` is one of the
  * call's keys. A same-tool row whose key can't be recomputed is treated as a match (fail closed).
  */
 import {
+  activityStatus,
   activityTs,
   canonicalJson,
-  countsTowardLimits,
   err,
   ok,
   redact,
@@ -206,11 +208,51 @@ function validMs(v: unknown, min: number): v is number {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= min;
 }
 
-function statusOf(a: AuditActivity): DuplicateStatus {
-  if (a.outcome === undefined) {
-    return a.attempt.decision === "require_approval" ? "pending_approval" : "in_flight";
+/** Core `Countable` of an activity row (decision, outcome, latest verification). */
+export function countableOf(a: AuditActivity): {
+  decision: AuditActivity["attempt"]["decision"];
+  outcome?: NonNullable<AuditActivity["outcome"]>["outcome"];
+  verification?: NonNullable<AuditActivity["verification"]>["result"];
+} {
+  return {
+    decision: a.attempt.decision,
+    ...(a.outcome === undefined ? {} : { outcome: a.outcome.outcome }),
+    ...(a.verification === undefined ? {} : { verification: a.verification.result }),
+  };
+}
+
+/**
+ * Agent-facing duplicate status of a COUNTED row (T010: a latest verification `happened` reads as executed,
+ * `unknown` as may_have_executed).
+ */
+export function statusOf(a: AuditActivity): DuplicateStatus {
+  switch (activityStatus(countableOf(a))) {
+    case "open":
+      return a.attempt.decision === "require_approval" ? "pending_approval" : "in_flight";
+    case "executed":
+      return "executed";
+    default:
+      return "may_have_executed";
   }
-  return a.outcome.outcome === "success" ? "executed" : "may_have_executed";
+}
+
+/** Upstream reference of an executed row: the outcome's, else the `happened` verification's. */
+function refOf(a: AuditActivity): string | undefined {
+  return a.outcome?.upstreamRef ?? a.verification?.upstreamRef;
+}
+
+/**
+ * `rows` plus every row of `extra` whose attempt id is not already in `rows` (T010: unresolved `unknown` actions kept
+ * in memory beyond the audit scan window). Rows from the scan win: they carry the latest verification.
+ */
+export function mergeActivity(
+  rows: readonly AuditActivity[],
+  extra: Iterable<AuditActivity>,
+): AuditActivity[] {
+  const ids = new Set(rows.map((r) => r.attempt.id));
+  const out = [...rows];
+  for (const e of extra) if (!ids.has(e.attempt.id)) out.push(e);
+  return out;
 }
 
 /** Whether `a` matches one of `keys` (stored key, or recomputed from either stored args). Unrecomputable ⇒ true. */
@@ -253,22 +295,23 @@ export function findDuplicate(
   let best: AuditActivity | undefined;
   for (const a of rows) {
     if (a.attempt.tool !== tool) continue;
-    const open = a.outcome === undefined;
-    const countable = open
-      ? { decision: a.attempt.decision }
-      : { decision: a.attempt.decision, outcome: a.outcome.outcome };
-    if (!countsTowardLimits(countable)) continue;
+    const status = activityStatus(countableOf(a));
+    if (status === "not_counted") continue;
     if (opts.excludeAttemptIds?.has(a.attempt.id) === true) continue;
-    const ts = activityTs(a.attempt.ts, a.outcome?.ts);
-    // Unparseable time ⇒ inside every window (fail closed).
-    const executed = !open && a.outcome.outcome === "success";
-    if (ts !== undefined && ts < (executed ? executedCutoff : unsettledCutoff)) continue;
+    // `unknown` never ages out (T010): it blocks until settled.
+    if (status !== "unknown") {
+      const ts = activityTs(a.attempt.ts, a.outcome?.ts, a.verification?.ts);
+      // Unparseable time ⇒ inside every window (fail closed).
+      if (ts !== undefined && ts < (status === "executed" ? executedCutoff : unsettledCutoff)) {
+        continue;
+      }
+    }
     if (!rowMatches(a, tool, keys)) continue;
     if (best === undefined || a.attempt.seq > best.attempt.seq) best = a;
   }
   if (best === undefined) return ok(undefined);
   const status = statusOf(best);
-  const ref = best.outcome?.upstreamRef;
+  const ref = refOf(best);
   return ok(
     status === "executed" && ref !== undefined
       ? { attemptId: best.attempt.id, status, upstreamRef: ref }

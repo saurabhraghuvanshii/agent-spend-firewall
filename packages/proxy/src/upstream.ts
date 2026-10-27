@@ -16,7 +16,9 @@
  *   reconnects) unless the live connection is still that generation.
  * - Late responses: when a call times out or is cancelled, upstream may still answer. The SDK then reports
  *   "unknown message ID" with the FULL response body; we never log that body. Instead a tap on the transport emits a
- *   payload-free `LateResponse` event (`onLateResponse`) so T010 can reconcile.
+ *   payload-free `LateResponse` event (`onLateResponse`) so T010 can reconcile. The event carries only `isError`
+ *   (JSON-RPC error, or a result with `isError: true`) and a bounded failure classification (`upstream-failure.ts`:
+ *   definite Razorpay rejection vs ambiguous), computed while the response is delivered; the body is never kept.
  *
  * Nothing upstream-controlled is trusted for output: error messages go through `redact` (key id / secret in every
  * known encoding) and are length-capped; callers escape before printing to a terminal.
@@ -41,6 +43,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { escapeForTerminal } from "./cli/audit-verify.js";
+import { classifyToolResultFailure, type UpstreamFailure } from "./upstream-failure.js";
 import {
   discoverTools,
   errorText,
@@ -49,6 +52,13 @@ import {
 } from "./tool-discovery.js";
 
 export const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
+/**
+ * T010: per-call timeout for MONEY tools (`ASF_MONEY_CALL_TIMEOUT_MS`), shorter than reads so a hung refund is
+ * verified (verify-before-retry) while the agent still waits. Reads keep `DEFAULT_UPSTREAM_TIMEOUT_MS`.
+ */
+export const DEFAULT_MONEY_CALL_TIMEOUT_MS = 10_000;
+export const MIN_MONEY_CALL_TIMEOUT_MS = 1_000;
+export const MAX_MONEY_CALL_TIMEOUT_MS = 120_000;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 20_000;
 export const DEFAULT_RECONNECT_ATTEMPTS = 3;
 export const DEFAULT_BACKOFF_INITIAL_MS = 250;
@@ -139,8 +149,20 @@ export interface LateResponse {
   /** Epoch ms the request was sent, if known. */
   readonly sentAt: number | undefined;
   readonly receivedAt: number;
-  /** JSON-RPC level: a `result` or an `error` response (the tool result's own `isError` is not inspected). */
+  /** JSON-RPC level: a `result` or an `error` response. */
   readonly responseType: "result" | "error";
+  /**
+   * T010: true iff the response reports a failure — a JSON-RPC `error` response, or a `result` whose `isError` is
+   * exactly `true`. Only this boolean is read from the body (nothing else is kept). A `result` without
+   * `isError: true` is `false` (success, or a body we can't interpret as a failure).
+   */
+  readonly isError: boolean;
+  /**
+   * T010 (security review): what the failure proves (`upstream-failure.ts`). `none` iff `isError` is false; a JSON-RPC
+   * error is always `ambiguous`; an `isError: true` result is `definite_rejection` only for a recognised Razorpay
+   * client rejection. Classified while the response is delivered; the body itself is never kept.
+   */
+  readonly failure: UpstreamFailure;
 }
 
 export interface UpstreamOptions {
@@ -196,6 +218,17 @@ interface Delivering {
   readonly id: RequestId;
   readonly outbound: Outbound | undefined;
   readonly responseType: "result" | "error";
+  readonly isError: boolean;
+  readonly failure: UpstreamFailure;
+}
+
+/**
+ * Failure classification of a JSON-RPC response (only the enum is kept): an `error` response ⇒ ambiguous; a
+ * `result` ⇒ `classifyToolResultFailure` (`none` unless `isError === true`).
+ */
+export function responseFailure(message: JSONRPCMessage): UpstreamFailure {
+  if (!isJSONRPCResultResponse(message)) return "ambiguous";
+  return classifyToolResultFailure(message.result);
 }
 
 /**
@@ -273,10 +306,13 @@ export class TappedTransport implements Transport {
       this.onmessage?.(message, extra);
       return;
     }
+    const failure = responseFailure(message);
     this.delivering = {
       id,
       outbound: this.outbound.get(id),
       responseType: isResult ? "result" : "error",
+      isError: failure !== "none",
+      failure,
     };
     try {
       this.onmessage?.(message, extra);
@@ -479,6 +515,8 @@ export class Upstream implements UpstreamPort {
       sentAt: d.outbound?.sentAt,
       receivedAt: this.now(),
       responseType: d.responseType,
+      isError: d.isError,
+      failure: d.failure,
     };
     for (const l of [...this.lateListeners]) {
       try {

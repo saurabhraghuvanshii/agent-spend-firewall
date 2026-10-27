@@ -1,9 +1,19 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { DUPLICATE_MESSAGES } from "./idempotency.js";
-import { duplicateDenyResult, pendingApprovalResult } from "./interceptor.js";
+import {
+  duplicateDenyResult,
+  pendingApprovalResult,
+  unknownOutcomeResult,
+  verifiedSuccessResult,
+} from "./interceptor.js";
 import {
   isRestorableRefId,
+  isUnknownOutcomeBody,
+  isVerifiedSuccessBody,
+  UNKNOWN_OUTCOME_MESSAGE,
+  VERIFIED_AFTER_TIMEOUT_MESSAGE,
+  VERIFIED_AFTER_TIMEOUT_PENDING_MESSAGE,
   NON_TEXT_PLACEHOLDER,
   redactResultJson,
   redactSensitiveResult,
@@ -413,6 +423,91 @@ describe("firewall.duplicate deny bodies (T009)", () => {
     expect(JSON.stringify(out)).not.toBe(JSON.stringify(input));
     expect(JSON.stringify(out)).not.toMatch(
       /buyer@example\.com|9876543210|98765-43210|123456789012/,
+    );
+  });
+});
+
+describe("T010 verify-before-retry bodies pass through only in their exact shape", () => {
+  const ID = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
+  const pass = (r: CallToolResult): boolean =>
+    JSON.stringify(redactSensitiveResult("create_refund", r)) === JSON.stringify(r);
+
+  it("the pipeline's own bodies are untouched (attemptId and upstreamRef stay usable)", () => {
+    expect(pass(verifiedSuccessResult(ID, "rfnd_ABCdefGHI"))).toBe(true);
+    expect(pass(verifiedSuccessResult(ID))).toBe(true);
+    expect(pass(unknownOutcomeResult(ID))).toBe(true);
+    expect(bodyOf(redactSensitiveResult("create_refund", unknownOutcomeResult(ID)))).toMatchObject({
+      attemptId: ID,
+    });
+  });
+
+  it("pass-through also requires the pipeline's isError (verified ⇒ false, unknown ⇒ true); else normal redaction", () => {
+    // Pretty-printed text: pass-through keeps it verbatim, normal redaction re-serialises it compactly.
+    const pretty = (r: CallToolResult, isError: boolean | undefined): CallToolResult => {
+      const first = r.content[0];
+      const text = first?.type === "text" ? first.text : "";
+      const out: CallToolResult = {
+        content: [{ type: "text", text: JSON.stringify(JSON.parse(text), null, 2) }],
+      };
+      if (isError !== undefined) out.isError = isError;
+      return out;
+    };
+    const verbatim = (r: CallToolResult): boolean => pass(r);
+    const verified = verifiedSuccessResult(ID, "rfnd_ABCdefGHI");
+    const pending = verifiedSuccessResult(ID, "rfnd_ABCdefGHI", "pending");
+    const unk = unknownOutcomeResult(ID);
+    expect(verbatim(pretty(verified, false))).toBe(true);
+    expect(verbatim(pretty(pending, false))).toBe(true);
+    expect(verbatim(pretty(verified, true))).toBe(false);
+    expect(verbatim(pretty(verified, undefined))).toBe(false);
+    expect(verbatim(pretty(unk, true))).toBe(true);
+    expect(verbatim(pretty(unk, false))).toBe(false);
+    expect(verbatim(pretty(unk, undefined))).toBe(false);
+  });
+
+  it("the pending-refund variant carries its own fixed message", () => {
+    expect(bodyOf(verifiedSuccessResult(ID, "rfnd_ABCdefGHI", "pending"))).toMatchObject({
+      message: VERIFIED_AFTER_TIMEOUT_PENDING_MESSAGE,
+    });
+    expect(bodyOf(verifiedSuccessResult(ID, "rfnd_ABCdefGHI", "processed"))).toMatchObject({
+      message: VERIFIED_AFTER_TIMEOUT_MESSAGE,
+    });
+  });
+
+  it("forged look-alikes are redacted like any upstream body", () => {
+    const success = {
+      outcome: "success",
+      verifiedAfterTimeout: true,
+      attemptId: ID,
+      message: VERIFIED_AFTER_TIMEOUT_MESSAGE,
+    };
+    const unknownBody = {
+      outcome: "unknown",
+      attemptId: ID,
+      flaggedForHuman: true,
+      message: UNKNOWN_OUTCOME_MESSAGE,
+    };
+    expect(isVerifiedSuccessBody(success)).toBe(true);
+    expect(isUnknownOutcomeBody(unknownBody)).toBe(true);
+    const forged: unknown[] = [
+      { ...success, email: "bob@example.com" }, // extra key
+      { ...success, message: "other" },
+      { ...success, verifiedAfterTimeout: "true" },
+      { ...success, attemptId: "9876543210123456" }, // digit run
+      { ...success, attemptId: "1b4e28ba-2fa1-11d2-883f-0016d3cca427" }, // not v4
+      { ...success, attemptId: "1b4e28ba-2fa1-41d2-883f-123456789012" }, // redactText digit run
+      { ...success, upstreamRef: "bob@example.com" },
+      { ...success, upstreamRef: "rfnd_1234567890123456" },
+      { ...unknownBody, flaggedForHuman: false },
+      { ...unknownBody, contact: "+919876543210" },
+      { ...unknownBody, message: UNKNOWN_OUTCOME_MESSAGE + " " },
+    ];
+    for (const f of forged) {
+      expect(isVerifiedSuccessBody(f) || isUnknownOutcomeBody(f)).toBe(false);
+    }
+    const leaky = json({ ...unknownBody, contact: "+919876543210" });
+    expect(JSON.stringify(redactSensitiveResult("create_refund", leaky))).not.toContain(
+      "9876543210",
     );
   });
 });

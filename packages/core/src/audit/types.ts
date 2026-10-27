@@ -16,7 +16,19 @@ export interface Hasher {
   sha256Hex(input: string): string;
 }
 
-export type AuditKind = "attempt" | "outcome";
+/**
+ * Shape rules shared by the core chain validator and storage adapters (the proxy's zod schemas mirror these).
+ * Record / attempt id: printable ASCII token (UUIDs, `att-1`, `rfnd_x:1`).
+ */
+export const RECORD_ID_RE: RegExp = /^[A-Za-z0-9_.:-]{1,128}$/;
+/** Upstream resource id, e.g. `rfnd_ABC123xyz`. */
+export const UPSTREAM_REF_RE: RegExp = /^[A-Za-z0-9_.:-]{1,128}$/;
+/** Lowercase machine code, e.g. `upstream.timeout`. */
+export const ERROR_CODE_RE: RegExp = /^[a-z0-9_.:-]{1,64}$/;
+/** Opaque approver / resolver id: `telegram:<1-20 digits>` or `dashboard:<[a-z0-9_-]{1,32}>`. Never PII. */
+export const APPROVER_RE: RegExp = /^(?:telegram:[0-9]{1,20}|dashboard:[a-z0-9_-]{1,32})$/;
+
+export type AuditKind = "attempt" | "outcome" | "verification";
 
 export type AuditDecision = "allow" | "deny" | "require_approval" | "transform";
 
@@ -50,6 +62,13 @@ export interface AuditAttemptBody {
   decision: AuditDecision;
   matchedRules: string[];
   approver?: string;
+  /**
+   * T010: id of an earlier attempt of the same tool that this attempt retries (same format as attempt ids,
+   * `RECORD_ID_RE`). Only allowed when the original's latest verification is `not_happened`, at most one retry per
+   * original, and a retry is never itself retried (`verifyChain` ⇒ `bad_retry_of`). Hashed only when present, so
+   * rows without it hash exactly as before. Only attempts may carry it.
+   */
+  retryOf?: string;
 }
 
 /** Chained record describing what happened to an earlier attempt. */
@@ -65,7 +84,55 @@ export interface AuditOutcomeBody {
   upstreamRef?: string;
 }
 
-export type AuditBody = AuditAttemptBody | AuditOutcomeBody;
+/** What triggered a verification of an unsettled money action (T010). */
+export type AuditVerificationTrigger =
+  "timeout" | "upstream_error" | "late_response" | "startup" | "human";
+export const AUDIT_VERIFICATION_TRIGGERS: readonly AuditVerificationTrigger[] = [
+  "timeout",
+  "upstream_error",
+  "late_response",
+  "startup",
+  "human",
+];
+
+/** Whether the upstream applied the action. Only `unknown` may be followed by further verifications. */
+export type AuditVerificationResult = "happened" | "not_happened" | "unknown";
+export const AUDIT_VERIFICATION_RESULTS: readonly AuditVerificationResult[] = [
+  "happened",
+  "not_happened",
+  "unknown",
+];
+
+/** How the result was established. `none`: no lookup possible (result is then `unknown`, or a human decided). */
+export type AuditVerificationMethod = "refund_notes_marker" | "payment_status" | "none";
+export const AUDIT_VERIFICATION_METHODS: readonly AuditVerificationMethod[] = [
+  "refund_notes_marker",
+  "payment_status",
+  "none",
+];
+
+/**
+ * Chained record (T010) settling — or failing to settle — an attempt whose outcome left it unclear whether the
+ * upstream applied it (timeout, sent-then-failed). Several may exist per attempt, but only while the latest is
+ * `unknown`. Validated strictly in `computeHash`: no extra keys; enums exact; `needsHuman` boolean;
+ * `upstreamRef` ⇒ `UPSTREAM_REF_RE`; `errorCode` ⇒ `ERROR_CODE_RE`; `resolver` ⇒ `APPROVER_RE`, required iff
+ * `trigger === "human"`.
+ */
+export interface AuditVerificationBody {
+  kind: "verification";
+  id: string;
+  attemptId: string;
+  ts: string;
+  trigger: AuditVerificationTrigger;
+  result: AuditVerificationResult;
+  method: AuditVerificationMethod;
+  needsHuman: boolean;
+  upstreamRef?: string;
+  errorCode?: string;
+  resolver?: string;
+}
+
+export type AuditBody = AuditAttemptBody | AuditOutcomeBody | AuditVerificationBody;
 
 export type AuditRecord = AuditBody & { seq: number; prevHash: string; hash: string };
 
@@ -84,7 +151,11 @@ export type VerifyBreakReason =
   | "orphan_outcome"
   | "duplicate_outcome"
   | "duplicate_id"
-  | "hasher_error";
+  | "hasher_error"
+  | "orphan_verification"
+  | "verification_before_outcome"
+  | "verification_after_settled"
+  | "bad_retry_of";
 
 export type VerifyResult =
   | { ok: true; count: number; headHash: string; danglingAttempts: string[] }

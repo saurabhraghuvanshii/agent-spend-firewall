@@ -179,6 +179,26 @@ export interface ForwardReport {
 const forwardReports = new WeakMap<CallToolResult, ForwardReport>();
 
 /**
+ * T010: ONE extra send of the same tool call, for verify-before-retry. Issued by the server only on a result of the
+ * call's FIRST `forward` whose report is `upstream_timeout` or a sent (`forwarded: true`) `upstream_error`. Same
+ * checks as `forward` (plain JSON args, current list, unchanged schema, generation pinned); usable once and only
+ * before the intercepted call settles (else refused `firewall.forward_twice` / `firewall.forward_after_settle`, not
+ * sent). Its own results never carry another `RetryForward`. Callers MUST verify that the first send did not
+ * execute before using it.
+ */
+export type RetryForward = (args: Record<string, unknown>) => Promise<CallToolResult>;
+
+const retryForwards = new WeakMap<CallToolResult, RetryForward>();
+
+/**
+ * The retry capability attached to a result returned by `forward`, if any (see `RetryForward`). Keyed by object
+ * identity in a module-private map, so an interceptor cannot forge one.
+ */
+export function retryForwardOf(r: CallToolResult): RetryForward | undefined {
+  return retryForwards.get(r);
+}
+
+/**
  * The report for a result returned by the server's `forward`, or `undefined` for any other object (a result built by
  * an interceptor, or a copy of a forwarded result — reports are keyed by object identity).
  */
@@ -265,6 +285,8 @@ export interface ProxyServerOptions {
    */
   readonly advertise?: (tool: Tool, toolClass: ToolClass) => Tool;
   readonly callTimeoutMs?: number;
+  /** T010: upstream timeout for MONEY tool calls (`ASF_MONEY_CALL_TIMEOUT_MS`). Default: `callTimeoutMs`. */
+  readonly moneyCallTimeoutMs?: number;
   readonly logger?: Logger;
   /** Applied to every message derived from upstream / errors before it reaches the agent or the log. */
   readonly redact?: Redactor;
@@ -482,26 +504,19 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
         let sendAttempted = false;
         const refused = (r: CallToolResult): CallToolResult =>
           tagged(r, { sent: false, kind: "refused", latencyMs: 0 });
-        const forward: Forward = async (forwardArgs) => {
-          if (settled) {
-            log(`interceptor called forward after settling (${escapeForTerminal(name)}); refused`);
-            return refused(
-              denyResult(
-                "firewall.forward_after_settle",
-                "the firewall refused a late forward of this call; it was not sent",
-              ),
-            );
-          }
-          if (forwardUsed) {
-            log(`interceptor called forward twice (${escapeForTerminal(name)}); refused`);
-            return refused(
-              denyResult(
-                "firewall.forward_twice",
-                "the firewall refused to send this call twice; the second send was not made",
-              ),
-            );
-          }
-          forwardUsed = true;
+        const timeoutMs =
+          ctx.toolClass === "money" && opts.moneyCallTimeoutMs !== undefined
+            ? opts.moneyCallTimeoutMs
+            : opts.callTimeoutMs;
+        /**
+         * One send to upstream (validated, re-checked against the current list, generation pinned). `issueRetry`: a
+         * timeout / sent-then-failed result of THIS send gets a one-use `RetryForward` (T010); a retry's own result
+         * never does.
+         */
+        const send = async (
+          forwardArgs: Record<string, unknown>,
+          issueRetry: boolean,
+        ): Promise<CallToolResult> => {
           // Validate the given value (structuredClone would silently drop prototypes), then validate the copy that
           // is actually sent, so later mutation by the interceptor can't change it.
           let toSend: unknown;
@@ -534,7 +549,7 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
           const outcome = await upstream.callTool(name, toSend, {
             signal: extra.signal,
             expectedGeneration: current.generation,
-            ...(opts.callTimeoutMs === undefined ? {} : { timeoutMs: opts.callTimeoutMs }),
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
           });
           const latencyMs = elapsedMs(started, now());
           const result = toCallResult(name, outcome);
@@ -547,13 +562,67 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
               generation: current.generation,
             });
           }
-          return tagged(result, {
+          const fresh = tagged(result, {
             sent: outcome.forwarded,
             kind: outcome.error,
             latencyMs: outcome.forwarded ? latencyMs : 0,
             ...(outcome.requestId === undefined ? {} : { requestId: outcome.requestId }),
             generation: outcome.generation ?? current.generation,
           });
+          if (
+            issueRetry &&
+            outcome.forwarded &&
+            (outcome.error === "upstream_timeout" || outcome.error === "upstream_error")
+          ) {
+            retryForwards.set(fresh, retryForward);
+          }
+          return fresh;
+        };
+        let retryUsed = false;
+        /** The one extra send (T010): same rules as `forward`, usable once, never after the call settled. */
+        const retryForward: RetryForward = async (retryArgs) => {
+          if (settled) {
+            log(`interceptor called retry after settling (${escapeForTerminal(name)}); refused`);
+            return refused(
+              denyResult(
+                "firewall.forward_after_settle",
+                "the firewall refused a late forward of this call; it was not sent",
+              ),
+            );
+          }
+          if (retryUsed) {
+            log(`interceptor called retry twice (${escapeForTerminal(name)}); refused`);
+            return refused(
+              denyResult(
+                "firewall.forward_twice",
+                "the firewall refused to send this call twice; the second send was not made",
+              ),
+            );
+          }
+          retryUsed = true;
+          return send(retryArgs, false);
+        };
+        const forward: Forward = async (forwardArgs) => {
+          if (settled) {
+            log(`interceptor called forward after settling (${escapeForTerminal(name)}); refused`);
+            return refused(
+              denyResult(
+                "firewall.forward_after_settle",
+                "the firewall refused a late forward of this call; it was not sent",
+              ),
+            );
+          }
+          if (forwardUsed) {
+            log(`interceptor called forward twice (${escapeForTerminal(name)}); refused`);
+            return refused(
+              denyResult(
+                "firewall.forward_twice",
+                "the firewall refused to send this call twice; the second send was not made",
+              ),
+            );
+          }
+          forwardUsed = true;
+          return send(forwardArgs, true);
         };
         let result: CallToolResult;
         try {

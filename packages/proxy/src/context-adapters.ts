@@ -3,13 +3,15 @@
  * upstream Razorpay MCP server, and system clock / timer. Also the firewall's own order lookup (`createOrderLookup`,
  * T008 INR invariant for order-based money tools; not a policy port).
  *
- * Semantics (D-023): an audited action counts toward history / velocity iff
- * - `countsTowardLimits({ decision, outcome })` (executed, possibly executed, or pending; never denied / not
- *   forwarded),
+ * Semantics (D-023, amended by T010): an audited action counts toward history / velocity iff
+ * - `countsTowardLimits({ decision, outcome, verification })` (executed, possibly executed, unknown, or pending;
+ *   never denied / not forwarded / verified `not_happened`),
  * - its tool is one of the queried tools,
  * - its attempt id is not in `excludeAttemptIds` (e.g. the attempt being evaluated), and
  * - its activity time is in range:
- *   - CLOSED actions (an outcome was recorded): `activityTs(attempt.ts, outcome.ts)` is at or after `now − window`;
+ *   - CLOSED actions (an outcome was recorded): `activityTs(attempt.ts, outcome.ts, verification.ts)` is at or after
+ *     `now − window`; an action whose latest verification is `unknown` counts regardless of time (T010, no age-out —
+ *     within the rows the audit read returns);
  *   - OPEN actions (decision allow / transform / require_approval with NO outcome yet: in flight, awaiting or
  *     approved-but-not-executed approval) count for EVERY window as long as they are younger than
  *     `openLookbackMs` (default 24 h). A still-pending approval can execute at any moment, so it must keep
@@ -31,6 +33,7 @@
 import {
   activityTs,
   argsMatch,
+  blocksIndefinitely,
   countsTowardLimits,
   err,
   ok,
@@ -52,6 +55,7 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { AuditActivity, AuditStore } from "./audit-store.js";
+import { countableOf } from "./idempotency.js";
 import { CREDENTIAL_LEAK_RESULT, screenResult } from "./server.js";
 import { classifyTool } from "./tool-classes.js";
 import { noRedact, type CallOptions, type Redactor, type UpstreamCallOutcome } from "./upstream.js";
@@ -206,15 +210,15 @@ function countedActivity(
   const counted: AuditActivity[] = [];
   for (const a of rows.value) {
     const open = a.outcome === undefined;
-    const countable = open
-      ? { decision: a.attempt.decision }
-      : { decision: a.attempt.decision, outcome: a.outcome.outcome };
+    const countable = countableOf(a);
     if (!countsTowardLimits(countable)) continue;
     if (!tools.has(a.attempt.tool)) continue;
     if (exclude?.has(a.attempt.id) === true) continue;
-    const ts = activityTs(a.attempt.ts, a.outcome?.ts);
-    // Unparseable time ⇒ treat as inside every window (fail closed).
-    if (ts !== undefined && ts < (open ? openCutoff : cutoff)) continue;
+    if (!blocksIndefinitely(countable)) {
+      const ts = activityTs(a.attempt.ts, a.outcome?.ts, a.verification?.ts);
+      // Unparseable time ⇒ treat as inside every window (fail closed).
+      if (ts !== undefined && ts < (open ? openCutoff : cutoff)) continue;
+    }
     counted.push(a);
   }
   return ok(counted);
@@ -380,7 +384,11 @@ async function strictLookup(
   }
 }
 
-function parseSingleJson(result: CallToolResult, what: string): Result<unknown> {
+/**
+ * Exactly one JSON text item of a (credential-screened) lookup result, parsed; `err` (`razorpay.*`) otherwise.
+ * Shared with T010's action verifier.
+ */
+export function parseSingleJson(result: CallToolResult, what: string): Result<unknown> {
   if (result === CREDENTIAL_LEAK_RESULT) {
     return lookupErr("credential_leak", `${what} lookup result contained credential material`);
   }

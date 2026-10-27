@@ -50,6 +50,26 @@
  *  8. Envelope: any `{decision:"deny"}` result for a money call that the stage did not produce (e.g. a
  *     `moneyArgsStage` deny) is audited as attempt `deny` (args minus `reason`, reason "", matchedRules [ruleId]) +
  *     outcome `denied`.
+ *
+ * T010 — verify before retry (see `failure.ts`):
+ *  - Notes: an agent- or transform-supplied `notes` key starting with `asf_` (any case), more than 14 notes, or a
+ *    non-object `notes` on `create_refund` ⇒ deny `firewall.invalid_args`. For a non-deny `create_refund` the attempt
+ *    id is generated BEFORE `recordAttempt` and stamped as `notes.asf_attempt`; the stamped args are recorded and
+ *    forwarded (the idempotency key ignores notes).
+ *  - After a forward whose outcome may hide an execution (timeout incl. cancelled-after-send, sent-then-failed,
+ *    tool error, credential-leak replacement, forward threw) the action is VERIFIED with Razorpay and one
+ *    `verification` record is written: happened ⇒ `{outcome:"success", verifiedAfterTimeout:true, attemptId,
+ *    upstreamRef?}` (`isError: false`); not_happened ⇒ for a timed-out `create_refund` whose LATE answer was a
+ *    failure (and complete refund list without the marker), exactly ONE retry through the server's `RetryForward`
+ *    (no policy re-run; firewall invariants + duplicate check under the global lock, excluding the original; new
+ *    attempt id + marker, `retryOf` = original); a tool error keeps its upstream result; unknown ⇒
+ *    `{outcome:"unknown", attemptId, flaggedForHuman:true}` (`isError: true`), a stderr line, and the action stays
+ *    in an in-memory `unresolved` set merged into every duplicate check (no age-out) until a later verification
+ *    settles it. A late answer arriving after the flag re-verifies in the background (trigger `late_response`) under
+ *    the resource locks. A retry that times out is verified once and never retried again.
+ *  - `startReconciling`: until `reconcile()` finishes every money call is denied `firewall.reconciling` (audited);
+ *    reads work. `reconcile()` runs `reconcileAtStartup` and loads the still-unknown actions into `unresolved`; its
+ *    failure latches the pipeline degraded.
  */
 import {
   canonicalJson,
@@ -58,6 +78,7 @@ import {
   type Clock,
   type CompiledPolicy,
   type Decision,
+  type AuditRecord,
   type EvalResult,
   type Result,
   type Timer,
@@ -70,7 +91,15 @@ import {
   type ApprovalPort,
 } from "./approval-port.js";
 import { escapeForTerminal } from "./cli/audit-verify.js";
-import { upstreamRefSchema, type AuditStore, type AuditOutcomeInput } from "./audit-store.js";
+import {
+  upstreamRefSchema,
+  type AuditActivity,
+  type AuditAttemptRecord,
+  type AuditOutcomeInput,
+  type AuditOutcomeRecord,
+  type AuditStore,
+  type AuditVerificationRecord,
+} from "./audit-store.js";
 import {
   createOrderLookup,
   createPolicyDeps,
@@ -80,6 +109,24 @@ import {
   type ActivityReader,
   type UpstreamPaymentPort,
 } from "./context-adapters.js";
+import {
+  createActionVerifier,
+  createLateResponseTracker,
+  DEFAULT_VERIFY_WAIT_MS,
+  handleUnsettled,
+  lateKey,
+  MAX_VERIFY_WAIT_MS,
+  notesProblem,
+  reconcileAtStartup,
+  REJECTED_ERROR_CODE,
+  RETRYABLE_TOOLS,
+  stampAttemptMarker,
+  type ActionVerifier,
+  type LateResponseSource,
+  type ReconcileSummary,
+  type UnsettledDeps,
+} from "./failure.js";
+import { redactionSafeUuid } from "./ids.js";
 import { composeInterceptors, firewallChain, type Next, type Stage } from "./interceptor-chain.js";
 import {
   DEFAULT_DUPLICATE_WINDOW_MS,
@@ -87,6 +134,7 @@ import {
   findDuplicate,
   idempotencyKey,
   MAX_DUPLICATE_WINDOW_MS,
+  mergeActivity,
   MIN_DUPLICATE_WINDOW_MS,
   type DuplicateHit,
 } from "./idempotency.js";
@@ -97,18 +145,29 @@ import {
   hasSafeTopLevelKeys,
   isBounded,
 } from "./money-args.js";
-import { isSafeUpstreamRef, PENDING_APPROVAL_MESSAGE } from "./result-redaction.js";
+import {
+  isSafeUpstreamRef,
+  PENDING_APPROVAL_MESSAGE,
+  UNKNOWN_OUTCOME_MESSAGE,
+  VERIFIED_AFTER_TIMEOUT_MESSAGE,
+  VERIFIED_AFTER_TIMEOUT_PENDING_MESSAGE,
+  type UnknownOutcomeBody,
+  type VerifiedSuccessBody,
+} from "./result-redaction.js";
 import { rewriteMoneySchema } from "./schema-rewrite.js";
 import {
   denyResult,
   forwardReportOf,
   jsonErrorResult,
+  retryForwardOf,
   type CallContext,
   type CallInterceptor,
   type ForwardReport,
+  type RetryForward,
 } from "./server.js";
 import { classifyTool } from "./tool-classes.js";
-import { noRedact, type Logger, type Redactor } from "./upstream.js";
+import { noRedact, type LateResponse, type Logger, type Redactor } from "./upstream.js";
+import { classifyToolResultFailure, type UpstreamFailure } from "./upstream-failure.js";
 
 export const DEFAULT_LOCK_WAIT_MS = 5000;
 
@@ -131,12 +190,20 @@ export const FIREWALL_RULES = {
   notImplemented: "firewall.not_implemented",
   duplicate: "firewall.duplicate",
   duplicateCheckFailed: "firewall.duplicate_check_failed",
+  reconciling: "firewall.reconciling",
 } as const;
+
+export const RECONCILING_MESSAGE =
+  "the firewall is checking earlier unsettled money actions with Razorpay after a restart; try again in a moment. The call was not sent";
+
+/** Agent-facing body when a timed-out action was verified NOT executed but could not be retried. */
+export const NOT_RETRIED_MESSAGE =
+  "the upstream call did not answer in time; the firewall verified with Razorpay that the action was NOT executed and did not retry it. You may try again";
 
 /** Store surface the pipeline needs. */
 export type PipelineStore = Pick<
   AuditStore,
-  "recordAttempt" | "recordOutcome" | "readActivitySince"
+  "recordAttempt" | "recordOutcome" | "readActivitySince" | "recordVerification" | "readUnsettled"
 >;
 
 export interface PreCheckDeny {
@@ -179,6 +246,21 @@ export interface MoneyPipelineOptions {
    * once at creation for the operator. Read tools are unaffected.
    */
   readonly startDegraded?: { readonly reason: string; readonly message: string };
+  /** T010: late-response events of the upstream (`Upstream`); without them no retry can ever happen. */
+  readonly lateResponses?: LateResponseSource;
+  /**
+   * T010: how long to wait for the late answer of a timed-out refund before deciding, integer ms in
+   * `[1, MAX_VERIFY_WAIT_MS]` (default `DEFAULT_VERIFY_WAIT_MS`); else `createMoneyPipeline` throws.
+   */
+  readonly verifyWaitMs?: number;
+  /** Timer for that wait (default `timer`). */
+  readonly verifyTimer?: Timer;
+  /** Per-lookup timeout of verification lookups (see `VerifierOptions`). */
+  readonly verifyLookupTimeoutMs?: number;
+  /** Injected verifier (tests). Default: `createActionVerifier` over `upstream`. */
+  readonly verifier?: ActionVerifier;
+  /** T010: deny money calls `firewall.reconciling` until `reconcile()` has finished. */
+  readonly startReconciling?: boolean;
 }
 
 export interface ExecuteApprovedRequest {
@@ -207,6 +289,16 @@ export interface MoneyPipeline {
   executeApproved(req: ExecuteApprovedRequest): Promise<CallToolResult>;
   /** True once an outcome write failed; all later money calls are denied. */
   isDegraded(): boolean;
+  /**
+   * T010 startup reconciliation (`reconcileAtStartup`), once. Ends the `reconciling` state whatever happens; an error
+   * latches the pipeline degraded. Skipped (err) when the pipeline is already degraded.
+   */
+  reconcile(): Promise<Result<ReconcileSummary>>;
+  isReconciling(): boolean;
+  /** Attempt ids flagged unknown and still unresolved (in memory). */
+  unresolvedAttemptIds(): string[];
+  /** Stop listening for late responses. */
+  close(): void;
 }
 
 /**
@@ -258,6 +350,45 @@ function withoutReason(args: Readonly<Record<string, unknown>>): Record<string, 
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args)) if (k !== "reason") out[k] = v;
   return out;
+}
+
+/** An attempt that was (or was about to be) sent. */
+interface SentAttempt {
+  readonly id: string;
+  readonly record: AuditAttemptRecord | undefined;
+  /** Args as forwarded (stamped). */
+  readonly args: Record<string, unknown>;
+}
+
+/** What a retry of the original attempt re-uses. */
+interface RetryContext {
+  readonly decision: "allow" | "transform";
+  readonly matchedRules: string[];
+  readonly recordedKey: string;
+  /** Policy `finalArgs` (unstamped). */
+  readonly finalArgs: Readonly<Record<string, unknown>>;
+  readonly transformed: boolean;
+  readonly reason: string;
+}
+
+/** A flagged (unknown) action waiting for its late answer. */
+interface FlaggedLate {
+  readonly attemptId: string;
+  readonly tool: string;
+  readonly args: Record<string, unknown>;
+  /** What the answer in hand at flag time proved; merged with the late answer (ambiguous always wins). */
+  readonly failure: UpstreamFailure;
+}
+
+/** Max flagged actions remembered for late answers (oldest evicted; they stay flagged, only the auto-settle is lost). */
+const MAX_FLAGGED_LATE = 1024;
+
+/** Resource targets (top-level string `payment_id` / `order_id`) of forwarded args. */
+function targetsOf(args: Readonly<Record<string, unknown>>): { payment?: string; order?: string } {
+  const t: { payment?: string; order?: string } = {};
+  if (typeof args["payment_id"] === "string") t.payment = args["payment_id"];
+  if (typeof args["order_id"] === "string") t.order = args["order_id"];
+  return t;
 }
 
 interface OutcomeSpec {
@@ -326,7 +457,12 @@ export function outcomeFor(r: CallToolResult, report: ForwardReport | undefined)
   switch (report.kind) {
     case "ok": {
       if (r.isError === true) {
-        return { outcome: "upstream_error", errorCode: "upstream.tool_error", latencyMs };
+        // A definite Razorpay rejection is recorded distinctly so startup reconciliation can tell it apart.
+        const errorCode =
+          classifyToolResultFailure(r) === "definite_rejection"
+            ? REJECTED_ERROR_CODE
+            : "upstream.tool_error";
+        return { outcome: "upstream_error", errorCode, latencyMs };
       }
       const ref = upstreamRefOf(r);
       return ref === undefined
@@ -392,7 +528,7 @@ interface FinalArgsProblem {
  * resources. `undefined` = OK.
  */
 export function checkFinalArgs(
-  ctx: Pick<CallContext, "args" | "inputSchema">,
+  ctx: Pick<CallContext, "args" | "inputSchema"> & { readonly tool?: string },
   finalArgs: Readonly<Record<string, unknown>>,
 ): FinalArgsProblem | undefined {
   if (retargetsIds(ctx.args, finalArgs)) {
@@ -410,6 +546,13 @@ export function checkFinalArgs(
     return {
       ruleId: FIREWALL_RULES.invalidArgs,
       message: "a policy transform produced invalid arguments; the call was denied",
+    };
+  }
+  const notes = notesProblem(ctx.tool ?? "", finalArgs);
+  if (notes !== undefined) {
+    return {
+      ruleId: FIREWALL_RULES.invalidArgs,
+      message: `a policy transform produced invalid notes (${notes}); the call was denied`,
     };
   }
   if (!allCurrenciesInr(finalArgs)) {
@@ -450,6 +593,70 @@ export function duplicateDenyResult(hit: DuplicateHit): CallToolResult {
   });
 }
 
+/** T010 `verifiedAfterTimeout` success (shape passed through verbatim by `redactSensitiveResult`). */
+export function verifiedSuccessResult(
+  attemptId: string,
+  upstreamRef?: string,
+  refundStatus?: string,
+): CallToolResult {
+  const body: VerifiedSuccessBody = {
+    outcome: "success",
+    verifiedAfterTimeout: true,
+    attemptId,
+    ...(isSafeUpstreamRef(upstreamRef) ? { upstreamRef } : {}),
+    message:
+      refundStatus === "pending"
+        ? VERIFIED_AFTER_TIMEOUT_PENDING_MESSAGE
+        : VERIFIED_AFTER_TIMEOUT_MESSAGE,
+  };
+  return { isError: false, content: [{ type: "text", text: JSON.stringify(body) }] };
+}
+
+/** T010 unknown outcome (shape passed through verbatim by `redactSensitiveResult`). */
+export function unknownOutcomeResult(attemptId: string): CallToolResult {
+  const body: UnknownOutcomeBody = {
+    outcome: "unknown",
+    attemptId,
+    flaggedForHuman: true,
+    message: UNKNOWN_OUTCOME_MESSAGE,
+  };
+  return { isError: true, content: [{ type: "text", text: JSON.stringify(body) }] };
+}
+
+/** Why a forwarded call's outcome is unsettled (needs verification), or `undefined` if it is settled. */
+export function unsettledTriggerOf(
+  r: CallToolResult,
+  report: ForwardReport | undefined,
+):
+  | {
+      readonly trigger: "timeout" | "upstream_error";
+      readonly toolError: boolean;
+      /** What the answer in hand proves (only a direct tool error carries one; see `upstream-failure.ts`). */
+      readonly failure: UpstreamFailure;
+    }
+  | undefined {
+  const noAnswer = (trigger: "timeout" | "upstream_error") =>
+    ({ trigger, toolError: false, failure: "none" }) as const;
+  if (report === undefined) return noAnswer("upstream_error");
+  switch (report.kind) {
+    case "ok":
+      return r.isError === true
+        ? { trigger: "upstream_error", toolError: true, failure: classifyToolResultFailure(r) }
+        : undefined;
+    case "credential_leak":
+      // The upstream body was replaced: nothing in hand can be classified.
+      return noAnswer("upstream_error");
+    case "upstream_timeout":
+    case "cancelled":
+      return report.sent ? noAnswer("timeout") : undefined;
+    case "upstream_unavailable":
+    case "upstream_error":
+      return report.sent ? noAnswer("upstream_error") : undefined;
+    case "refused":
+      return undefined;
+  }
+}
+
 /** Valid `duplicateWindowMs` (integer ms within bounds). */
 export function isValidDuplicateWindowMs(v: unknown): v is number {
   return (
@@ -474,6 +681,16 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       `duplicateWindowMs must be an integer between ${String(MIN_DUPLICATE_WINDOW_MS)} and ${String(MAX_DUPLICATE_WINDOW_MS)}`,
     );
   }
+  const verifyWaitMs = o.verifyWaitMs ?? DEFAULT_VERIFY_WAIT_MS;
+  if (
+    !Number.isSafeInteger(verifyWaitMs) ||
+    verifyWaitMs < 1 ||
+    verifyWaitMs > MAX_VERIFY_WAIT_MS
+  ) {
+    throw new RangeError(
+      `verifyWaitMs must be an integer between 1 and ${String(MAX_VERIFY_WAIT_MS)}`,
+    );
+  }
   const resourceLocks = createKeyedMutex();
   const globalLock = createMutex();
   const calls = new WeakMap<object, CallInfo>();
@@ -495,6 +712,35 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     ...(o.lookupTimeoutMs === undefined ? {} : { lookupTimeoutMs: o.lookupTimeoutMs }),
   };
 
+  // ---- T010 state ----
+  const verifier =
+    o.verifier ??
+    createActionVerifier({
+      upstream: o.upstream,
+      redact,
+      ...(o.verifyLookupTimeoutMs === undefined
+        ? {}
+        : { lookupTimeoutMs: o.verifyLookupTimeoutMs }),
+    });
+  const tracker = createLateResponseTracker({
+    source: o.lateResponses,
+    timer: o.verifyTimer ?? o.timer,
+    logger: log,
+  });
+  const unsettledDeps: UnsettledDeps = {
+    store: o.store,
+    verifier,
+    tracker,
+    verifyWaitMs,
+    logger: log,
+  };
+  let reconciling = o.startReconciling === true;
+  let reconcileStarted = false;
+  /** Actions whose latest verification is `unknown`: they block duplicates with no age-out. */
+  const unresolved = new Map<string, AuditActivity>();
+  /** Flagged actions waiting for their late answer, keyed by `lateKey(generation, requestId)`. */
+  const flaggedLate = new Map<string, FlaggedLate>();
+
   const latch = (why: string): void => {
     if (!degraded) {
       log(
@@ -504,8 +750,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     degraded = true;
   };
 
-  /** Record an outcome. `false` (and a log line) on failure. */
-  const recordOutcome = (attemptId: string, spec: OutcomeSpec): boolean => {
+  /** Record an outcome; the record, or `undefined` (and a log line) on failure. */
+  const writeOutcome = (attemptId: string, spec: OutcomeSpec): AuditOutcomeRecord | undefined => {
     const r = o.store.recordOutcome({
       attemptId,
       outcome: spec.outcome,
@@ -515,10 +761,18 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     });
     if (!r.ok) {
       log(`audit outcome write failed for attempt ${attemptId}: ${r.error.code}`);
-      return false;
+      return undefined;
     }
-    return true;
+    if (r.value.kind !== "outcome") {
+      log(`audit outcome write for attempt ${attemptId} returned an unexpected record`);
+      return undefined;
+    }
+    return r.value;
   };
+
+  /** Record an outcome. `false` (and a log line) on failure. */
+  const recordOutcome = (attemptId: string, spec: OutcomeSpec): boolean =>
+    writeOutcome(attemptId, spec) !== undefined;
 
   /** Write attempt `deny` + outcome `denied`. Audit write failures are logged (the call is denied regardless). */
   const recordDenied = (info: CallInfo, rec: DenyRecord, ruleId: string): void => {
@@ -585,7 +839,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     if (!Number.isSafeInteger(now) || now < 0) return { failed: "clock returned an invalid time" };
     const rows = read(now - Math.max(duplicateWindowMs, DEFAULT_OPEN_LOOKBACK_MS));
     if (!rows.ok) return { failed: `audit activity read failed: ${rows.error.code}` };
-    return { rows: rows.value, nowMs: now };
+    // T010: unresolved (unknown) actions older than the scan still block.
+    return { rows: mergeActivity(rows.value, unresolved.values()), nowMs: now };
   };
 
   const duplicateCheckFailed = (info: CallInfo, base: DenyRecord, why: string): CallToolResult => {
@@ -649,6 +904,9 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     if (degraded) {
       return auditedDeny(info, base, FIREWALL_RULES.auditUnavailable, degradedMessage);
     }
+    if (reconciling) {
+      return auditedDeny(info, base, FIREWALL_RULES.reconciling, RECONCILING_MESSAGE);
+    }
     if (o.preCheck !== undefined) {
       let pre: PreCheckDeny | undefined;
       try {
@@ -663,6 +921,11 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         );
       }
       if (pre !== undefined) return auditedDeny(info, base, pre.ruleId, pre.message);
+    }
+    // T010: `asf_*` notes are the firewall's marker namespace.
+    const notes = notesProblem(info.tool, ctx.args);
+    if (notes !== undefined) {
+      return auditedDeny(info, base, FIREWALL_RULES.invalidArgs, `${notes}; the call was not sent`);
     }
 
     // 1. Per-resource locks (payment and/or order), in sorted key order.
@@ -785,7 +1048,11 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       }
     }
     let res: EvalResult;
-    let attempt: Result<{ id: string }>;
+    let attempt: Result<AuditRecord>;
+    /** Args recorded and (for allow / transform) forwarded: `finalArgs` + the T010 marker. */
+    let forwardArgs: Record<string, unknown> = {};
+    let recordedKey: string;
+    let transformed: boolean;
     try {
       // 3a. Duplicate check (T009) on the agent's args, sharing one audit read with the policy.
       const agentKey = idempotencyKey(info.tool, ctx.args);
@@ -809,9 +1076,9 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         { tool: info.tool, args: ctx.args, reason, sessionId: ctx.sessionId },
         deps,
       );
-      let recordedKey = agentKey.value;
+      recordedKey = agentKey.value;
       if (res.decision.type !== "deny") {
-        const bad = checkFinalArgs(ctx, res.finalArgs);
+        const bad = checkFinalArgs({ ...ctx, tool: info.tool }, res.finalArgs);
         if (bad !== undefined) {
           return auditedDeny(
             info,
@@ -850,17 +1117,33 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         recordedKey = finalKey.value;
       }
       const d = res.decision;
-      const transformed = d.type !== "deny" && !sameJson(res.finalArgs, ctx.args);
+      transformed = d.type !== "deny" && !sameJson(res.finalArgs, ctx.args);
+      // T010: pre-generate the attempt id and stamp it into the forwarded args (notes marker).
+      let presetId: string | undefined;
+      if (d.type !== "deny") {
+        presetId = redactionSafeUuid();
+        const stamped = stampAttemptMarker(info.tool, res.finalArgs, presetId);
+        if (!stamped.ok) {
+          return auditedDeny(
+            info,
+            { ...keyedBase, matchedRules: [...d.matchedRules, FIREWALL_RULES.invalidArgs] },
+            FIREWALL_RULES.invalidArgs,
+            "notes must be an object of key-value pairs; the call was not sent",
+          );
+        }
+        forwardArgs = stamped.value;
+      }
       attempt = o.store.recordAttempt({
         sessionId: ctx.sessionId,
         tool: info.tool,
-        args: d.type === "deny" ? ctx.args : res.finalArgs,
+        args: d.type === "deny" ? ctx.args : forwardArgs,
         ...(transformed ? { originalArgs: ctx.args } : {}),
         reason,
         decision: d.type,
         matchedRules: withRuleId(d),
-        // Key of the recorded args (the forwarded ones for a non-deny decision).
+        // Key of the recorded args (the forwarded ones for a non-deny decision; notes are never part of it).
         idempotencyKey: recordedKey,
+        ...(presetId === undefined ? {} : { id: presetId }),
       });
     } finally {
       got.value();
@@ -891,6 +1174,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       );
     }
     const attemptId = attempt.value.id;
+    const attemptRecord = attempt.value.kind === "attempt" ? attempt.value : undefined;
     const d = res.decision;
 
     // 5. Deny.
@@ -981,39 +1265,332 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       });
       return mark(info, denyResult(FIREWALL_RULES.auditUnavailable, degradedMessage));
     }
-    // The attempt's `idempotencyKey` (recorded above) identifies this logical action; T010 uses it to look the
-    // resource up before any retry. Razorpay's MCP tools take no idempotency header, so nothing is attached here.
-    let r: CallToolResult;
+    // Razorpay's MCP tools take no idempotency header: the attempt's `idempotencyKey` (duplicate check) and the notes
+    // marker (verification, T010) identify this logical action.
+    let r: CallToolResult | undefined;
     try {
-      r = await next({ ...ctx, args: res.finalArgs });
+      r = await next({ ...ctx, args: forwardArgs });
     } catch (e: unknown) {
       log(
         `forwarding ${escapeForTerminal(info.tool)} threw ${e instanceof Error ? e.name : typeof e}`,
       );
+      r = undefined;
+    }
+    const retryCtx: RetryContext = {
+      decision: d.type,
+      matchedRules: withRuleId(d),
+      recordedKey,
+      finalArgs: res.finalArgs,
+      transformed,
+      reason,
+    };
+    return settleForward(
+      ctx,
+      info,
+      { id: attemptId, record: attemptRecord, args: forwardArgs },
+      r,
+      retryCtx,
+    );
+  };
+
+  /** Result when `forward` threw (the call may have reached Razorpay). */
+  const forwardThrewResult = (): CallToolResult =>
+    jsonErrorResult({
+      error: "upstream_error",
+      message:
+        "the firewall failed while sending this call; it may have reached Razorpay — check its status before retrying",
+      forwarded: true,
+    });
+
+  const notRetriedResult = (): CallToolResult =>
+    jsonErrorResult({ error: "upstream_timeout", message: NOT_RETRIED_MESSAGE, forwarded: true });
+
+  /**
+   * Record the outcome of a send (`r` undefined: forward threw) and, if it may hide an execution, verify it (T010)
+   * and map the verification to the agent's result. `retryCtx` is given only for the ORIGINAL send.
+   */
+  const settleForward = async (
+    ctx: CallContext,
+    info: CallInfo,
+    sent: SentAttempt,
+    r: CallToolResult | undefined,
+    retryCtx: RetryContext | undefined,
+  ): Promise<CallToolResult> => {
+    const report = r === undefined ? undefined : forwardReportOf(r);
+    const spec: OutcomeSpec =
+      r === undefined
+        ? { outcome: "upstream_error", errorCode: FIREWALL_RULES.forwardThrew, latencyMs: 0 }
+        : outcomeFor(r, report);
+    const fallback = r ?? forwardThrewResult();
+    const outcomeRec = writeOutcome(sent.id, spec);
+    if (outcomeRec === undefined) {
+      latch(`the outcome of attempt ${sent.id} (${spec.outcome}) could not be recorded`);
+      return mark(info, fallback);
+    }
+    const trig =
+      r === undefined
+        ? { trigger: "upstream_error" as const, toolError: false, failure: "none" as const }
+        : unsettledTriggerOf(r, report);
+    // Settled, or the audit log is degraded (verification records can't be trusted to land): result as is.
+    if (trig === undefined || degraded) return mark(info, fallback);
+
+    const token: RetryForward | undefined =
+      r !== undefined && retryCtx !== undefined && RETRYABLE_TOOLS.has(info.tool)
+        ? retryForwardOf(r)
+        : undefined;
+    const waitLate =
+      token !== undefined &&
+      report?.kind === "upstream_timeout" &&
+      report.requestId !== undefined &&
+      report.generation !== undefined &&
+      !ctx.signal.aborted
+        ? { generation: report.generation, requestId: report.requestId }
+        : undefined;
+    const res = await handleUnsettled(unsettledDeps, {
+      attemptId: sent.id,
+      tool: info.tool,
+      args: sent.args,
+      trigger: trig.trigger,
+      failure: trig.failure,
+      ...(waitLate === undefined ? {} : { waitLate }),
+    });
+    if (res.auditFailed) {
+      latch(`the verification of attempt ${sent.id} could not be recorded`);
+      return mark(info, unknownOutcomeResult(sent.id));
+    }
+    const f = res.finding;
+    if (f.result === "happened") {
+      return mark(info, verifiedSuccessResult(sent.id, f.upstreamRef, f.refundStatus));
+    }
+    if (f.result === "not_happened") {
+      if (trig.toolError) return mark(info, fallback);
+      // Retry preconditions: a timed-out refund (token + waitLate) whose LATE answer was a failure. `retryOnce`
+      // re-checks cancellation and the degraded latch.
       if (
-        !recordOutcome(attemptId, {
-          outcome: "upstream_error",
-          errorCode: FIREWALL_RULES.forwardThrew,
+        token !== undefined &&
+        retryCtx !== undefined &&
+        waitLate !== undefined &&
+        res.lateRejection
+      ) {
+        return retryOnce(ctx, info, sent.id, retryCtx, token);
+      }
+      log(
+        `attempt ${sent.id} was verified not executed; not retried (no late definite-rejection answer)`,
+      );
+      return mark(info, notRetriedResult());
+    }
+    flagUnresolved(info.tool, sent, outcomeRec, res.record, report, trig);
+    return mark(info, unknownOutcomeResult(sent.id));
+  };
+
+  /** Keep an unknown action blocking (no age-out) and listen for its late answer. */
+  const flagUnresolved = (
+    tool: string,
+    sent: SentAttempt,
+    outcome: AuditOutcomeRecord,
+    verification: AuditVerificationRecord | undefined,
+    report: ForwardReport | undefined,
+    trig: { readonly trigger: "timeout" | "upstream_error"; readonly failure: UpstreamFailure },
+  ): void => {
+    if (sent.record !== undefined && verification !== undefined) {
+      unresolved.set(sent.id, { attempt: sent.record, outcome, verification });
+    }
+    // Only a timed-out / cancelled send can still get a late answer; a direct answer (tool error) already arrived.
+    if (trig.trigger !== "timeout") return;
+    if (report?.requestId === undefined || report.generation === undefined) return;
+    if (flaggedLate.size >= MAX_FLAGGED_LATE) {
+      const oldest = flaggedLate.keys().next();
+      if (oldest.done !== true) flaggedLate.delete(oldest.value);
+    }
+    const key = lateKey(report.generation, report.requestId);
+    const entry: FlaggedLate = { attemptId: sent.id, tool, args: sent.args, failure: trig.failure };
+    flaggedLate.set(key, entry);
+    // The answer may already have arrived (between the wait and now).
+    const already = tracker.take(report.generation, report.requestId);
+    if (already !== undefined) void settleLate(key, entry, already);
+  };
+
+  /** Background re-verification of a flagged action whose late answer arrived (trigger `late_response`). */
+  const settleLate = async (
+    key: string,
+    entry: FlaggedLate,
+    late: Pick<LateResponse, "isError" | "failure">,
+  ): Promise<void> => {
+    flaggedLate.delete(key);
+    const releases: Release[] = [];
+    try {
+      const keys = resourceLockKeys(targetsOf(entry.args));
+      for (const k of keys) {
+        const got = await resourceLocks.acquire(k, { timeoutMs: lockWaitMs });
+        if (!got.ok) {
+          log(
+            `late answer for attempt ${entry.attemptId} not re-verified (${got.error.code}); it stays flagged for a human`,
+          );
+          return;
+        }
+        releases.push(got.value);
+      }
+      if (degraded || !unresolved.has(entry.attemptId)) return;
+      const res = await handleUnsettled(unsettledDeps, {
+        attemptId: entry.attemptId,
+        tool: entry.tool,
+        args: entry.args,
+        trigger: "late_response",
+        failure: entry.failure,
+        late,
+        recordUnknown: false,
+      });
+      if (res.auditFailed) {
+        latch(`the late-response verification of attempt ${entry.attemptId} could not be recorded`);
+        return;
+      }
+      if (res.record !== undefined && res.finding.result !== "unknown") {
+        unresolved.delete(entry.attemptId);
+        log(
+          `late answer settled attempt ${entry.attemptId} (${escapeForTerminal(entry.tool)}): ${res.finding.result}`,
+        );
+      } else {
+        log(
+          `late answer for attempt ${entry.attemptId} did not settle it; still flagged for a human`,
+        );
+      }
+    } catch (e: unknown) {
+      log(
+        `late-response verification failed (${e instanceof Error ? e.name : typeof e}); still flagged`,
+      );
+    } finally {
+      for (const release of releases.reverse()) release();
+    }
+  };
+
+  tracker.onUnclaimed((e) => {
+    const key = lateKey(e.generation, e.requestId);
+    const entry = flaggedLate.get(key);
+    if (entry === undefined) return;
+    tracker.take(e.generation, e.requestId);
+    void settleLate(key, entry, e);
+  });
+
+  /**
+   * The single retry (T010) after the original was verified NOT executed on a late failure answer. No policy re-run:
+   * the firewall invariants and the duplicate check (excluding the original) run under the global lock; the retry
+   * gets a new attempt id + marker and `retryOf` = original. Its own unclear outcome is verified once, never retried.
+   */
+  const retryOnce = async (
+    ctx: CallContext,
+    info: CallInfo,
+    originalId: string,
+    rc: RetryContext,
+    token: RetryForward,
+  ): Promise<CallToolResult> => {
+    const notRetried = (why: string): CallToolResult => {
+      log(`attempt ${originalId} was verified not executed but not retried: ${why}`);
+      return mark(info, notRetriedResult());
+    };
+    if (ctx.signal.aborted) return notRetried("the request was cancelled");
+    if (degraded) return notRetried("the audit log is degraded");
+    const bad = checkFinalArgs({ ...ctx, tool: info.tool }, rc.finalArgs);
+    if (bad !== undefined) return notRetried(bad.ruleId);
+    const got = await globalLock.acquire({ timeoutMs: lockWaitMs, signal: ctx.signal });
+    if (!got.ok) return notRetried(got.error.code);
+    let att: Result<AuditRecord> | undefined;
+    let stamped: Record<string, unknown>;
+    try {
+      if (degraded) return notRetried("the audit log is degraded");
+      const scope = duplicateScope(memoisedReader(o.store));
+      if ("failed" in scope) return notRetried(scope.failed);
+      const dup = findDuplicate(scope.rows, info.tool, new Set([rc.recordedKey]), {
+        nowMs: scope.nowMs,
+        windowMs: duplicateWindowMs,
+        openLookbackMs: DEFAULT_OPEN_LOOKBACK_MS,
+        excludeAttemptIds: new Set([originalId]),
+      });
+      if (!dup.ok) return notRetried(dup.error.code);
+      if (dup.value !== undefined) {
+        log(`retry of attempt ${originalId} skipped: duplicate of ${dup.value.attemptId}`);
+        return mark(info, duplicateDenyResult(dup.value));
+      }
+      const retryId = redactionSafeUuid();
+      const s = stampAttemptMarker(info.tool, rc.finalArgs, retryId);
+      if (!s.ok) return notRetried(s.error.code);
+      stamped = s.value;
+      att = o.store.recordAttempt({
+        id: retryId,
+        retryOf: originalId,
+        sessionId: ctx.sessionId,
+        tool: info.tool,
+        args: stamped,
+        ...(rc.transformed ? { originalArgs: ctx.args } : {}),
+        reason: rc.reason,
+        decision: rc.decision,
+        matchedRules: rc.matchedRules,
+        idempotencyKey: rc.recordedKey,
+      });
+    } finally {
+      got.value();
+    }
+    if (!att.ok) return notRetried(`retry attempt not recorded (${att.error.code})`);
+    const retryAttempt = att.value;
+    if (ctx.signal.aborted || degraded) {
+      const cancelled = ctx.signal.aborted;
+      if (
+        !recordOutcome(retryAttempt.id, {
+          outcome: "not_forwarded",
+          errorCode: cancelled ? "agent.cancelled" : FIREWALL_RULES.auditUnavailable,
           latencyMs: 0,
         })
       ) {
-        latch("an outcome could not be recorded after a failed forward");
+        latch("a retry's not_forwarded outcome could not be recorded");
       }
-      return mark(
-        info,
-        jsonErrorResult({
-          error: "upstream_error",
-          message:
-            "the firewall failed while sending this call; it may have reached Razorpay — check its status before retrying",
-          forwarded: true,
-        }),
+      return notRetried(cancelled ? "the request was cancelled" : "the audit log is degraded");
+    }
+    log(`retrying attempt ${originalId} once as ${retryAttempt.id} (verified not executed)`);
+    let r2: CallToolResult | undefined;
+    try {
+      r2 = await token(stamped);
+    } catch (e: unknown) {
+      log(
+        `retry of ${escapeForTerminal(info.tool)} threw ${e instanceof Error ? e.name : typeof e}`,
       );
+      r2 = undefined;
     }
-    const spec = outcomeFor(r, forwardReportOf(r));
-    if (!recordOutcome(attemptId, spec)) {
-      latch(`the outcome of attempt ${attemptId} (${spec.outcome}) could not be recorded`);
+    return settleForward(
+      ctx,
+      info,
+      {
+        id: retryAttempt.id,
+        record: retryAttempt.kind === "attempt" ? retryAttempt : undefined,
+        args: stamped,
+      },
+      r2,
+      undefined,
+    );
+  };
+
+  const reconcile = async (): Promise<Result<ReconcileSummary>> => {
+    if (reconcileStarted) return err("firewall.reconcile_twice", "reconciliation already ran");
+    reconcileStarted = true;
+    try {
+      if (degraded) {
+        log("startup reconciliation skipped: the audit log is degraded");
+        return err("audit_unavailable", "the audit log is degraded");
+      }
+      const r = await reconcileAtStartup({ store: o.store, verifier, logger: log });
+      if (!r.ok) {
+        latch(`startup reconciliation failed (${r.error.code})`);
+        return r;
+      }
+      for (const a of r.value.unresolved) unresolved.set(a.attempt.id, a);
+      log(
+        `startup reconciliation: ${String(r.value.orphaned)} orphaned, ${String(r.value.happened)} happened, ${String(r.value.notHappened)} not happened, ${String(r.value.unresolved.length)} need a human (${String(r.value.lookups)} lookups)`,
+      );
+      return r;
+    } catch (e: unknown) {
+      latch(`startup reconciliation threw ${e instanceof Error ? e.name : typeof e}`);
+      return err("firewall.reconcile_failed", "startup reconciliation failed");
+    } finally {
+      reconciling = false;
     }
-    return mark(info, r);
   };
 
   const envelope = (inner: CallInterceptor): CallInterceptor => ({
@@ -1056,6 +1633,12 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         ),
       ),
     isDegraded: () => degraded,
+    reconcile,
+    isReconciling: () => reconciling,
+    unresolvedAttemptIds: () => [...unresolved.keys()],
+    close: () => {
+      tracker.close();
+    },
   };
 }
 

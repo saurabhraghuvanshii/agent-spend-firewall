@@ -5,40 +5,110 @@
  */
 import { canonicalJson } from "../audit/canonical-json.js";
 import { redact } from "../audit/redact.js";
-import type { AuditDecision, AuditOutcome, JsonValue } from "../audit/types.js";
+import type {
+  AuditDecision,
+  AuditOutcome,
+  AuditVerificationResult,
+  JsonValue,
+} from "../audit/types.js";
 import { isPlainObject } from "./context.js";
 import type { Args } from "./types.js";
 
-/** An audit attempt's decision joined with its outcome record, if one exists yet. */
-export type Countable = { decision: AuditDecision; outcome?: AuditOutcome };
+/**
+ * An audit attempt's decision joined with its outcome record, if one exists yet, and the `result` of its LATEST
+ * verification record (T010, highest seq), if any.
+ */
+export type Countable = {
+  decision: AuditDecision;
+  outcome?: AuditOutcome;
+  verification?: AuditVerificationResult;
+};
+
+/**
+ * Settlement status of an audited action (D-023 as amended by T010):
+ * - `executed`: outcome `success`, or latest verification `happened`. Ages out after the duplicate window.
+ * - `may_have_executed`: outcome `timeout` / `upstream_error` and no verification yet. Ages out after the open
+ *   lookback (24 h) until verified.
+ * - `unknown`: latest verification `unknown` — may have executed and could not be settled. NEVER ages out
+ *   (`blocksIndefinitely`), until a later `happened` / `not_happened` verification exists.
+ * - `open`: no outcome yet (in flight, or awaiting / approved but not executed).
+ * - `not_counted`: `deny`, outcome `denied` / `not_forwarded`, latest verification `not_happened`, or a decision /
+ *   outcome outside the audit schema.
+ */
+export type ActivityStatus = "executed" | "may_have_executed" | "unknown" | "open" | "not_counted";
 
 const COUNTED_DECISIONS: ReadonlySet<string> = new Set<AuditDecision>([
   "allow",
   "transform",
   "require_approval",
 ]);
-const COUNTED_OUTCOMES: ReadonlySet<string> = new Set<AuditOutcome>([
-  "success",
+const MAY_HAVE_EXECUTED_OUTCOMES: ReadonlySet<string> = new Set<AuditOutcome>([
   "timeout",
   "upstream_error",
 ]);
 
 /**
- * Whether an audited action counts toward history / velocity limits.
+ * Settlement status of an audited action; see `ActivityStatus`. Precedence, first match wins:
+ * 1. decision not in {allow, transform, require_approval} ⇒ `not_counted` (nothing was ever sent).
+ * 2. outcome `success` ⇒ `executed` (an upstream success is authoritative; a later verification cannot undo it).
+ * 3. latest verification `happened` ⇒ `executed`; `not_happened` ⇒ `not_counted`; `unknown` ⇒ `unknown`.
+ *    A verification value outside the audit schema ⇒ `unknown` (fail closed: keeps blocking).
+ * 4. no verification: D-023 — no outcome ⇒ `open`; `timeout` / `upstream_error` ⇒ `may_have_executed`;
+ *    anything else ⇒ `not_counted`.
+ */
+export function activityStatus(a: Countable): ActivityStatus {
+  if (!COUNTED_DECISIONS.has(a.decision)) return "not_counted";
+  if (a.outcome === "success") return "executed";
+  if (a.verification !== undefined) {
+    if (a.verification === "happened") return "executed";
+    if (a.verification === "not_happened") return "not_counted";
+    return "unknown";
+  }
+  if (a.outcome === undefined) return "open";
+  return MAY_HAVE_EXECUTED_OUTCOMES.has(a.outcome) ? "may_have_executed" : "not_counted";
+}
+
+/**
+ * Whether an audited action counts toward history / velocity / duplicate limits: `activityStatus(a)` is anything
+ * but `not_counted`.
  *
- * Counted: actions that were executed (`success`), may have executed (`timeout`,
- * `upstream_error` — the upstream may have applied them), or are still pending (no outcome yet:
- * in flight, or awaiting / approved but not yet executed). Counting pending actions stops the same
- * refund from being queued twice.
+ * Counted: actions that were executed (`success`, or verified `happened`), may have executed (`timeout`,
+ * `upstream_error` not yet verified, or verified `unknown`), or are still pending (no outcome yet: in flight, or
+ * awaiting / approved but not yet executed). Counting pending actions stops the same refund from being queued twice.
  *
- * Not counted: `deny` decisions, and any action whose outcome is `denied` (e.g. approval rejected
- * or expired) or `not_forwarded` (never sent upstream).
+ * Not counted: `deny` decisions, any action whose outcome is `denied` (e.g. approval rejected or expired) or
+ * `not_forwarded` (never sent upstream), and any action whose latest verification is `not_happened`.
  *
  * Unknown decision / outcome values (not in the audit schema) are not counted.
  */
 export function countsTowardLimits(a: Countable): boolean {
-  if (!COUNTED_DECISIONS.has(a.decision)) return false;
-  return a.outcome === undefined || COUNTED_OUTCOMES.has(a.outcome);
+  return activityStatus(a) !== "not_counted";
+}
+
+/**
+ * True iff the action is counted and must NOT age out of any window or lookback (latest verification `unknown`):
+ * callers must count it regardless of its timestamp, however old.
+ */
+export function blocksIndefinitely(a: Countable): boolean {
+  return activityStatus(a) === "unknown";
+}
+
+/**
+ * Latest verification result per attempt id from verification records in any order (highest `seq` wins).
+ * Pure helper for adapters building `Countable.verification`.
+ */
+export function latestVerifications(
+  records: Iterable<{ attemptId: string; seq: number; result: AuditVerificationResult }>,
+): Map<string, AuditVerificationResult> {
+  const best = new Map<string, { seq: number; result: AuditVerificationResult }>();
+  for (const r of records) {
+    const cur = best.get(r.attemptId);
+    if (cur === undefined || r.seq > cur.seq)
+      best.set(r.attemptId, { seq: r.seq, result: r.result });
+  }
+  const out = new Map<string, AuditVerificationResult>();
+  for (const [id, v] of best) out.set(id, v.result);
+  return out;
 }
 
 /**
@@ -77,16 +147,24 @@ export function argsMatch(argsRedacted: JsonValue, match: Args): boolean {
 }
 
 /**
- * Activity time (epoch ms) of an action: the later of the attempt timestamp and its outcome
- * timestamp, if any. Returns `undefined` if any given timestamp is not a string or does not parse;
- * adapters should then treat the action as inside every window (fail closed).
+ * Activity time (epoch ms) of an action: the latest of the attempt timestamp, its outcome timestamp and its latest
+ * verification timestamp (T010), where given. Returns `undefined` if any given timestamp is not a string or does
+ * not parse; adapters should then treat the action as inside every window (fail closed).
  */
-export function activityTs(attemptTs: string, outcomeTs?: string): number | undefined {
-  const a = parseTs(attemptTs);
-  if (a === undefined) return undefined;
-  if (outcomeTs === undefined) return a;
-  const o = parseTs(outcomeTs);
-  return o === undefined ? undefined : Math.max(a, o);
+export function activityTs(
+  attemptTs: string,
+  outcomeTs?: string,
+  verificationTs?: string,
+): number | undefined {
+  let latest = parseTs(attemptTs);
+  if (latest === undefined) return undefined;
+  for (const ts of [outcomeTs, verificationTs]) {
+    if (ts === undefined) continue;
+    const t = parseTs(ts);
+    if (t === undefined) return undefined;
+    latest = Math.max(latest, t);
+  }
+  return latest;
 }
 
 function parseTs(ts: unknown): number | undefined {
