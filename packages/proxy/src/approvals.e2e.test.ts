@@ -53,6 +53,7 @@ import {
   type MoneyPipelineOptions,
   type PipelineStore,
 } from "./interceptor.js";
+import { createModePreCheck, createModeStore, KILL_SWITCH_RULE } from "./modes.js";
 import { redactSensitiveResult } from "./result-redaction.js";
 import { advertiseTool } from "./schema-rewrite.js";
 import { createProxyServer, type ProxyServer } from "./server.js";
@@ -999,5 +1000,60 @@ describe("restart", () => {
     // An old button press can't approve it any more.
     expect(await press(h, 0)).toBe(DECISION_ANSWERS.alreadyDecided);
     expect(refundCalls(h)).toEqual([]);
+  });
+});
+
+describe("T012: kill switch and pending approvals", () => {
+  it("Approve pressed while the kill switch is ON ⇒ not executed (not_forwarded kill-switch), even after it is turned off", async () => {
+    // A second connection to the same audit DB: the operator's CLI (and the mode reader).
+    const cliStore = unwrap(openAuditStore({ path: join(dir, `audit-${String(open.length)}.db`) }));
+    try {
+      const cli = createModeStore(cliStore);
+      const h = await setup({ preCheck: createModePreCheck(cli) });
+      const { approvalId, attemptId } = await requestApproval(h);
+      unwrap(cli.set({ killSwitch: true, actor: "cli:ops" }));
+      await press(h, 0);
+      expect(refundCalls(h)).toEqual([]);
+      const recs = records(h, attemptId);
+      expect(recs.map((r) => r["kind"])).toEqual(["attempt", "approval", "outcome"]);
+      expect(recs[1]).toMatchObject({ decision: "approved", approver: `telegram:${CHAT}` });
+      expect(recs[2]).toMatchObject({ outcome: "not_forwarded", errorCode: KILL_SWITCH_RULE });
+      const polled = await check(h, approvalId);
+      expect(polled.isError).toBe(true);
+      expect(jsonOf(polled)).toMatchObject({ ruleId: KILL_SWITCH_RULE });
+      // Turning the kill switch off does not resurrect it.
+      unwrap(cli.set({ killSwitch: false, actor: "cli:ops" }));
+      expect(jsonOf(await check(h, approvalId))).toMatchObject({ ruleId: KILL_SWITCH_RULE });
+      expect(refundCalls(h)).toEqual([]);
+      // New live calls go through the policy again.
+      const next = await call(h, "create_refund", {
+        reason: REASON,
+        payment_id: "pay_A1",
+        amount: 1_000,
+      });
+      expect(next.isError).not.toBe(true);
+      expect(refundCalls(h)).toHaveLength(1);
+    } finally {
+      cliStore.close();
+    }
+  });
+
+  it("shadow mode does not shadow an approved execution: the re-evaluation still enforces the policy", async () => {
+    const cliStore = unwrap(openAuditStore({ path: join(dir, `audit-${String(open.length)}.db`) }));
+    try {
+      const cli = createModeStore(cliStore);
+      const h = await setup({ preCheck: createModePreCheck(cli) });
+      const { attemptId } = await requestApproval(h);
+      unwrap(cli.set({ shadow: true, actor: "cli:ops" }));
+      await press(h, 0);
+      // Executed as the approved (non-shadow) action it is.
+      expect(refundCalls(h)).toHaveLength(1);
+      const recs = records(h, attemptId);
+      expect(recs[0]).toMatchObject({ decision: "require_approval" });
+      expect(recs[0]).not.toHaveProperty("shadow");
+      expect(recs.at(-1)).toMatchObject({ kind: "outcome", outcome: "success" });
+    } finally {
+      cliStore.close();
+    }
   });
 });

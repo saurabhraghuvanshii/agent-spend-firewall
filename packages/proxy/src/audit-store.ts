@@ -23,8 +23,10 @@ import { z } from "zod";
 import {
   buildRecord,
   canonicalJson,
+  computeHash,
   err,
   IDEMPOTENCY_KEY_RE,
+  MODE_ACTOR_RE,
   ok,
   redact,
   redactText,
@@ -36,6 +38,7 @@ import {
   type AuditApprovalBody,
   type AuditApprovalDecision,
   type AuditAttemptBody,
+  type AuditModeBody,
   type AuditVerificationBody,
   type AuditVerificationMethod,
   type AuditVerificationResult,
@@ -95,10 +98,40 @@ export interface RecordAttemptInput {
    * retried already ⇒ else `audit.invalid_retry_of` (nothing written). Hashed only when present.
    */
   retryOf?: string;
+  /**
+   * T012 shadow mode: the policy decided `wouldDecision` but the firewall forwarded the agent's original args anyway.
+   * Requires `decision: "allow"`, no `originalArgs` and no `approver` ⇒ else `audit.invalid_input`; and (checked in
+   * the write transaction) an earlier `mode` record with `shadow: true` ⇒ else `audit.invalid_shadow`. Stored as
+   * `shadow: true` + `wouldDecision` (dropped on an `audit.invalid_args` deny trail row).
+   */
+  shadow?: { wouldDecision: AuditDecisionInput };
   /** Defaults to `idGen()`. Must match `recordIdSchema` (T010: the pipeline pre-generates it for the notes marker). */
   id?: string;
   /** ISO-8601; defaults to `clock().toISOString()`. */
   ts?: string;
+}
+
+/**
+ * T012: change the firewall mode. Absent fields keep their current value; the store writes the FULL new state as one
+ * chained `mode` record, atomically with reading the current one (`BEGIN IMMEDIATE`), so concurrent changes from the
+ * CLI / API never lose an update.
+ */
+export interface ChangeModeInput {
+  killSwitch?: boolean;
+  shadow?: boolean;
+  /** `MODE_ACTOR_RE`: `cli:<slug>` | `dashboard:<slug>` | `telegram:<id>`. */
+  actor: string;
+  id?: string;
+  ts?: string;
+}
+
+/**
+ * Result of `changeMode`: `record` is the latest `mode` record after the call (`undefined` only if none exists and
+ * nothing had to change); `changed` is false iff the requested state was already in force.
+ */
+export interface ChangeModeResult {
+  readonly changed: boolean;
+  readonly record: AuditModeRecord | undefined;
 }
 
 /** T010: a verification of an attempt whose outcome left it unclear whether upstream applied it. */
@@ -147,6 +180,7 @@ export type AuditAttemptRecord = Extract<AuditRecord, { kind: "attempt" }>;
 export type AuditOutcomeRecord = Extract<AuditRecord, { kind: "outcome" }>;
 export type AuditVerificationRecord = Extract<AuditRecord, { kind: "verification" }>;
 export type AuditApprovalRecord = Extract<AuditRecord, { kind: "approval" }>;
+export type AuditModeRecord = Extract<AuditRecord, { kind: "mode" }>;
 
 /**
  * An attempt joined with its outcome record, if one has been written, its LATEST verification (T010), if any, and
@@ -223,6 +257,17 @@ export interface AuditStore {
   }>;
   /** T010: actions whose latest verification is `unknown` (flagged for a human), full scan like `readUnsettled`. */
   listNeedsHuman(): Result<AuditActivity[]>;
+  /**
+   * T012: the latest `mode` record (indexed lookup), its own hash re-computed; `undefined` if none was ever written
+   * (both modes off). Unreadable / malformed / hash mismatch / closed store ⇒ `err` (callers treat that as kill
+   * switch ON). Never throws.
+   */
+  readMode(): Result<AuditModeRecord | undefined>;
+  /**
+   * T012: append a `mode` record with the merged state (see `ChangeModeInput`), unless it is already in force. When
+   * the current mode record is unreadable the merge starts from kill ON / shadow off and a record is always written.
+   */
+  changeMode(input: ChangeModeInput): Result<ChangeModeResult>;
   /** `verifyChain` over `readAll()`. `err` only if the DB cannot be read. */
   verify(): Result<VerifyResult>;
   /** Idempotent. */
@@ -276,6 +321,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS audit_log_one_outcome_per_attempt
   ON audit_log (json_extract(body_json, '$.attemptId')) WHERE kind = 'outcome';
 CREATE UNIQUE INDEX IF NOT EXISTS audit_log_one_approval_per_attempt
   ON audit_log (json_extract(body_json, '$.attemptId')) WHERE kind = 'approval';
+CREATE INDEX IF NOT EXISTS audit_log_mode_by_seq ON audit_log (seq) WHERE kind = 'mode';
 `;
 
 // ---------- input validation (boundary) ----------
@@ -315,6 +361,18 @@ const attemptInputSchema = z.object({
   approver: approverSchema.optional(),
   idempotencyKey: idempotencyKeySchema.optional(),
   retryOf: recordIdSchema.optional(),
+  shadow: z.strictObject({ wouldDecision: z.enum(AUDIT_DECISIONS) }).optional(),
+  id: recordIdSchema.optional(),
+  ts: isoTs.optional(),
+});
+
+/** Operator id for mode changes (core `MODE_ACTOR_RE`). Stored verbatim. */
+export const modeActorSchema = z.string().regex(MODE_ACTOR_RE);
+
+const changeModeInputSchema = z.strictObject({
+  killSwitch: z.boolean().optional(),
+  shadow: z.boolean().optional(),
+  actor: modeActorSchema,
   id: recordIdSchema.optional(),
   ts: isoTs.optional(),
 });
@@ -403,6 +461,17 @@ const storedAttemptSchema = z.strictObject({
   // Legacy rows have no key; a present key must be well-formed (core verify reports it otherwise).
   idempotencyKey: idempotencyKeySchema.optional(),
   retryOf: recordIdSchema.optional(),
+  shadow: z.literal(true).optional(),
+  wouldDecision: z.enum(AUDIT_DECISIONS).optional(),
+});
+
+const storedModeSchema = z.strictObject({
+  kind: z.literal("mode"),
+  id: recordIdSchema,
+  ts: z.string(),
+  killSwitch: z.boolean(),
+  shadow: z.boolean(),
+  actor: z.string(),
 });
 
 const storedOutcomeSchema = z.strictObject({
@@ -445,6 +514,7 @@ const storedBodySchema = z.discriminatedUnion("kind", [
   storedOutcomeSchema,
   storedVerificationSchema,
   storedApprovalSchema,
+  storedModeSchema,
 ]);
 
 const rowSchema = z.object({
@@ -476,7 +546,20 @@ function toCoreBody(b: StoredBody): AuditBody {
     if (b.approver !== undefined) body.approver = b.approver;
     if (b.idempotencyKey !== undefined) body.idempotencyKey = b.idempotencyKey;
     if (b.retryOf !== undefined) body.retryOf = b.retryOf;
+    if (b.shadow !== undefined) body.shadow = b.shadow;
+    if (b.wouldDecision !== undefined) body.wouldDecision = b.wouldDecision;
     return body;
+  }
+  if (b.kind === "mode") {
+    const m: AuditModeBody = {
+      kind: "mode",
+      id: b.id,
+      ts: b.ts,
+      killSwitch: b.killSwitch,
+      shadow: b.shadow,
+      actor: b.actor,
+    };
+    return m;
   }
   if (b.kind === "verification") {
     const v: AuditVerificationBody = {
@@ -718,6 +801,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   let approvalRowStmt: Database.Statement;
   let latestVerificationRowStmt: Database.Statement;
   let ascStmt: Database.Statement;
+  let latestModeStmt: Database.Statement;
   let warnings: string[] = [];
   try {
     db.pragma(`busy_timeout = ${String(Math.max(0, Math.trunc(busyTimeoutMs)))}`);
@@ -797,6 +881,9 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     );
     ascStmt = db.prepare(
       "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log ORDER BY seq ASC",
+    );
+    latestModeStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE kind = 'mode' ORDER BY seq DESC LIMIT 1",
     );
   } catch (e: unknown) {
     if (db.open) db.close();
@@ -913,9 +1000,24 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     return ok(null);
   }
 
+  /**
+   * T012 (mirrors core `verifyChain`): a shadow attempt needs shadow mode ON at write time — the latest `mode` record
+   * must exist, be readable and have `shadow: true` (a later shadow-off record ends it).
+   */
+  function checkShadowAttempt(body: AuditBody): Result<null> {
+    if (body.kind !== "attempt" || body.shadow === undefined) return ok(null);
+    const latest = readLatestMode();
+    if (!latest.ok || latest.value?.shadow !== true) {
+      return err("audit.invalid_shadow", "a shadow attempt needs shadow mode to be on");
+    }
+    return ok(null);
+  }
+
   /** Runs inside BEGIN IMMEDIATE. Returning `err` before the insert leaves the DB unchanged. */
   function appendInTx(req: AppendRequest): Result<AuditRecord> {
     const { body } = req;
+    const t012 = checkShadowAttempt(body);
+    if (!t012.ok) return t012;
     const t010 = checkT010(body);
     if (!t010.ok) return t010;
     const t011 = checkApprovalRecord(body);
@@ -1038,6 +1140,9 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         if (approvals.has(rec.attemptId))
           return invalid("duplicate approval in audit log", rec.seq);
         approvals.set(rec.attemptId, rec);
+      } else if (rec.kind === "mode") {
+        // T012: mode changes are not money activity.
+        continue;
       } else if (!verifications.has(rec.attemptId)) {
         verifications.set(rec.attemptId, rec);
       }
@@ -1117,6 +1222,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         attempts.set(rec.id, rec);
         continue;
       }
+      if (rec.kind === "mode") continue; // T012: not money activity
       if (!attempts.has(rec.attemptId)) {
         return err("audit.activity_invalid", "record references a missing attempt", {
           seq: rec.seq,
@@ -1183,6 +1289,73 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   }
 
   const readAttemptTx = db.transaction(readAttemptInTx);
+
+  /** Highest mode-record seq this connection has seen (T012): the latest one may only move forward. */
+  let lastModeSeq = 0;
+
+  /**
+   * Latest `mode` record with its own hash re-computed (T012). Fails closed if it is older than one this connection
+   * already saw (the tail of the log was deleted / rolled back) or has disappeared.
+   */
+  function readLatestMode(): Result<AuditModeRecord | undefined> {
+    const raw: unknown = latestModeStmt.get();
+    if (raw === undefined) {
+      if (lastModeSeq > 0) {
+        return err("audit.mode_invalid", "a mode record seen earlier has disappeared", {
+          lastSeq: lastModeSeq,
+        });
+      }
+      return ok(undefined);
+    }
+    const rec = parseRow(raw, 0);
+    if ("invalid" in rec || rec.kind !== "mode" || !Number.isFinite(Date.parse(rec.ts))) {
+      return err("audit.mode_invalid", "the latest mode record is unreadable");
+    }
+    const { seq, prevHash, hash, ...body } = rec;
+    const recomputed = computeHash(hasher, prevHash, seq, body);
+    if (!recomputed.ok || recomputed.value !== hash) {
+      return err("audit.mode_invalid", "the latest mode record does not match its hash", { seq });
+    }
+    if (seq < lastModeSeq) {
+      return err("audit.mode_invalid", "the latest mode record is older than one seen earlier", {
+        seq,
+        lastSeq: lastModeSeq,
+      });
+    }
+    lastModeSeq = seq;
+    return ok(rec);
+  }
+
+  /** Runs inside BEGIN IMMEDIATE (see `AuditStore.changeMode`). */
+  function changeModeInTx(p: z.infer<typeof changeModeInputSchema>): Result<ChangeModeResult> {
+    const current = readLatestMode();
+    // Unreadable ⇒ the effective state is kill ON (fail closed); always write a fresh, valid record.
+    const base = current.ok
+      ? { killSwitch: current.value?.killSwitch ?? false, shadow: current.value?.shadow ?? false }
+      : { killSwitch: true, shadow: false };
+    const next = { killSwitch: p.killSwitch ?? base.killSwitch, shadow: p.shadow ?? base.shadow };
+    if (current.ok && next.killSwitch === base.killSwitch && next.shadow === base.shadow) {
+      return ok({ changed: false, record: current.value });
+    }
+    const id = resolveId(p.id);
+    if (!id.ok) return id;
+    const ts = resolveTs(p.ts);
+    if (!ts.ok) return ts;
+    const body: AuditModeBody = {
+      kind: "mode",
+      id: id.value,
+      ts: ts.value.ts,
+      killSwitch: next.killSwitch,
+      shadow: next.shadow,
+      actor: p.actor,
+    };
+    const rec = appendInTx({ body, callerTs: ts.value.callerTs });
+    if (!rec.ok) return rec;
+    if (rec.value.kind !== "mode") return err("audit.write_failed", "mode record not written");
+    return ok({ changed: true, record: rec.value });
+  }
+
+  const changeModeTx = db.transaction(changeModeInTx);
 
   /** Guard + catch-all for write paths: never throws, fails closed. */
   function guardedWrite(fn: () => Result<AuditRecord>): Result<AuditRecord> {
@@ -1270,6 +1443,15 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         };
         if (p.approver !== undefined) body.approver = p.approver;
         if (p.retryOf !== undefined) body.retryOf = p.retryOf;
+        if (p.shadow !== undefined) {
+          if (p.decision !== "allow" || p.originalArgs !== undefined || p.approver !== undefined) {
+            return err("audit.invalid_input", "invalid attempt input", {
+              issues: "shadow: a shadow attempt is an allow without original args or approver",
+            });
+          }
+          body.shadow = true;
+          body.wouldDecision = p.shadow.wouldDecision;
+        }
 
         if (args.ok) {
           body.argsRedacted = args.value;
@@ -1280,6 +1462,8 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
 
         // Invalid args (e.g. float amount): still leave a trail, as a deny, then report the error.
         delete body.retryOf;
+        delete body.shadow;
+        delete body.wouldDecision;
         const rawPath = args.error.details?.["path"];
         const path = typeof rawPath === "string" ? redactText(rawPath) : null;
         body.argsRedacted = { _invalid: args.error.code, _path: path };
@@ -1450,6 +1634,32 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         return readActivityTx(sinceMs);
       } catch (e: unknown) {
         return err("audit.read_failed", "could not read audit activity", describeError(e));
+      }
+    },
+
+    readMode(): Result<AuditModeRecord | undefined> {
+      if (!db.open) return err("audit.read_failed", "audit store is closed");
+      try {
+        return readLatestMode();
+      } catch (e: unknown) {
+        return err("audit.read_failed", "could not read the firewall mode", describeError(e));
+      }
+    },
+
+    changeMode(input: ChangeModeInput): Result<ChangeModeResult> {
+      if (isReadonly) return err("audit.write_failed", "audit store is read-only");
+      if (!db.open) return err("audit.write_failed", "audit store is closed");
+      const parsed = changeModeInputSchema.safeParse(input);
+      if (!parsed.success) {
+        return err("audit.invalid_input", "invalid mode change", {
+          issues: zodIssuePaths(parsed.error),
+        });
+      }
+      const p = parsed.data;
+      try {
+        return changeModeTx.immediate(p);
+      } catch (e: unknown) {
+        return err("audit.write_failed", "mode change failed", describeError(e));
       }
     },
 

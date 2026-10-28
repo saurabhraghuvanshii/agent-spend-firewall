@@ -10,6 +10,7 @@ import {
   ERROR_CODE_RE,
   GENESIS_PREV_HASH,
   IDEMPOTENCY_KEY_RE,
+  MODE_ACTOR_RE,
   RECORD_ID_RE,
   UPSTREAM_REF_RE,
   type AuditApprovalDecision,
@@ -164,12 +165,72 @@ function checkApproval(body: AuditBody): Result<true> {
   return ok(true);
 }
 
+const AUDIT_DECISION_VALUES: readonly unknown[] = [
+  "allow",
+  "deny",
+  "require_approval",
+  "transform",
+];
+
+/**
+ * T012 shadow fields on attempts. `shadow` must be exactly `true` when present and comes with `wouldDecision`
+ * (an audit decision), `decision === "allow"`, and no `originalArgsRedacted` / `approver`. `wouldDecision` without
+ * `shadow`, or either field on another record kind ⇒ rejected.
+ */
+function checkShadow(body: AuditBody): Result<true> {
+  const b = body as unknown as Record<string, unknown>;
+  // A `mode` record's own boolean `shadow` is the mode state (strictly checked by `checkMode`).
+  if (b["kind"] === "mode") return ok(true);
+  const shadow = b["shadow"];
+  const would = b["wouldDecision"];
+  if (shadow === undefined && would === undefined) return ok(true);
+  const bad = (msg: string): Result<true> => err("audit.invalid_shadow", msg);
+  if (b["kind"] !== "attempt") return bad("only attempt records may carry shadow fields");
+  if (shadow !== true) return bad("wouldDecision requires shadow: true");
+  if (!AUDIT_DECISION_VALUES.includes(would))
+    return bad("a shadow attempt requires its wouldDecision");
+  if (b["decision"] !== "allow") return bad("a shadow attempt is recorded as decision allow");
+  if (b["originalArgsRedacted"] !== undefined)
+    return bad("a shadow attempt forwards the original args");
+  if (b["approver"] !== undefined) return bad("a shadow attempt has no approver");
+  return ok(true);
+}
+
+const MODE_KEYS: ReadonlySet<string> = new Set([
+  "kind",
+  "id",
+  "ts",
+  "killSwitch",
+  "shadow",
+  "actor",
+]);
+
+/** Strict shape check for `mode` records (T012). Other kinds pass through unchanged. */
+function checkMode(body: AuditBody): Result<true> {
+  const kind: string = body.kind;
+  if (kind !== "mode") return ok(true);
+  const bad = (msg: string): Result<true> => err("audit.invalid_mode", msg);
+  const b = body as unknown as Record<string, unknown>;
+  for (const k of Object.keys(b)) {
+    if (!MODE_KEYS.has(k) && b[k] !== undefined) return bad("unexpected field");
+  }
+  if (typeof b["id"] !== "string" || !RECORD_ID_RE.test(b["id"])) return bad("invalid id");
+  if (typeof b["ts"] !== "string" || b["ts"] === "") return bad("invalid ts");
+  if (typeof b["killSwitch"] !== "boolean") return bad("killSwitch must be a boolean");
+  if (typeof b["shadow"] !== "boolean") return bad("shadow must be a boolean");
+  if (typeof b["actor"] !== "string" || !MODE_ACTOR_RE.test(b["actor"]))
+    return bad("invalid actor");
+  return ok(true);
+}
+
 /**
  * `hash = sha256Hex(prevHash + canonicalJson({ ...body, seq }))`. Never throws.
  * Rejects (`audit.invalid_idempotency_key`) a malformed `idempotencyKey` or one on a non-attempt record,
  * (`audit.invalid_retry_of`) a malformed `retryOf` or one on a non-attempt record, and
  * (`audit.invalid_verification`) a malformed `verification` record (see `AuditVerificationBody`), and
- * (`audit.invalid_approval`) a malformed `approval` record (see `AuditApprovalBody`).
+ * (`audit.invalid_approval`) a malformed `approval` record (see `AuditApprovalBody`),
+ * (`audit.invalid_shadow`) inconsistent T012 shadow fields (see `AuditAttemptBody.shadow`), and
+ * (`audit.invalid_mode`) a malformed `mode` record (see `AuditModeBody`).
  */
 export function computeHash(
   h: Hasher,
@@ -185,6 +246,10 @@ export function computeHash(
   if (!verificationCheck.ok) return verificationCheck;
   const approvalCheck = checkApproval(body);
   if (!approvalCheck.ok) return approvalCheck;
+  const shadowCheck = checkShadow(body);
+  if (!shadowCheck.ok) return shadowCheck;
+  const modeCheck = checkMode(body);
+  if (!modeCheck.ok) return modeCheck;
   const canon = canonicalJson({ ...body, seq });
   if (!canon.ok) return canon;
   let digest: string;
@@ -233,6 +298,9 @@ function isInvalid(r: AuditRecord | InvalidAuditRow): r is InvalidAuditRow {
  * and no earlier approval (`duplicate_approval`). An outcome `success` / `upstream_error` / `timeout` (the action was
  * sent) of a `require_approval` attempt needs an earlier `approved` record — for a retry, on its original
  * (`approval_missing`); a `rejected` / `expired` attempt's outcome must be `not_forwarded` (`approval_outcome_mismatch`).
+ * T012 modes: `mode` records are standalone. A shadow attempt (`shadow: true`, which `computeHash` already ties to
+ * `decision: "allow"` + a `wouldDecision`) needs the latest earlier `mode` record to have `shadow: true`
+ * (`shadow_without_mode`; the store refuses it at write time otherwise, inside the append transaction).
  * The id/outcome/verification/approval checks catch tampered rows that otherwise chain correctly.
  * Attempts with no outcome are reported in `danglingAttempts` (a warning, not a break).
  */
@@ -253,6 +321,8 @@ export function verifyChain(
   const attemptDecision = new Map<string, string>();
   /** Approval decision per attempt; a retry of an approved attempt inherits `approved`. */
   const approvalOf = new Map<string, AuditApprovalDecision>();
+  /** T012: shadow mode per the latest `mode` record so far (a shadow-off record clears it). */
+  let shadowOn = false;
 
   const broken = (seq: number, id: string | null, reason: VerifyBreakReason): VerifyResult => ({
     ok: false,
@@ -267,7 +337,8 @@ export function verifyChain(
       kind !== "attempt" &&
       kind !== "outcome" &&
       kind !== "verification" &&
-      kind !== "approval"
+      kind !== "approval" &&
+      kind !== "mode"
     ) {
       return broken(r.seq, null, "invalid_row");
     }
@@ -290,7 +361,10 @@ export function verifyChain(
     if (seenIds.has(r.id)) return broken(r.seq, id, "duplicate_id");
     seenIds.add(r.id);
 
-    if (r.kind === "attempt") {
+    if (r.kind === "mode") {
+      shadowOn = r.shadow;
+    } else if (r.kind === "attempt") {
+      if (r.shadow !== undefined && !shadowOn) return broken(r.seq, id, "shadow_without_mode");
       if (r.retryOf !== undefined) {
         const original = r.retryOf;
         if (

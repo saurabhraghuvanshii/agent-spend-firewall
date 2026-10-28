@@ -40,7 +40,9 @@ import {
   NOT_RETRIED_MESSAGE,
   RECONCILING_MESSAGE,
   type MoneyPipeline,
+  type MoneyPipelineOptions,
 } from "./interceptor.js";
+import { createModePreCheck, createModeStore, KILL_SWITCH_RULE } from "./modes.js";
 import {
   redactSensitiveResult,
   UNKNOWN_OUTCOME_MESSAGE,
@@ -184,6 +186,7 @@ interface SetupOpts {
   verifyTimer?: Timer;
   store?: AuditStore;
   startReconciling?: boolean;
+  preCheck?: MoneyPipelineOptions["preCheck"];
 }
 
 async function setup(opts: SetupOpts = {}): Promise<Harness> {
@@ -255,6 +258,7 @@ async function setup(opts: SetupOpts = {}): Promise<Harness> {
     verifyWaitMs: opts.verifyWaitMs ?? 2_000,
     ...(opts.verifyTimer === undefined ? {} : { verifyTimer: opts.verifyTimer }),
     ...(opts.startReconciling === true ? { startReconciling: true } : {}),
+    ...(opts.preCheck === undefined ? {} : { preCheck: opts.preCheck }),
   });
   const proxy = createProxyServer({
     upstream,
@@ -980,5 +984,78 @@ describe("not retried", () => {
     expect(sent(h, "create_refund")).toHaveLength(1);
     expect(h.logs.join("\n")).toContain("not retried: the request was cancelled");
     expect(NOT_RETRIED_MESSAGE).toMatch(/NOT executed/);
+  });
+});
+
+describe("T012 modes and verify-before-retry", () => {
+  it("shadow mode: a timed-out refund is still verified and retried once; both attempts are shadow attempts", async () => {
+    const store = unwrap(openAuditStore({ path: ":memory:" }));
+    const modes = createModeStore(store);
+    unwrap(modes.set({ shadow: true, actor: "cli:ops" }));
+    const SHADOW_DENY = compiled(
+      definePolicy({ default: "deny", rules: [rule("refund.no").on("create_refund").deny("no")] }),
+    );
+    const h = await setup({ store, policy: SHADOW_DENY, preCheck: createModePreCheck(modes) });
+    h.world.refundScript.push(failsLate(80));
+    const r = await refund(h, A1);
+    expect(r.isError).not.toBe(true);
+    expect(sent(h, "create_refund")).toHaveLength(2);
+    const { attempts, verifications } = rows(h.store);
+    const [orig, retry] = attempts;
+    expect(orig).toMatchObject({ decision: "allow", shadow: true, wouldDecision: "deny" });
+    expect(retry).toMatchObject({
+      retryOf: orig?.id,
+      decision: "allow",
+      shadow: true,
+      wouldDecision: "deny",
+    });
+    expect(verifications).toEqual([
+      expect.objectContaining({ attemptId: orig?.id, result: "not_happened" }),
+    ]);
+    // Duplicates of the executed retry are still blocked in shadow mode.
+    expect(expectDuplicate(await refund(h, A1), "executed")["attemptId"]).toBe(retry?.id);
+  });
+
+  it("kill switch turned ON after the send ⇒ the original is verified, the retry is NOT sent", async () => {
+    const store = unwrap(openAuditStore({ path: ":memory:" }));
+    const modes = createModeStore(store);
+    const h = await setup({ store, preCheck: createModePreCheck(modes) });
+    h.world.refundScript.push(() => {
+      unwrap(modes.set({ killSwitch: true, actor: "cli:ops" }));
+      return failsLate(80)();
+    });
+    const r = await refund(h, A1);
+    expect(sent(h, "create_refund")).toHaveLength(1);
+    expect(jsonOf(r)).toMatchObject({ error: "upstream_timeout", message: NOT_RETRIED_MESSAGE });
+    const { attempts, verifications } = rows(h.store);
+    expect(attempts).toHaveLength(1);
+    expect(verifications).toEqual([
+      expect.objectContaining({ attemptId: attempts[0]?.id, result: "not_happened" }),
+    ]);
+    expect(h.logs.join("\n")).toContain(`not retried: ${KILL_SWITCH_RULE}`);
+    // And new money calls are frozen.
+    expect(jsonOf(await refund(h, { payment_id: PAY, amount: 6_000 }))).toMatchObject({
+      decision: "deny",
+      ruleId: KILL_SWITCH_RULE,
+    });
+  });
+
+  it("shadow mode turned OFF after the send ⇒ a would-deny refund is NOT retried (M1)", async () => {
+    const store = unwrap(openAuditStore({ path: ":memory:" }));
+    const modes = createModeStore(store);
+    unwrap(modes.set({ shadow: true, actor: "cli:ops" }));
+    const DENY = compiled(
+      definePolicy({ default: "deny", rules: [rule("refund.no").on("create_refund").deny("no")] }),
+    );
+    const h = await setup({ store, policy: DENY, preCheck: createModePreCheck(modes) });
+    h.world.refundScript.push(() => {
+      unwrap(modes.set({ shadow: false, actor: "cli:ops" }));
+      return failsLate(80)();
+    });
+    const r = await refund(h, A1);
+    expect(sent(h, "create_refund")).toHaveLength(1);
+    expect(jsonOf(r)).toMatchObject({ error: "upstream_timeout", message: NOT_RETRIED_MESSAGE });
+    expect(rows(h.store).attempts).toHaveLength(1);
+    expect(h.logs.join("\n")).toContain("not retried: firewall.shadow_ended");
   });
 });

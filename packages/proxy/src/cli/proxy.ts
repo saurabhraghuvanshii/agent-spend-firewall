@@ -55,12 +55,17 @@
  * The policy is loaded and the audit store opened BEFORE serving: if either fails the proxy exits 2 (never serves
  * money tools without a policy and an audit log).
  *
+ * T012 modes: the kill switch / shadow mode live in the audit log (`mode` records) and are read on EVERY money call
+ * (`createModePreCheck`), so `asf-proxy mode kill on|off`, `mode shadow on|off`, `mode status` (`cli/mode.ts`; this
+ * entry point dispatches `mode …` there) take effect on the next call. An unreadable mode ⇒ kill switch ON.
+ *
  * Exit codes: 0 clean shutdown, 1 fatal runtime error, 2 refused (keys / config / policy / audit store).
  */
 import { randomBytes } from "node:crypto";
+import { userInfo } from "node:os";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { err, ok, type CompiledPolicy, type Result } from "@asf/core";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -88,6 +93,7 @@ import {
   DEFAULT_LOCK_WAIT_MS,
   type MoneyPipeline,
 } from "../interceptor.js";
+import { createModePreCheck, createModeStore, describeMode, type ModeStore } from "../modes.js";
 import { loadPolicy, resolvePolicyPath } from "../policy-loader.js";
 import { redactSensitiveResult } from "../result-redaction.js";
 import { advertiseTool } from "../schema-rewrite.js";
@@ -121,7 +127,16 @@ import {
   type Redactor,
   type UpstreamTransportFactory,
 } from "../upstream.js";
+import {
+  AUDIT_DB_DIR,
+  confineAuditDb,
+  DEFAULT_AUDIT_DB,
+  isStrictlyInside,
+} from "./audit-db-path.js";
 import { escapeForTerminal } from "./audit-verify.js";
+import { runModeCommand } from "./mode.js";
+
+export { AUDIT_DB_DIR, confineAuditDb, DEFAULT_AUDIT_DB } from "./audit-db-path.js";
 import { DEFAULT_TOOLS_OUT, findRepoRoot, mergeEnv } from "./discover-tools.js";
 
 export const MIN_UPSTREAM_TIMEOUT_MS = 1_000;
@@ -133,9 +148,6 @@ export const SHUTDOWN_TIMEOUT_MS = 20_000;
  * default is 10 MiB. Exceeding it makes the SDK drop the buffer and close the agent channel.
  */
 export const AGENT_MAX_MESSAGE_BYTES = 1024 * 1024;
-export const DEFAULT_AUDIT_DB = "data/audit.db";
-/** Repo-relative directory the audit DB must live in. */
-export const AUDIT_DB_DIR = "data";
 /** Settings read from the SHELL environment only (a `.env` value is ignored with a note). */
 export const SHELL_ONLY_SETTINGS = [
   "ASF_RAZORPAY_MCP_IMAGE",
@@ -424,13 +436,6 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
   });
 }
 
-/** True iff `child` is `dir` itself (when `allowEqual`) or strictly below it. Both absolute, normalised. */
-function isStrictlyInside(dir: string, child: string, allowEqual = false): boolean {
-  const rel = relative(dir, child);
-  if (rel === "") return allowEqual;
-  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-}
-
 /** What the money pipeline needs from startup: a compiled deny-by-default policy and a writable audit store. */
 export interface Firewall {
   readonly policy: CompiledPolicy;
@@ -455,49 +460,6 @@ export interface FirewallReport {
 
 export interface OpenedFirewall extends Firewall {
   readonly report: FirewallReport;
-}
-
-/**
- * Confine the audit DB to `<repo>/data/` by REAL path: `<realRepo>/data` is created if missing (and must be a
- * directory), the DB's parent directory must exist and its realpath must be `<realRepo>/data` or below, and an
- * existing DB file must be a regular file (not a symlink). Returns the real DB path and whether it already existed.
- */
-export function confineAuditDb(
-  auditDbPath: string,
-  repoRoot: string,
-): Result<{ path: string; existed: boolean }> {
-  const outside = err<{ path: string; existed: boolean }>(
-    "proxy.bad_audit_db",
-    `ASF_AUDIT_DB must be a file inside <repo>/${AUDIT_DB_DIR}/`,
-  );
-  if (!isStrictlyInside(join(repoRoot, AUDIT_DB_DIR), auditDbPath)) return outside;
-  try {
-    const realRoot = realpathSync(repoRoot);
-    const dataDir = join(realRoot, AUDIT_DB_DIR);
-    if (!existsSync(dataDir)) mkdirSync(dataDir);
-    if (!statSync(dataDir).isDirectory()) return outside;
-    const rel = relative(repoRoot, auditDbPath);
-    const parent = dirname(join(realRoot, rel));
-    if (!existsSync(parent)) {
-      return err("proxy.bad_audit_db", "the ASF_AUDIT_DB parent directory does not exist");
-    }
-    const realParent = realpathSync(parent);
-    if (!isStrictlyInside(dataDir, realParent, true)) return outside;
-    const path = join(realParent, basename(auditDbPath));
-    let existed = false;
-    try {
-      const st = lstatSync(path);
-      if (!st.isFile()) return err("proxy.bad_audit_db", "ASF_AUDIT_DB is not a regular file");
-      existed = true;
-    } catch (e: unknown) {
-      if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
-    }
-    return ok({ path, existed });
-  } catch (e: unknown) {
-    return err("proxy.bad_audit_db", "the ASF_AUDIT_DB location cannot be checked", {
-      cause: e instanceof Error ? e.name : typeof e,
-    });
-  }
 }
 
 /**
@@ -665,6 +627,8 @@ export interface StartProxyOptions {
   readonly startDegraded?: { readonly reason: string; readonly message: string };
   /** Injected for tests; default: hardened docker. */
   readonly factory?: UpstreamTransportFactory;
+  /** T012 mode state; default: `createModeStore(firewall.store)` (read on every money call). */
+  readonly modes?: ModeStore;
 }
 
 /** Build upstream + server (not yet connected to the agent). Kicks off the upstream connection in the background. */
@@ -689,6 +653,20 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
     clientInfo: { name: "agent-spend-firewall", version: "0.0.0" },
   });
   const wiring = opts.approvalWiring;
+  const modes = opts.modes ?? createModeStore(opts.firewall.store);
+  const mode = modes.read();
+  logger(
+    mode.ok
+      ? `mode: ${describeMode(mode.value)}`
+      : `WARNING: firewall mode unreadable (${mode.error.message}); the kill switch is treated as ON`,
+  );
+  if (mode.ok && mode.value.killSwitch) {
+    logger("WARNING: KILL SWITCH IS ON: every money tool call will be denied (kill-switch)");
+  } else if (mode.ok && mode.value.shadow) {
+    logger(
+      "WARNING: SHADOW MODE IS ON: policy decisions are only recorded; money calls are forwarded",
+    );
+  }
   const pipeline = createMoneyPipeline({
     policy: opts.firewall.policy,
     store: opts.firewall.store,
@@ -708,6 +686,8 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
     lateResponses: upstream,
     verifyWaitMs: config.verifyWaitMs,
     startReconciling: true,
+    // T012: kill switch / shadow mode, read per money call.
+    preCheck: createModePreCheck(modes, logger),
   });
   const proxy = createProxyServer({
     upstream,
@@ -792,6 +772,29 @@ function isMain(): boolean {
 }
 
 async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  if (args[0] === "--") args.shift();
+  if (args[0] === "mode") {
+    const r = runModeCommand(args.slice(1), {
+      env: process.env,
+      cwd: process.cwd(),
+      moduleDir: dirname(fileURLToPath(import.meta.url)),
+      isRepoRoot: (dir) => existsSync(join(dir, "pnpm-workspace.yaml")),
+      userName: () => {
+        try {
+          return userInfo().username;
+        } catch (e: unknown) {
+          process.stderr.write(
+            `note: no OS user name (${e instanceof Error ? e.name : typeof e})\n`,
+          );
+          return undefined;
+        }
+      },
+    });
+    (r.exitCode === 0 ? process.stdout : process.stderr).write(`${r.output}\n`);
+    process.exitCode = r.exitCode;
+    return;
+  }
   const logger = stderrLogger((s) => process.stderr.write(s));
   const config = resolveProxyConfig(process.env, {
     cwd: process.cwd(),

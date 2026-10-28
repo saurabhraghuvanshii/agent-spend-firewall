@@ -18,6 +18,10 @@ export {
   type RecordOutcomeInput,
   type RecordVerificationInput,
   type AuditVerificationRecord,
+  type AuditModeRecord,
+  type ChangeModeInput,
+  type ChangeModeResult,
+  modeActorSchema,
 } from "./audit-store.js";
 export {
   ATTEMPT_MARKER_KEY,
@@ -181,7 +185,24 @@ export {
   type MoneyPipelineOptions,
   type PipelineStore,
   type PreCheckDeny,
+  type PreCheckShadow,
+  type PreCheckVerdict,
 } from "./interceptor.js";
+export {
+  createModePreCheck,
+  createModeStore,
+  DEFAULT_MODE,
+  describeMode,
+  effectiveMode,
+  isShadowableDecision,
+  KILL_SWITCH_MESSAGE,
+  KILL_SWITCH_RULE,
+  MODE_UNREADABLE_MESSAGE,
+  type ModeChange,
+  type ModeSnapshot,
+  type ModeState,
+  type ModeStore,
+} from "./modes.js";
 export {
   createKeyedMutex,
   createMutex,

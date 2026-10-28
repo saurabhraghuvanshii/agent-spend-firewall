@@ -28,7 +28,14 @@ export const ERROR_CODE_RE: RegExp = /^[a-z0-9_.:-]{1,64}$/;
 /** Opaque approver / resolver id: `telegram:<1-20 digits>` or `dashboard:<[a-z0-9_-]{1,32}>`. Never PII. */
 export const APPROVER_RE: RegExp = /^(?:telegram:[0-9]{1,20}|dashboard:[a-z0-9_-]{1,32})$/;
 
-export type AuditKind = "attempt" | "outcome" | "verification" | "approval";
+/**
+ * Who changed the firewall mode (T012): `cli:<slug>` (operator on the proxy host), `dashboard:<slug>` (T013 API) or
+ * `telegram:<id>`. Opaque, never PII beyond an operator handle.
+ */
+export const MODE_ACTOR_RE: RegExp =
+  /^(?:cli:[a-z0-9_-]{1,32}|dashboard:[a-z0-9_-]{1,32}|telegram:[0-9]{1,20})$/;
+
+export type AuditKind = "attempt" | "outcome" | "verification" | "approval" | "mode";
 
 export type AuditDecision = "allow" | "deny" | "require_approval" | "transform";
 
@@ -69,6 +76,16 @@ export interface AuditAttemptBody {
    * rows without it hash exactly as before. Only attempts may carry it.
    */
   retryOf?: string;
+  /**
+   * T012 shadow mode: `true` iff the policy's decision was only OBSERVED and the agent's original (validated) args
+   * were forwarded anyway. Then `decision` MUST be `"allow"` (what the firewall actually did), `wouldDecision` MUST be
+   * present (what the policy decided), and `originalArgsRedacted` / `approver` MUST be absent (nothing was
+   * transformed or approved). `verifyChain` also requires an earlier `mode` record with `shadow: true`. Hashed only
+   * when present, so older rows hash exactly as before. Only attempts may carry it.
+   */
+  shadow?: true;
+  /** T012: the policy decision a shadow attempt did NOT enforce (`deny` ⇒ "would deny", …). Only with `shadow`. */
+  wouldDecision?: AuditDecision;
 }
 
 /** Chained record describing what happened to an earlier attempt. */
@@ -164,8 +181,22 @@ export interface AuditApprovalBody {
   approver?: string;
 }
 
+/**
+ * Chained record (T012) of a firewall mode change: the FULL new state (kill switch, shadow mode), who changed it
+ * (`MODE_ACTOR_RE`) and when (`ts`). The latest `mode` record by seq is the current mode; none ⇒ both off.
+ * Validated strictly in `computeHash`: no extra keys; booleans; `actor` ⇒ `MODE_ACTOR_RE`.
+ */
+export interface AuditModeBody {
+  kind: "mode";
+  id: string;
+  ts: string;
+  killSwitch: boolean;
+  shadow: boolean;
+  actor: string;
+}
+
 export type AuditBody =
-  AuditAttemptBody | AuditOutcomeBody | AuditVerificationBody | AuditApprovalBody;
+  AuditAttemptBody | AuditOutcomeBody | AuditVerificationBody | AuditApprovalBody | AuditModeBody;
 
 export type AuditRecord = AuditBody & { seq: number; prevHash: string; hash: string };
 
@@ -194,7 +225,8 @@ export type VerifyBreakReason =
   | "approval_after_outcome"
   | "duplicate_approval"
   | "approval_missing"
-  | "approval_outcome_mismatch";
+  | "approval_outcome_mismatch"
+  | "shadow_without_mode";
 
 export type VerifyResult =
   | { ok: true; count: number; headHash: string; danglingAttempts: string[] }

@@ -10,7 +10,10 @@
  *  0. Guards: the tool name must be the server's exact name (a stage may not rename it) ⇒ else deny
  *     `firewall.tool_mismatch`; `untrustedReason` must be set ⇒ else `firewall.internal_error`; the degraded latch
  *     (an outcome write failed earlier, or `startDegraded`: chain failed verification at startup) ⇒ deny `audit_unavailable` (re-checked right after the global lock is acquired and again immediately before
- *     forwarding, since the latch can be set while a call waits); optional `preCheck` (T012 kill switch seam).
+ *     forwarding, since the latch can be set while a call waits). The optional `preCheck` (T012 kill switch / shadow
+ *     mode, `modes.ts`) runs FIRST among these state checks (right after the tool / reason guards), so a kill-switch
+ *     deny wins over every other state; it runs again right before EVERY send (live forward, T010 retry, T011
+ *     approved execution): a deny there ⇒ outcome `not_forwarded` + the deny, nothing sent.
  *  1. Per-resource locks keyed `payment:<id>` (top-level string `payment_id`) and `order:<id>` (top-level string
  *     `order_id`); a non-string id ⇒ deny `firewall.invalid_args`. When both are present they are acquired in SORTED
  *     key order; the global lock always comes last, and nothing waits on a resource lock while holding the global
@@ -54,6 +57,14 @@
  *     `moneyArgsStage` deny) is audited as attempt `deny` (args minus `reason`, reason "", matchedRules [ruleId]) +
  *     outcome `denied`.
  *
+ * T012 — shadow mode (`preCheck` returned `{shadow: true}` at the start of the call): the duplicate check and every
+ * firewall invariant run as usual, the policy is evaluated, and if its decision is the POLICY's own
+ * (`isShadowableDecision`: not an engine error / timeout / invalid patch) it is NOT enforced: the agent's original
+ * validated args are re-checked (`checkFinalArgs`), stamped and forwarded exactly like an `allow`, and the attempt is
+ * recorded `decision: "allow"`, `shadow: {wouldDecision}` with the policy's matched rules. Transforms are not applied
+ * (would-transform is recorded), approvals are not requested. Engine errors stay real denies. Shadow attempts count
+ * toward history / velocity / duplicates as the allows they are. T011 approved executions are never shadowed.
+ *
  * T010 — verify before retry (see `failure.ts`):
  *  - Notes: an agent- or transform-supplied `notes` key starting with `asf_` (any case), more than 14 notes, or a
  *    non-object `notes` on `create_refund` ⇒ deny `firewall.invalid_args`. For a non-deny `create_refund` the attempt
@@ -77,6 +88,7 @@
 import {
   canonicalJson,
   err,
+  ERROR_CODE_RE,
   evaluate,
   ok,
   type Clock,
@@ -144,6 +156,7 @@ import {
   type DuplicateHit,
 } from "./idempotency.js";
 import { createKeyedMutex, createMutex, type Release } from "./locks.js";
+import { isShadowableDecision } from "./modes.js";
 import {
   allCurrenciesInr,
   findInvalidAmount,
@@ -197,7 +210,12 @@ export const FIREWALL_RULES = {
   duplicate: "firewall.duplicate",
   duplicateCheckFailed: "firewall.duplicate_check_failed",
   reconciling: "firewall.reconciling",
+  shadowEnded: "firewall.shadow_ended",
 } as const;
+
+/** T012: a shadow call's policy did not allow it and shadow mode was turned off before it was sent. */
+export const SHADOW_ENDED_MESSAGE =
+  "shadow mode was turned off while this call was in progress and the policy does not allow it as sent; the call was not sent";
 
 /** T011 codes for approved actions that were not executed / approvals that were closed (audit `errorCode`). */
 export const APPROVAL_RULES = {
@@ -234,6 +252,17 @@ export interface PreCheckDeny {
   readonly message: string;
 }
 
+/** T012: run this call in shadow mode (policy decisions observed and audited, not enforced). */
+export interface PreCheckShadow {
+  readonly shadow: true;
+}
+
+export type PreCheckVerdict = PreCheckDeny | PreCheckShadow;
+
+function isPreCheckDeny(v: PreCheckVerdict): v is PreCheckDeny {
+  return !("shadow" in v);
+}
+
 export interface MoneyPipelineOptions {
   /** Compiled policy (the CLI only accepts deny-by-default ones; tests may pass any). */
   readonly policy: CompiledPolicy;
@@ -257,12 +286,14 @@ export interface MoneyPipelineOptions {
    */
   readonly duplicateWindowMs?: number;
   /**
-   * T012 seam (kill switch / shadow mode): runs after the guards and before any lock. Returning a deny audits and
-   * returns it; throwing ⇒ deny `firewall.internal_error`.
+   * T012 seam (kill switch / shadow mode, see `createModePreCheck`): runs after the tool / reason guards and before
+   * the degraded / reconciling checks and any lock. Returning a deny audits and returns it; `{shadow: true}` runs the
+   * call in shadow mode; throwing ⇒ deny `firewall.internal_error`. Called again right before every send, where only
+   * a deny (or a throw) matters.
    */
   readonly preCheck?: (
     ctx: CallContext,
-  ) => PreCheckDeny | undefined | Promise<PreCheckDeny | undefined>;
+  ) => PreCheckVerdict | undefined | Promise<PreCheckVerdict | undefined>;
   /**
    * Start with the degraded latch already SET (e.g. the audit chain failed `verify()` at startup): every money call is
    * denied `audit_unavailable` with `message` (agent-facing) and the deny is audited best-effort. `reason` is logged
@@ -446,6 +477,8 @@ interface RetryContext {
   readonly finalArgs: Readonly<Record<string, unknown>>;
   readonly transformed: boolean;
   readonly reason: string;
+  /** T012: the original was a shadow attempt; the retry is recorded the same way. */
+  readonly shadow?: { readonly wouldDecision: Decision["type"] };
 }
 
 /** T011: what a settled send amounted to, reported by `settleForward` (the last report wins: a retry's). */
@@ -656,6 +689,11 @@ export function checkFinalArgs(
     };
   }
   return undefined;
+}
+
+/** Audit `errorCode` for a pre-send gate deny: its rule id if it is a valid machine code. */
+function gateCode(gate: PreCheckDeny): string {
+  return ERROR_CODE_RE.test(gate.ruleId) ? gate.ruleId : "firewall.precheck_denied";
 }
 
 function withRuleId(d: Decision): string[] {
@@ -902,6 +940,33 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     return r;
   };
 
+  /**
+   * T012: re-run `preCheck` right before a send. A deny (or a throw ⇒ `firewall.internal_error`) is returned. For a
+   * shadow call (`would` = the policy decision it is NOT enforcing) whose policy did not allow it, shadow mode must
+   * still be ON: otherwise ⇒ deny `firewall.shadow_ended` (the operator turned shadow off mid-call; the policy's
+   * decision applies again, so the call is not sent).
+   */
+  const sendGate = async (
+    ctx: CallContext,
+    would?: Decision["type"],
+  ): Promise<PreCheckDeny | undefined> => {
+    if (o.preCheck === undefined) return undefined;
+    try {
+      const pre = await o.preCheck(ctx);
+      if (pre !== undefined && isPreCheckDeny(pre)) return pre;
+      if (would !== undefined && would !== "allow" && pre === undefined) {
+        return { ruleId: FIREWALL_RULES.shadowEnded, message: SHADOW_ENDED_MESSAGE };
+      }
+      return undefined;
+    } catch (e: unknown) {
+      log(`preCheck threw ${e instanceof Error ? e.name : typeof e} before a send; not sent`);
+      return {
+        ruleId: FIREWALL_RULES.internalError,
+        message: "the firewall pre-check failed; the call was not sent",
+      };
+    }
+  };
+
   /** Audit a `firewall.duplicate` deny and return it. */
   const duplicateDenied = (info: CallInfo, rec: DenyRecord, hit: DuplicateHit): CallToolResult => {
     recordDenied(info, rec, FIREWALL_RULES.duplicate);
@@ -986,14 +1051,10 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         "the firewall could not validate this call's reason; it was denied",
       );
     }
-    if (degraded) {
-      return auditedDeny(info, base, FIREWALL_RULES.auditUnavailable, degradedMessage);
-    }
-    if (reconciling) {
-      return auditedDeny(info, base, FIREWALL_RULES.reconciling, RECONCILING_MESSAGE);
-    }
+    // T012: kill switch / shadow mode first, so a kill-switch deny wins over every other state.
+    let shadow = false;
     if (o.preCheck !== undefined) {
-      let pre: PreCheckDeny | undefined;
+      let pre: PreCheckVerdict | undefined;
       try {
         pre = await o.preCheck(ctx);
       } catch (e: unknown) {
@@ -1005,7 +1066,16 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
           "the firewall pre-check failed; the call was denied",
         );
       }
-      if (pre !== undefined) return auditedDeny(info, base, pre.ruleId, pre.message);
+      if (pre !== undefined) {
+        if (isPreCheckDeny(pre)) return auditedDeny(info, base, pre.ruleId, pre.message);
+        shadow = true;
+      }
+    }
+    if (degraded) {
+      return auditedDeny(info, base, FIREWALL_RULES.auditUnavailable, degradedMessage);
+    }
+    if (reconciling) {
+      return auditedDeny(info, base, FIREWALL_RULES.reconciling, RECONCILING_MESSAGE);
     }
     // T010: `asf_*` notes are the firewall's marker namespace.
     const notes = notesProblem(info.tool, ctx.args);
@@ -1042,7 +1112,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         if (!got.ok) return lockDenied(info, base, got.error.code);
         releases.push(got.value);
       }
-      return await underResourceLocks(ctx, next, info, base, targets);
+      return await underResourceLocks(ctx, next, info, base, targets, shadow);
     } finally {
       // Release in reverse acquisition order.
       for (const release of releases.reverse()) release();
@@ -1105,6 +1175,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     info: CallInfo,
     base: DenyRecord,
     targets: ResourceTargets,
+    shadow: boolean,
   ): Promise<CallToolResult> => {
     const reason = base.reason;
 
@@ -1132,6 +1203,12 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       }
     }
     let res: EvalResult;
+    /** The decision acted on: the policy's, or (T012 shadow) an `allow` standing in for it. */
+    let decision: Decision;
+    /** Args acted on: the policy's `finalArgs`, or (T012 shadow) the agent's original args. */
+    let finalArgs: Readonly<Record<string, unknown>>;
+    /** T012: the policy decision a shadow call did not enforce. */
+    let would: Decision["type"] | undefined;
     let attempt: Result<AuditRecord>;
     /** Args recorded and (for allow / transform) forwarded: `finalArgs` + the T010 marker. */
     let forwardArgs: Record<string, unknown> = {};
@@ -1160,23 +1237,38 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         { tool: info.tool, args: ctx.args, reason, sessionId: ctx.sessionId },
         deps,
       );
+      decision = res.decision;
+      finalArgs = res.finalArgs;
+      // T012: shadow mode observes a POLICY decision instead of enforcing it; engine errors stay real denies.
+      if (shadow && isShadowableDecision(o.policy, res)) {
+        would = res.decision.type;
+        decision = {
+          type: "allow",
+          ruleId: res.decision.ruleId,
+          matchedRules: withRuleId(res.decision),
+        };
+        finalArgs = ctx.args;
+        log(
+          `shadow mode: ${escapeForTerminal(info.tool)} would ${would} (${escapeForTerminal(res.decision.ruleId)}); forwarding the original args`,
+        );
+      }
       recordedKey = agentKey.value;
-      if (res.decision.type !== "deny") {
-        const bad = checkFinalArgs({ ...ctx, tool: info.tool }, res.finalArgs);
+      if (decision.type !== "deny") {
+        const bad = checkFinalArgs({ ...ctx, tool: info.tool }, finalArgs);
         if (bad !== undefined) {
           return auditedDeny(
             info,
-            { ...keyedBase, matchedRules: [...res.decision.matchedRules, bad.ruleId] },
+            { ...keyedBase, matchedRules: [...decision.matchedRules, bad.ruleId] },
             bad.ruleId,
             bad.message,
           );
         }
         // 3b. A transform changed the args: the forwarded action must not duplicate an earlier one either.
-        const finalKey = idempotencyKey(info.tool, res.finalArgs);
+        const finalKey = idempotencyKey(info.tool, finalArgs);
         if (!finalKey.ok) {
           return keyDenied(info, {
             ...keyedBase,
-            matchedRules: [...res.decision.matchedRules, FIREWALL_RULES.invalidArgs],
+            matchedRules: [...decision.matchedRules, FIREWALL_RULES.invalidArgs],
           });
         }
         if (finalKey.value !== agentKey.value) {
@@ -1192,7 +1284,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
               info,
               {
                 ...keyedBase,
-                matchedRules: [...res.decision.matchedRules, FIREWALL_RULES.duplicate],
+                matchedRules: [...decision.matchedRules, FIREWALL_RULES.duplicate],
               },
               dup2.value,
             );
@@ -1200,13 +1292,13 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         }
         recordedKey = finalKey.value;
       }
-      const d = res.decision;
-      transformed = d.type !== "deny" && !sameJson(res.finalArgs, ctx.args);
+      const d = decision;
+      transformed = d.type !== "deny" && !sameJson(finalArgs, ctx.args);
       // T010: pre-generate the attempt id and stamp it into the forwarded args (notes marker).
       let presetId: string | undefined;
       if (d.type !== "deny") {
         presetId = redactionSafeUuid();
-        const stamped = stampAttemptMarker(info.tool, res.finalArgs, presetId);
+        const stamped = stampAttemptMarker(info.tool, finalArgs, presetId);
         if (!stamped.ok) {
           return auditedDeny(
             info,
@@ -1228,12 +1320,17 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         // Key of the recorded args (the forwarded ones for a non-deny decision; notes are never part of it).
         idempotencyKey: recordedKey,
         ...(presetId === undefined ? {} : { id: presetId }),
+        ...(would === undefined ? {} : { shadow: { wouldDecision: would } }),
       });
     } finally {
       got.value();
     }
 
     // 4. Attempt not recorded ⇒ never forward.
+    if (!attempt.ok && attempt.error.code === "audit.invalid_shadow") {
+      // T012: shadow mode was turned off between the mode read and the attempt write.
+      return auditedDeny(info, base, FIREWALL_RULES.shadowEnded, SHADOW_ENDED_MESSAGE);
+    }
     if (!attempt.ok) {
       const trail = attempt.error.details?.["attemptId"];
       if (attempt.error.code === "audit.invalid_args" && typeof trail === "string") {
@@ -1259,7 +1356,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     }
     const attemptId = attempt.value.id;
     const attemptRecord = attempt.value.kind === "attempt" ? attempt.value : undefined;
-    const d = res.decision;
+    const d = decision;
 
     // 5. Deny.
     if (d.type === "deny") {
@@ -1339,6 +1436,20 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         }),
       );
     }
+    // T012: the kill switch may have been turned on (or shadow mode off) while this call waited.
+    const gate = await sendGate(ctx, would);
+    if (gate !== undefined) {
+      if (
+        !recordOutcome(attemptId, {
+          outcome: "not_forwarded",
+          errorCode: gateCode(gate),
+          latencyMs: 0,
+        })
+      ) {
+        latch("a not_forwarded outcome could not be recorded");
+      }
+      return mark(info, denyResult(gate.ruleId, gate.message));
+    }
     // Last check before the send: the latch may have been set after the global lock was released (e.g. by a
     // concurrent call on another resource). The outcome write is best-effort (the audit log is already degraded).
     if (degraded) {
@@ -1364,9 +1475,10 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       decision: d.type,
       matchedRules: withRuleId(d),
       recordedKey,
-      finalArgs: res.finalArgs,
+      finalArgs,
       transformed,
       reason,
+      ...(would === undefined ? {} : { shadow: { wouldDecision: would } }),
     };
     return settleForward(
       ctx,
@@ -1602,6 +1714,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       return mark(info, notRetriedResult());
     };
     if (ctx.signal.aborted) return notRetried("the request was cancelled");
+    const gate0 = await sendGate(ctx, rc.shadow?.wouldDecision);
+    if (gate0 !== undefined) return notRetried(gate0.ruleId);
     if (degraded) return notRetried("the audit log is degraded");
     const bad = checkFinalArgs({ ...ctx, tool: info.tool }, rc.finalArgs);
     if (bad !== undefined) return notRetried(bad.ruleId);
@@ -1641,12 +1755,26 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         matchedRules: rc.matchedRules,
         idempotencyKey: rc.recordedKey,
         ...(rc.approver === undefined ? {} : { approver: rc.approver }),
+        ...(rc.shadow === undefined ? {} : { shadow: { wouldDecision: rc.shadow.wouldDecision } }),
       });
     } finally {
       got.value();
     }
     if (!att.ok) return notRetried(`retry attempt not recorded (${att.error.code})`);
     const retryAttempt = att.value;
+    const gate = await sendGate(ctx, rc.shadow?.wouldDecision);
+    if (gate !== undefined) {
+      if (
+        !recordOutcome(retryAttempt.id, {
+          outcome: "not_forwarded",
+          errorCode: gateCode(gate),
+          latencyMs: 0,
+        })
+      ) {
+        latch("a retry's not_forwarded outcome could not be recorded");
+      }
+      return notRetried(gate.ruleId);
+    }
     if (ctx.signal.aborted || degraded) {
       const cancelled = ctx.signal.aborted;
       if (
@@ -1825,8 +1953,9 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       };
       const info: CallInfo = { tool: req.tool, audited: new WeakSet<CallToolResult>() };
       // Same T012 pre-check (kill switch / shadow mode) as a live call; a deny or a throw ⇒ not executed.
+      // A shadow verdict is ignored: an approved action is a real, non-shadow action (D-035).
       if (o.preCheck !== undefined) {
-        let pre: PreCheckDeny | undefined;
+        let pre: PreCheckVerdict | undefined;
         try {
           pre = await o.preCheck(ctx);
         } catch (e: unknown) {
@@ -1837,7 +1966,9 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
             "the firewall pre-check failed; the approved action was not executed",
           );
         }
-        if (pre !== undefined) return approvedNotExecuted(attemptId, pre.ruleId, pre.message);
+        if (pre !== undefined && isPreCheckDeny(pre)) {
+          return approvedNotExecuted(attemptId, pre.ruleId, pre.message);
+        }
       }
 
       const got = await globalLock.acquire({ timeoutMs: lockWaitMs });
@@ -1940,6 +2071,9 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       // request was reported failed), it must not be sent.
       const closedNow = stillOpen();
       if (closedNow !== undefined) return closedNow;
+      // T012: the kill switch may have been turned on while this approved action waited for its locks.
+      const gate = await sendGate(ctx);
+      if (gate !== undefined) return approvedNotExecuted(attemptId, gateCode(gate), gate.message);
       let r: CallToolResult | undefined;
       try {
         r = await call.forward(stamped.value);

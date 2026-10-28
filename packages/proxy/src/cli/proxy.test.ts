@@ -975,3 +975,102 @@ describe("T010 settings: ASF_MONEY_CALL_TIMEOUT_MS / ASF_VERIFY_WAIT_MS (shell e
     expect(bad2.ok === false && bad2.error.code).toBe("proxy.bad_money_timeout");
   });
 });
+
+describe("T012 startProxy mode wiring", () => {
+  async function started(change?: { killSwitch?: boolean; shadow?: boolean }) {
+    const fake = fakeUpstream({
+      handler: (name, args) =>
+        Promise.resolve({
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                name === "fetch_payment"
+                  ? {
+                      id: args?.["payment_id"],
+                      status: "captured",
+                      amount: 100_000,
+                      amount_refunded: 0,
+                      currency: "INR",
+                    }
+                  : { id: "rfnd_CLI2", entity: "refund" },
+              ),
+            },
+          ],
+        }),
+    });
+    const r = resolveProxyConfig(SHELL, deps());
+    if (!r.ok) throw new Error("config");
+    const firewall = memFirewall();
+    if (change !== undefined) {
+      const m = firewall.store.changeMode({ ...change, actor: "cli:ops" });
+      if (!m.ok) throw new Error(m.error.code);
+    }
+    const logs: string[] = [];
+    const running = startProxy({
+      config: r.value,
+      logger: (l) => logs.push(l),
+      factory: fake.factory,
+      firewall,
+    });
+    await running.reconciled;
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await running.proxy.connect(b);
+    const agent = new Client({ name: "t", version: "0" }, { capabilities: {} });
+    await agent.connect(a);
+    const callTool = (name: string, args: Record<string, unknown>) =>
+      agent.request(
+        { method: "tools/call", params: { name, arguments: args } },
+        CallToolResultSchema,
+      );
+    return { running, agent, fake, firewall, logs, callTool };
+  }
+  const REFUND_ARGS = {
+    payment_id: "pay_CLI2",
+    amount: 5_000,
+    reason: "customer cust_1 was double charged for order_9",
+  };
+
+  it("kill switch ON in the audit DB ⇒ money calls denied kill-switch, reads work; startup warns", async () => {
+    const t = await started({ killSwitch: true });
+    expect(t.logs.join("\n")).toContain("KILL SWITCH IS ON");
+    expect(t.logs.join("\n")).toContain("mode: kill switch ON");
+    const r = await t.callTool("create_refund", REFUND_ARGS);
+    expect(jsonOf(r)).toMatchObject({ decision: "deny", ruleId: "kill-switch" });
+    expect(t.fake.calls.filter((c) => c.name === "create_refund")).toEqual([]);
+    const read = await t.callTool("fetch_payment", { payment_id: "pay_CLI2" });
+    expect(read.isError).not.toBe(true);
+    // Turned off on the same DB while running ⇒ the next call goes through.
+    expect(t.firewall.store.changeMode({ killSwitch: false, actor: "cli:ops" }).ok).toBe(true);
+    expect(jsonOf(await t.callTool("create_refund", REFUND_ARGS))).toMatchObject({
+      id: "rfnd_CLI2",
+    });
+    await t.running.shutdown();
+    await t.agent.close();
+  });
+
+  it("shadow mode ON ⇒ startup warns; a policy deny is forwarded and recorded as wouldDecision deny", async () => {
+    const t = await started({ shadow: true });
+    expect(t.logs.join("\n")).toContain("SHADOW MODE IS ON");
+    // Default policy hard cap: ₹10,000 ⇒ would deny.
+    const r = await t.callTool("create_refund", { ...REFUND_ARGS, amount: 2_000_000 });
+    expect(jsonOf(r)).toMatchObject({ id: "rfnd_CLI2" });
+    const rows = t.firewall.store.readAll();
+    expect(
+      rows.ok && rows.value.find((x) => !("invalid" in x) && x.kind === "attempt"),
+    ).toMatchObject({
+      decision: "allow",
+      shadow: true,
+      wouldDecision: "deny",
+    });
+    await t.running.shutdown();
+    await t.agent.close();
+  });
+
+  it("defaults ⇒ logs both off", async () => {
+    const t = await started();
+    expect(t.logs.join("\n")).toContain("mode: kill switch off; shadow mode off; never changed");
+    await t.running.shutdown();
+    await t.agent.close();
+  });
+});
