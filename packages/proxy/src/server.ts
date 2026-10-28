@@ -36,6 +36,7 @@ import {
   type RequestId,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { err, ok, type Result } from "@asf/core";
 import { escapeForTerminal } from "./cli/audit-verify.js";
 import { classifyTool, type ToolClass } from "./tool-classes.js";
 import type { DiscoveredTool } from "./tool-discovery.js";
@@ -274,6 +275,38 @@ function deepFreeze<T>(value: T): T {
 
 export const PROXY_SERVER_INFO = { name: "agent-spend-firewall", version: "0.0.0" } as const;
 
+/**
+ * A tool implemented by the firewall itself (T011 `firewall_check_approval`): advertised as-is (no `advertise`
+ * rewrite), handled before any upstream lookup, never forwarded, not passed through the interceptor or
+ * `resultFilter` (its results are firewall-authored and must contain only validated ids). An upstream tool with the
+ * same name is hidden from the list and never callable. A handler that throws ⇒ deny `firewall.internal_error`.
+ */
+export interface LocalTool {
+  readonly tool: Tool;
+  call(
+    args: Readonly<Record<string, unknown>>,
+    ctx: { readonly sessionId: string; readonly signal: AbortSignal },
+  ): Promise<CallToolResult>;
+}
+
+/**
+ * T011: a forwarding capability for ONE call made by the firewall itself (an approved action), outside any agent
+ * request. Same rules as the `forward` an interceptor gets: call-once, plain JSON args, the name re-checked against the
+ * current live list, the generation pinned, refused if the tool's schema differs from `inputSchema`, credential
+ * screening, `ForwardReport` tags and one T010 `RetryForward` on a sent timeout / failure. `settle()` when done.
+ */
+export interface DirectCall {
+  readonly tool: string;
+  readonly toolClass: ToolClass;
+  /** The tool's ORIGINAL upstream input schema on the current live list (deep-frozen copy). */
+  readonly inputSchema: Tool["inputSchema"];
+  readonly forward: Forward;
+  settle(): void;
+}
+
+/** Opens a `DirectCall` for an exact upstream tool name; `err` if there is no usable live list or no such tool. */
+export type OpenDirectCall = (tool: string, signal: AbortSignal) => Promise<Result<DirectCall>>;
+
 export interface ProxyServerOptions {
   readonly upstream: UpstreamPort;
   readonly interceptor?: CallInterceptor;
@@ -300,10 +333,14 @@ export interface ProxyServerOptions {
   readonly resultFilter?: (tool: string, result: CallToolResult) => CallToolResult;
   /** Epoch-ms clock for `ForwardReport.latencyMs`. Default `Date.now`. */
   readonly now?: () => number;
+  /** Firewall-implemented tools (see `LocalTool`). Names must be unique. */
+  readonly localTools?: readonly LocalTool[];
 }
 
 export interface ProxyServer {
   readonly server: Server;
+  /** T011: forwarding for actions the firewall executes itself (approved actions). */
+  readonly openDirectCall: OpenDirectCall;
   connect(transport: Transport): Promise<void>;
   close(): Promise<void>;
 }
@@ -334,6 +371,11 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
   const fallbackSessionId = opts.sessionId ?? randomUUID();
   const now = opts.now ?? Date.now;
   const resultFilter = opts.resultFilter;
+  const localTools = new Map<string, LocalTool>();
+  for (const t of opts.localTools ?? []) {
+    if (localTools.has(t.tool.name)) throw new Error(`duplicate local tool ${t.tool.name}`);
+    localTools.set(t.tool.name, t);
+  }
 
   const cached = new Map<string, Tool>();
   for (const t of opts.cachedTools ?? []) {
@@ -431,14 +473,164 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
     return fresh;
   };
 
-  const advertisedView = (tools: ReadonlyMap<string, Tool>): Tool[] =>
-    [...tools.values()].map((t) => advertise(t, classifyTool(t.name)));
+  const advertisedView = (tools: ReadonlyMap<string, Tool>): Tool[] => [
+    ...[...tools.values()]
+      .filter((t) => !localTools.has(t.name))
+      .map((t) => advertise(t, classifyTool(t.name))),
+    ...[...localTools.values()].map((l) => l.tool),
+  ];
 
   /** No usable live list: a name we know of (cache or last live list) ⇒ unavailable; anything else ⇒ unknown. */
   const notAvailable = (name: string): CallToolResult =>
     cached.has(name) || live?.tools.has(name) === true
       ? jsonErrorResult(UNAVAILABLE)
       : unknownTool(name);
+
+  /**
+   * The once-only `forward` (+ T010 `RetryForward`) of ONE call to `name`, bound to the schema the caller validated
+   * against (`schemaKey`). Shared by `tools/call` and `openDirectCall` (T011). `settle()` ends it: later sends are
+   * refused `firewall.forward_after_settle`.
+   */
+  const makeForwarder = (
+    name: string,
+    schemaKey: string,
+    toolClass: ToolClass,
+    signal: AbortSignal,
+  ): { forward: Forward; settle: () => void; sendAttempted: () => boolean } => {
+    let forwardUsed = false;
+    let settled = false;
+    /** Set once `upstream.callTool` was invoked for this call (it may have reached Razorpay). */
+    let sendAttempted = false;
+    const refused = (r: CallToolResult): CallToolResult =>
+      tagged(r, { sent: false, kind: "refused", latencyMs: 0 });
+    const timeoutMs =
+      toolClass === "money" && opts.moneyCallTimeoutMs !== undefined
+        ? opts.moneyCallTimeoutMs
+        : opts.callTimeoutMs;
+    /**
+     * One send to upstream (validated, re-checked against the current list, generation pinned). `issueRetry`: a
+     * timeout / sent-then-failed result of THIS send gets a one-use `RetryForward` (T010); a retry's own result
+     * never does.
+     */
+    const send = async (
+      forwardArgs: Record<string, unknown>,
+      issueRetry: boolean,
+    ): Promise<CallToolResult> => {
+      // Validate the given value (structuredClone would silently drop prototypes), then validate the copy that
+      // is actually sent, so later mutation by the interceptor can't change it.
+      let toSend: unknown;
+      if (isPlainJsonObject(forwardArgs)) {
+        try {
+          toSend = structuredClone(forwardArgs);
+        } catch {
+          toSend = undefined; // not cloneable ⇒ not plain JSON; rejected below
+        }
+      }
+      if (!isPlainJsonObject(toSend)) {
+        return refused(
+          denyResult(
+            "firewall.invalid_forward_args",
+            "the firewall could not forward this call (arguments are not a plain JSON object); it was not sent",
+          ),
+        );
+      }
+      // Re-check against the list for the generation we will send on; pin that generation.
+      const current = await refresh();
+      if (current === undefined) return refused(notAvailable(name));
+      const nowTool = current.tools.get(name);
+      if (nowTool === undefined) return refused(unknownTool(name));
+      if (stableStringify(nowTool.inputSchema) !== schemaKey) {
+        log(`schema of ${escapeForTerminal(name)} changed during the call; refused`);
+        return refused(jsonErrorResult(SCHEMA_CHANGED));
+      }
+      sendAttempted = true;
+      const started = now();
+      const outcome = await upstream.callTool(name, toSend, {
+        signal,
+        expectedGeneration: current.generation,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      });
+      const latencyMs = elapsedMs(started, now());
+      const result = toCallResult(name, outcome);
+      if (outcome.kind === "ok") {
+        const leak = result === CREDENTIAL_LEAK_RESULT;
+        return tagged(result, {
+          sent: true,
+          kind: leak ? "credential_leak" : "ok",
+          latencyMs,
+          generation: current.generation,
+        });
+      }
+      const fresh = tagged(result, {
+        sent: outcome.forwarded,
+        kind: outcome.error,
+        latencyMs: outcome.forwarded ? latencyMs : 0,
+        ...(outcome.requestId === undefined ? {} : { requestId: outcome.requestId }),
+        generation: outcome.generation ?? current.generation,
+      });
+      if (
+        issueRetry &&
+        outcome.forwarded &&
+        (outcome.error === "upstream_timeout" || outcome.error === "upstream_error")
+      ) {
+        retryForwards.set(fresh, retryForward);
+      }
+      return fresh;
+    };
+    let retryUsed = false;
+    /** The one extra send (T010): same rules as `forward`, usable once, never after the call settled. */
+    const retryForward: RetryForward = async (retryArgs) => {
+      if (settled) {
+        log(`interceptor called retry after settling (${escapeForTerminal(name)}); refused`);
+        return refused(
+          denyResult(
+            "firewall.forward_after_settle",
+            "the firewall refused a late forward of this call; it was not sent",
+          ),
+        );
+      }
+      if (retryUsed) {
+        log(`interceptor called retry twice (${escapeForTerminal(name)}); refused`);
+        return refused(
+          denyResult(
+            "firewall.forward_twice",
+            "the firewall refused to send this call twice; the second send was not made",
+          ),
+        );
+      }
+      retryUsed = true;
+      return send(retryArgs, false);
+    };
+    const forward: Forward = async (forwardArgs) => {
+      if (settled) {
+        log(`interceptor called forward after settling (${escapeForTerminal(name)}); refused`);
+        return refused(
+          denyResult(
+            "firewall.forward_after_settle",
+            "the firewall refused a late forward of this call; it was not sent",
+          ),
+        );
+      }
+      if (forwardUsed) {
+        log(`interceptor called forward twice (${escapeForTerminal(name)}); refused`);
+        return refused(
+          denyResult(
+            "firewall.forward_twice",
+            "the firewall refused to send this call twice; the second send was not made",
+          ),
+        );
+      }
+      forwardUsed = true;
+      return send(forwardArgs, true);
+    };
+    return {
+      forward,
+      settle: () => {
+        settled = true;
+      },
+      sendAttempted: () => sendAttempted,
+    };
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const current = await refresh();
@@ -474,6 +666,8 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
     async (request, extra): Promise<CallToolResult> => {
       const name = request.params.name;
       const rawArgs: unknown = request.params.arguments ?? {};
+      const local = localTools.get(name);
+      if (local !== undefined) return callLocal(local, rawArgs, extra);
       try {
         // Exact match (Map: no prototype keys, no case folding) against the list for the CURRENT generation only.
         const current = await refresh();
@@ -498,132 +692,8 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
           signal: extra.signal,
         };
 
-        let forwardUsed = false;
-        let settled = false;
-        /** Set once `upstream.callTool` was invoked for this call (it may have reached Razorpay). */
-        let sendAttempted = false;
-        const refused = (r: CallToolResult): CallToolResult =>
-          tagged(r, { sent: false, kind: "refused", latencyMs: 0 });
-        const timeoutMs =
-          ctx.toolClass === "money" && opts.moneyCallTimeoutMs !== undefined
-            ? opts.moneyCallTimeoutMs
-            : opts.callTimeoutMs;
-        /**
-         * One send to upstream (validated, re-checked against the current list, generation pinned). `issueRetry`: a
-         * timeout / sent-then-failed result of THIS send gets a one-use `RetryForward` (T010); a retry's own result
-         * never does.
-         */
-        const send = async (
-          forwardArgs: Record<string, unknown>,
-          issueRetry: boolean,
-        ): Promise<CallToolResult> => {
-          // Validate the given value (structuredClone would silently drop prototypes), then validate the copy that
-          // is actually sent, so later mutation by the interceptor can't change it.
-          let toSend: unknown;
-          if (isPlainJsonObject(forwardArgs)) {
-            try {
-              toSend = structuredClone(forwardArgs);
-            } catch {
-              toSend = undefined; // not cloneable ⇒ not plain JSON; rejected below
-            }
-          }
-          if (!isPlainJsonObject(toSend)) {
-            return refused(
-              denyResult(
-                "firewall.invalid_forward_args",
-                "the firewall could not forward this call (arguments are not a plain JSON object); it was not sent",
-              ),
-            );
-          }
-          // Re-check against the list for the generation we will send on; pin that generation.
-          const current = await refresh();
-          if (current === undefined) return refused(notAvailable(name));
-          const nowTool = current.tools.get(name);
-          if (nowTool === undefined) return refused(unknownTool(name));
-          if (stableStringify(nowTool.inputSchema) !== schemaKey) {
-            log(`schema of ${escapeForTerminal(name)} changed during the call; refused`);
-            return refused(jsonErrorResult(SCHEMA_CHANGED));
-          }
-          sendAttempted = true;
-          const started = now();
-          const outcome = await upstream.callTool(name, toSend, {
-            signal: extra.signal,
-            expectedGeneration: current.generation,
-            ...(timeoutMs === undefined ? {} : { timeoutMs }),
-          });
-          const latencyMs = elapsedMs(started, now());
-          const result = toCallResult(name, outcome);
-          if (outcome.kind === "ok") {
-            const leak = result === CREDENTIAL_LEAK_RESULT;
-            return tagged(result, {
-              sent: true,
-              kind: leak ? "credential_leak" : "ok",
-              latencyMs,
-              generation: current.generation,
-            });
-          }
-          const fresh = tagged(result, {
-            sent: outcome.forwarded,
-            kind: outcome.error,
-            latencyMs: outcome.forwarded ? latencyMs : 0,
-            ...(outcome.requestId === undefined ? {} : { requestId: outcome.requestId }),
-            generation: outcome.generation ?? current.generation,
-          });
-          if (
-            issueRetry &&
-            outcome.forwarded &&
-            (outcome.error === "upstream_timeout" || outcome.error === "upstream_error")
-          ) {
-            retryForwards.set(fresh, retryForward);
-          }
-          return fresh;
-        };
-        let retryUsed = false;
-        /** The one extra send (T010): same rules as `forward`, usable once, never after the call settled. */
-        const retryForward: RetryForward = async (retryArgs) => {
-          if (settled) {
-            log(`interceptor called retry after settling (${escapeForTerminal(name)}); refused`);
-            return refused(
-              denyResult(
-                "firewall.forward_after_settle",
-                "the firewall refused a late forward of this call; it was not sent",
-              ),
-            );
-          }
-          if (retryUsed) {
-            log(`interceptor called retry twice (${escapeForTerminal(name)}); refused`);
-            return refused(
-              denyResult(
-                "firewall.forward_twice",
-                "the firewall refused to send this call twice; the second send was not made",
-              ),
-            );
-          }
-          retryUsed = true;
-          return send(retryArgs, false);
-        };
-        const forward: Forward = async (forwardArgs) => {
-          if (settled) {
-            log(`interceptor called forward after settling (${escapeForTerminal(name)}); refused`);
-            return refused(
-              denyResult(
-                "firewall.forward_after_settle",
-                "the firewall refused a late forward of this call; it was not sent",
-              ),
-            );
-          }
-          if (forwardUsed) {
-            log(`interceptor called forward twice (${escapeForTerminal(name)}); refused`);
-            return refused(
-              denyResult(
-                "firewall.forward_twice",
-                "the firewall refused to send this call twice; the second send was not made",
-              ),
-            );
-          }
-          forwardUsed = true;
-          return send(forwardArgs, true);
-        };
+        const fw = makeForwarder(name, schemaKey, ctx.toolClass, extra.signal);
+        const forward = fw.forward;
         let result: CallToolResult;
         try {
           result = await interceptor.intercept(ctx, forward);
@@ -633,12 +703,12 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
           );
           return denyResult(
             "firewall.interceptor_error",
-            sendAttempted
+            fw.sendAttempted()
               ? "the firewall failed after this call was sent upstream; check its status before retrying"
               : "the firewall could not evaluate this call; it was denied (fail closed)",
           );
         } finally {
-          settled = true;
+          fw.settle();
         }
         if (resultFilter === undefined) return result;
         try {
@@ -651,8 +721,8 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
             error: "upstream_error",
             message:
               "the firewall could not safely return this result; it was withheld" +
-              (sendAttempted ? " (the call was sent: check its status before retrying)" : ""),
-            forwarded: sendAttempted,
+              (fw.sendAttempted() ? " (the call was sent: check its status before retrying)" : ""),
+            forwarded: fw.sendAttempted(),
           });
         }
       } catch (e: unknown) {
@@ -666,6 +736,48 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
       }
     },
   );
+
+  const callLocal = async (
+    local: LocalTool,
+    rawArgs: unknown,
+    extra: { readonly sessionId?: string | undefined; readonly signal: AbortSignal },
+  ): Promise<CallToolResult> => {
+    if (!isPlainJsonObject(rawArgs)) {
+      return denyResult("firewall.invalid_args", "tool arguments must be a plain JSON object");
+    }
+    try {
+      return await local.call(deepFreeze(structuredClone(rawArgs)), {
+        sessionId: extra.sessionId ?? fallbackSessionId,
+        signal: extra.signal,
+      });
+    } catch (e: unknown) {
+      log(
+        `firewall tool ${escapeForTerminal(local.tool.name)} failed: ${e instanceof Error ? e.name : typeof e}`,
+      );
+      return denyResult("firewall.internal_error", "the firewall failed while handling this call");
+    }
+  };
+
+  const openDirectCall: OpenDirectCall = async (name, signal) => {
+    if (localTools.has(name)) return err("firewall.unknown_tool", "not an upstream tool");
+    const current = await refresh();
+    if (current === undefined) {
+      return err("upstream_unavailable", "the upstream Razorpay MCP server is unavailable");
+    }
+    const listedTool = current.tools.get(name);
+    if (listedTool === undefined) {
+      return err("firewall.unknown_tool", "the tool is not offered by the upstream server");
+    }
+    const toolClass = classifyTool(name);
+    const fw = makeForwarder(name, stableStringify(listedTool.inputSchema), toolClass, signal);
+    return ok({
+      tool: name,
+      toolClass,
+      inputSchema: deepFreeze(structuredClone(listedTool.inputSchema)),
+      forward: fw.forward,
+      settle: fw.settle,
+    });
+  };
 
   const unknownTool = (name: string): CallToolResult =>
     denyResult(
@@ -692,6 +804,7 @@ export function createProxyServer(opts: ProxyServerOptions): ProxyServer {
 
   return {
     server,
+    openDirectCall,
     connect: async (transport) => {
       await server.connect(transport);
       agentConnected = true;

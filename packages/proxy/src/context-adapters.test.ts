@@ -189,6 +189,14 @@ describe("createStatsPort", () => {
   it("uses the later of attempt and outcome time", async () => {
     seed("approved-late", { decision: "require_approval" });
     clock.set(T0 + 50 * MIN);
+    unwrap(
+      store.recordApproval({
+        attemptId: "approved-late",
+        approvalId: "apr_1",
+        decision: "approved",
+        approver: "telegram:1",
+      }),
+    );
     unwrap(store.recordOutcome({ attemptId: "approved-late", outcome: "success", latencyMs: 1 }));
     clock.set(T0 + 90 * MIN);
     expect(unwrap(await stats())).toEqual({ amountPaise: 10_000, count: 1 });
@@ -221,6 +229,14 @@ describe("createStatsPort", () => {
   it("does not count an attempt that completed and is now outside the window", async () => {
     seed("done", { decision: "require_approval" });
     clock.set(T0 + 5 * MIN);
+    unwrap(
+      store.recordApproval({
+        attemptId: "done",
+        approvalId: "apr_1",
+        decision: "approved",
+        approver: "telegram:1",
+      }),
+    );
     unwrap(store.recordOutcome({ attemptId: "done", outcome: "success", latencyMs: 1 }));
     clock.set(T0 + 5 * MIN + HOUR + 1);
     expect(unwrap(await stats())).toEqual({ amountPaise: 0, count: 0 });
@@ -393,6 +409,14 @@ describe("createHistoryPort", () => {
   it("an attempt that succeeded at t0 + 5 min is not a duplicate once outside the window", async () => {
     seed("p", { decision: "require_approval" });
     clock.set(T0 + 5 * MIN);
+    unwrap(
+      store.recordApproval({
+        attemptId: "p",
+        approvalId: "apr_1",
+        decision: "approved",
+        approver: "telegram:1",
+      }),
+    );
     unwrap(store.recordOutcome({ attemptId: "p", outcome: "success", latencyMs: 1 }));
     clock.set(T0 + 15 * MIN);
     expect(unwrap(await recent({ payment_id: PAY, amount: 10_000 }))).toBe(true);

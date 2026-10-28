@@ -29,9 +29,12 @@ import {
   redact,
   redactText,
   verifyChain,
+  AUDIT_APPROVAL_DECISIONS,
   AUDIT_VERIFICATION_METHODS,
   AUDIT_VERIFICATION_RESULTS,
   AUDIT_VERIFICATION_TRIGGERS,
+  type AuditApprovalBody,
+  type AuditApprovalDecision,
   type AuditAttemptBody,
   type AuditVerificationBody,
   type AuditVerificationMethod,
@@ -114,6 +117,20 @@ export interface RecordVerificationInput {
   ts?: string;
 }
 
+/**
+ * T011: the decision on a `require_approval` attempt. Checked in the write transaction: the attempt exists, has
+ * decision `require_approval`, is not a retry, has no outcome and no approval yet ⇒ else `audit.invalid_approval`.
+ */
+export interface RecordApprovalInput {
+  attemptId: string;
+  approvalId: string;
+  decision: AuditApprovalDecision;
+  /** Required for `approved` / `rejected` (`approverSchema`), forbidden for `expired`. */
+  approver?: string;
+  id?: string;
+  ts?: string;
+}
+
 export interface RecordOutcomeInput {
   attemptId: string;
   outcome: AuditOutcomeInput;
@@ -129,12 +146,17 @@ export type AuditDecisionInput = (typeof AUDIT_DECISIONS)[number];
 export type AuditAttemptRecord = Extract<AuditRecord, { kind: "attempt" }>;
 export type AuditOutcomeRecord = Extract<AuditRecord, { kind: "outcome" }>;
 export type AuditVerificationRecord = Extract<AuditRecord, { kind: "verification" }>;
+export type AuditApprovalRecord = Extract<AuditRecord, { kind: "approval" }>;
 
-/** An attempt joined with its outcome record, if one has been written, and its LATEST verification (T010), if any. */
+/**
+ * An attempt joined with its outcome record, if one has been written, its LATEST verification (T010), if any, and
+ * its approval decision (T011), if any.
+ */
 export interface AuditActivity {
   readonly attempt: AuditAttemptRecord;
   readonly outcome?: AuditOutcomeRecord;
   readonly verification?: AuditVerificationRecord;
+  readonly approval?: AuditApprovalRecord;
 }
 
 /** Default cap on rows `readActivitySince` scans before failing closed. */
@@ -150,8 +172,19 @@ export interface AuditStore {
   readonly warnings: readonly string[];
   /** Append an attempt record. Call *before* forwarding a money action. */
   recordAttempt(input: RecordAttemptInput): Result<AuditRecord>;
-  /** Append the outcome of an existing attempt. At most one outcome per attempt. */
+  /**
+   * Append the outcome of an existing attempt. At most one outcome per attempt. T011: a `require_approval` attempt
+   * (or a retry of one) may only get a sent outcome (`success` / `upstream_error` / `timeout`) after an `approved`
+   * record; after `rejected` / `expired` only `not_forwarded` ⇒ else `audit.inconsistent_outcome`.
+   */
   recordOutcome(input: RecordOutcomeInput): Result<AuditRecord>;
+  /** T011: append the approval decision of a `require_approval` attempt (see `RecordApprovalInput`). */
+  recordApproval(input: RecordApprovalInput): Result<AuditRecord>;
+  /**
+   * T011: one attempt joined with its outcome, latest verification and approval (indexed lookups), `undefined` if no
+   * attempt has that id. Any unreadable / inconsistent row ⇒ `err`.
+   */
+  readAttempt(attemptId: string): Result<AuditActivity | undefined>;
   /** All rows ordered by seq; unparseable / inconsistent rows become `{ invalid: true, seq }`. */
   readAll(): Result<Array<AuditRecord | InvalidAuditRow>>;
   /**
@@ -176,11 +209,18 @@ export interface AuditStore {
   /**
    * T010: every UNSETTLED money action in the whole log (scans ALL rows, oldest first, at most `maxScanRows` ⇒ else
    * `err` `audit.scan_too_large`; any unreadable row ⇒ `err`), ordered by attempt seq:
-   * - `open`: decision allow / transform with no outcome (orphaned by a crash; `require_approval` is NOT included);
+   * - `open`: no outcome and possibly sent (orphaned by a crash): decision allow / transform, a `require_approval`
+   *   attempt with an `approved` record, or a retry of one;
+   * - `staleApprovals` (T011): `require_approval` attempts (not retries) with no outcome and no `approved` record —
+   *   still pending (no record) or decided `rejected` / `expired` without the terminal outcome;
    * - `unsettled`: decision allow / transform / require_approval, outcome `timeout` / `upstream_error`, and no
    *   verification or a latest verification `unknown`.
    */
-  readUnsettled(): Result<{ open: AuditActivity[]; unsettled: AuditActivity[] }>;
+  readUnsettled(): Result<{
+    open: AuditActivity[];
+    unsettled: AuditActivity[];
+    staleApprovals: AuditActivity[];
+  }>;
   /** T010: actions whose latest verification is `unknown` (flagged for a human), full scan like `readUnsettled`. */
   listNeedsHuman(): Result<AuditActivity[]>;
   /** `verifyChain` over `readAll()`. `err` only if the DB cannot be read. */
@@ -234,6 +274,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 ${[...EXPECTED_TRIGGERS.values()].map(ifNotExists).join("\n")}
 CREATE UNIQUE INDEX IF NOT EXISTS audit_log_one_outcome_per_attempt
   ON audit_log (json_extract(body_json, '$.attemptId')) WHERE kind = 'outcome';
+CREATE UNIQUE INDEX IF NOT EXISTS audit_log_one_approval_per_attempt
+  ON audit_log (json_extract(body_json, '$.attemptId')) WHERE kind = 'approval';
 `;
 
 // ---------- input validation (boundary) ----------
@@ -299,6 +341,20 @@ const verificationInputSchema = z
   .refine((v) => (v.trigger === "human") === (v.resolver !== undefined), {
     message: "resolver is required iff trigger is human",
     path: ["resolver"],
+  });
+
+const approvalInputSchema = z
+  .object({
+    attemptId: recordIdSchema,
+    approvalId: recordIdSchema,
+    decision: z.enum(AUDIT_APPROVAL_DECISIONS),
+    approver: approverSchema.optional(),
+    id: recordIdSchema.optional(),
+    ts: isoTs.optional(),
+  })
+  .refine((v) => (v.decision === "expired") === (v.approver === undefined), {
+    message: "approver is required unless the approval expired",
+    path: ["approver"],
   });
 
 const outcomeInputSchema = z.object({
@@ -374,10 +430,21 @@ const storedVerificationSchema = z.strictObject({
   resolver: z.string().optional(),
 });
 
+const storedApprovalSchema = z.strictObject({
+  kind: z.literal("approval"),
+  id: recordIdSchema,
+  attemptId: recordIdSchema,
+  ts: z.string(),
+  approvalId: z.string(),
+  decision: z.enum(AUDIT_APPROVAL_DECISIONS),
+  approver: z.string().optional(),
+});
+
 const storedBodySchema = z.discriminatedUnion("kind", [
   storedAttemptSchema,
   storedOutcomeSchema,
   storedVerificationSchema,
+  storedApprovalSchema,
 ]);
 
 const rowSchema = z.object({
@@ -426,6 +493,18 @@ function toCoreBody(b: StoredBody): AuditBody {
     if (b.errorCode !== undefined) v.errorCode = b.errorCode;
     if (b.resolver !== undefined) v.resolver = b.resolver;
     return v;
+  }
+  if (b.kind === "approval") {
+    const a: AuditApprovalBody = {
+      kind: "approval",
+      id: b.id,
+      attemptId: b.attemptId,
+      ts: b.ts,
+      approvalId: b.approvalId,
+      decision: b.decision,
+    };
+    if (b.approver !== undefined) a.approver = b.approver;
+    return a;
   }
   const body: AuditOutcomeBody = {
     kind: "outcome",
@@ -492,13 +571,20 @@ const headRowSchema = z.object({
   body_json: z.string(),
 });
 const tsOnlySchema = z.object({ ts: isoTs });
-const decisionOnlySchema = z.object({ decision: z.enum(AUDIT_DECISIONS) });
 const attemptToolSchema = z.object({
   tool: z.string(),
   decision: z.enum(AUDIT_DECISIONS),
   retryOf: recordIdSchema.optional(),
 });
 const verificationResultSchema = z.object({ result: z.enum(AUDIT_VERIFICATION_RESULTS) });
+const approvalDecisionSchema = z.object({ decision: z.enum(AUDIT_APPROVAL_DECISIONS) });
+
+/** Outcomes meaning the action was (or may have been) sent upstream. */
+const SENT_OUTCOMES: ReadonlySet<AuditOutcomeInput> = new Set([
+  "success",
+  "upstream_error",
+  "timeout",
+]);
 const bodyJsonRowSchema = z.object({ body_json: z.string() });
 const tableInfoRowSchema = z.object({ name: z.string() });
 const triggerRowSchema = z.object({ name: z.string(), sql: z.string().nullable() });
@@ -540,11 +626,13 @@ function joinActivity(
   attempt: AuditAttemptRecord,
   outcome: AuditOutcomeRecord | undefined,
   verification: AuditVerificationRecord | undefined,
+  approval?: AuditApprovalRecord,
 ): AuditActivity {
   return {
     attempt,
     ...(outcome === undefined ? {} : { outcome }),
     ...(verification === undefined ? {} : { verification }),
+    ...(approval === undefined ? {} : { approval }),
   };
 }
 
@@ -626,6 +714,9 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   let outcomeRowStmt: Database.Statement;
   let latestVerificationStmt: Database.Statement;
   let retriedStmt: Database.Statement;
+  let approvalStmt: Database.Statement;
+  let approvalRowStmt: Database.Statement;
+  let latestVerificationRowStmt: Database.Statement;
   let ascStmt: Database.Statement;
   let warnings: string[] = [];
   try {
@@ -695,6 +786,15 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     retriedStmt = db.prepare(
       "SELECT 1 AS present FROM audit_log WHERE kind = 'attempt' AND json_extract(body_json, '$.retryOf') = ? LIMIT 1",
     );
+    approvalStmt = db.prepare(
+      "SELECT body_json FROM audit_log WHERE kind = 'approval' AND json_extract(body_json, '$.attemptId') = ?",
+    );
+    approvalRowStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE kind = 'approval' AND json_extract(body_json, '$.attemptId') = ?",
+    );
+    latestVerificationRowStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE kind = 'verification' AND json_extract(body_json, '$.attemptId') = ? ORDER BY seq DESC LIMIT 1",
+    );
     ascStmt = db.prepare(
       "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log ORDER BY seq ASC",
     );
@@ -727,6 +827,60 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     const row = bodyJsonRowSchema.safeParse(raw);
     if (!row.success) return undefined;
     return parseJsonAs(attemptToolSchema, row.data.body_json) ?? undefined;
+  }
+
+  /** Approval decision of `attemptId` (inside a transaction): `undefined` if none, `null` if unreadable. */
+  function approvalDecisionOf(attemptId: string): AuditApprovalDecision | undefined | null {
+    const raw: unknown = approvalStmt.get(attemptId);
+    if (raw === undefined) return undefined;
+    const row = bodyJsonRowSchema.safeParse(raw);
+    if (!row.success) return null;
+    return parseJsonAs(approvalDecisionSchema, row.data.body_json)?.decision ?? null;
+  }
+
+  /** T011 checks for approval records (mirror core `verifyChain`). */
+  function checkApprovalRecord(body: AuditBody): Result<null> {
+    if (body.kind !== "approval") return ok(null);
+    const bad = (why: string): Result<null> =>
+      err("audit.invalid_approval", `approval is not allowed: ${why}`);
+    const attempt = attemptInfo(body.attemptId);
+    if (attempt === undefined) return bad("the attempt does not exist");
+    if (attempt.decision !== "require_approval") return bad("the attempt did not require approval");
+    if (attempt.retryOf !== undefined) return bad("the attempt is a retry");
+    if (outcomeExistsStmt.get(body.attemptId) !== undefined)
+      return bad("the attempt has an outcome");
+    if (approvalStmt.get(body.attemptId) !== undefined)
+      return bad("the attempt is already decided");
+    return ok(null);
+  }
+
+  /**
+   * T011 outcome rule for `require_approval` attempts (inside a transaction): sent outcomes need an `approved` record
+   * (a retry: on its original); after `rejected` / `expired` only `not_forwarded`.
+   */
+  function checkApprovalOutcome(
+    attempt: { decision: AuditDecisionInput; retryOf?: string | undefined },
+    attemptId: string,
+    outcome: AuditOutcomeInput,
+  ): Result<null> {
+    if (attempt.decision !== "require_approval") return ok(null);
+    const decision = approvalDecisionOf(attempt.retryOf ?? attemptId);
+    if (decision === null) return err("audit.write_failed", "the approval record is unreadable");
+    if (SENT_OUTCOMES.has(outcome) && decision !== "approved") {
+      return err(
+        "audit.inconsistent_outcome",
+        "a require_approval attempt can only be sent after it was approved",
+        { decision: attempt.decision, outcome },
+      );
+    }
+    if ((decision === "rejected" || decision === "expired") && outcome !== "not_forwarded") {
+      return err(
+        "audit.inconsistent_outcome",
+        "a rejected or expired approval can only have a not_forwarded outcome",
+        { decision: attempt.decision, outcome },
+      );
+    }
+    return ok(null);
   }
 
   /** T010 checks for an attempt's `retryOf` and for verification records (mirror core `verifyChain`). */
@@ -764,6 +918,8 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     const { body } = req;
     const t010 = checkT010(body);
     if (!t010.ok) return t010;
+    const t011 = checkApprovalRecord(body);
+    if (!t011.ok) return t011;
     if (body.kind === "outcome") {
       const attemptRow: unknown = attemptBodyStmt.get(body.attemptId);
       if (attemptRow === undefined) {
@@ -774,11 +930,10 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
       }
       const rowParsed = bodyJsonRowSchema.safeParse(attemptRow);
       const attempt = rowParsed.success
-        ? parseJsonAs(decisionOnlySchema, rowParsed.data.body_json)
+        ? parseJsonAs(attemptToolSchema, rowParsed.data.body_json)
         : null;
       if (attempt === null) return err("audit.write_failed", "referenced attempt is unreadable");
       // A denied action was never forwarded; any other outcome would be a lie in the log.
-      // `require_approval` executes later (after approval), so all outcomes are allowed.
       if (attempt.decision === "deny" && !DENY_OUTCOMES.has(body.outcome)) {
         return err(
           "audit.inconsistent_outcome",
@@ -786,6 +941,9 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
           { decision: attempt.decision, outcome: body.outcome },
         );
       }
+      // `require_approval` executes only after an `approved` record (T011).
+      const approvalCheck = checkApprovalOutcome(attempt, body.attemptId, body.outcome);
+      if (!approvalCheck.ok) return approvalCheck;
     }
     const head = readHead();
     if (!head.ok) return head;
@@ -851,6 +1009,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     const outcomes = new Map<string, AuditOutcomeRecord>();
     /** Latest (first seen newest-first) verification per attempt. */
     const verifications = new Map<string, AuditVerificationRecord>();
+    const approvals = new Map<string, AuditApprovalRecord>();
     const invalid = (message: string, seq: number): Result<AuditActivity[]> =>
       err("audit.activity_invalid", message, { seq });
     let scanned = 0;
@@ -875,13 +1034,17 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
       } else if (rec.kind === "outcome") {
         if (outcomes.has(rec.attemptId)) return invalid("duplicate outcome in audit log", rec.seq);
         outcomes.set(rec.attemptId, rec);
+      } else if (rec.kind === "approval") {
+        if (approvals.has(rec.attemptId))
+          return invalid("duplicate approval in audit log", rec.seq);
+        approvals.set(rec.attemptId, rec);
       } else if (!verifications.has(rec.attemptId)) {
         verifications.set(rec.attemptId, rec);
       }
     }
     const all = new Map(attempts);
-    // Outcomes / verifications in the window for attempts older than the cutoff: indexed lookups by UNIQUE id.
-    for (const [attemptId, later] of [...outcomes, ...verifications]) {
+    // Outcomes / verifications / approvals in the window for attempts older than the cutoff: indexed lookups.
+    for (const [attemptId, later] of [...outcomes, ...verifications, ...approvals]) {
       let attempt = all.get(attemptId);
       if (attempt === undefined) {
         const rec = lookupRecord(attemptRowStmt, attemptId);
@@ -904,9 +1067,27 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
       if (rec.seq >= v.seq) return invalid("verification precedes its outcome", v.seq);
       outcomes.set(attemptId, rec);
     }
+    // Approvals written before the cutoff of attempts in the window (indexed lookup, one per attempt).
+    for (const attempt of all.values()) {
+      if (attempt.decision !== "require_approval" || approvals.has(attempt.id)) continue;
+      const rec = lookupRecord(approvalRowStmt, attempt.id);
+      if (rec === "missing") continue;
+      if (rec === "unreadable" || rec.kind !== "approval") {
+        return invalid("approval of an attempt is unreadable", attempt.seq);
+      }
+      if (rec.seq <= attempt.seq) return invalid("approval precedes its attempt", rec.seq);
+      approvals.set(attempt.id, rec);
+    }
     const result: AuditActivity[] = [];
     for (const attempt of [...all.values()].sort((a, b) => a.seq - b.seq)) {
-      result.push(joinActivity(attempt, outcomes.get(attempt.id), verifications.get(attempt.id)));
+      result.push(
+        joinActivity(
+          attempt,
+          outcomes.get(attempt.id),
+          verifications.get(attempt.id),
+          approvals.get(attempt.id),
+        ),
+      );
     }
     return ok(result);
   }
@@ -916,6 +1097,7 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     const attempts = new Map<string, AuditAttemptRecord>();
     const outcomes = new Map<string, AuditOutcomeRecord>();
     const verifications = new Map<string, AuditVerificationRecord>();
+    const approvals = new Map<string, AuditApprovalRecord>();
     let scanned = 0;
     for (const raw of ascStmt.iterate() as Iterable<unknown>) {
       scanned++;
@@ -945,13 +1127,18 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
           return err("audit.activity_invalid", "duplicate outcome", { seq: rec.seq });
         }
         outcomes.set(rec.attemptId, rec);
+      } else if (rec.kind === "approval") {
+        if (approvals.has(rec.attemptId)) {
+          return err("audit.activity_invalid", "duplicate approval", { seq: rec.seq });
+        }
+        approvals.set(rec.attemptId, rec);
       } else {
         verifications.set(rec.attemptId, rec); // ascending ⇒ the last one wins (latest)
       }
     }
     return ok(
       [...attempts.values()].map((a) =>
-        joinActivity(a, outcomes.get(a.id), verifications.get(a.id)),
+        joinActivity(a, outcomes.get(a.id), verifications.get(a.id), approvals.get(a.id)),
       ),
     );
   }
@@ -968,6 +1155,34 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   }
 
   const readActivityTx = db.transaction(readActivityInTx);
+
+  /** Runs inside a read transaction. See `AuditStore.readAttempt`. */
+  function readAttemptInTx(attemptId: string): Result<AuditActivity | undefined> {
+    const bad = (message: string): Result<AuditActivity | undefined> =>
+      err("audit.activity_invalid", message);
+    const attempt = lookupRecord(attemptRowStmt, attemptId);
+    if (attempt === "missing") return ok(undefined);
+    if (attempt === "unreadable") return bad("attempt record is unreadable");
+    if (attempt.kind !== "attempt") return ok(undefined);
+    const later = <K extends AuditRecord["kind"]>(
+      stmt: Database.Statement,
+      kind: K,
+    ): Extract<AuditRecord, { kind: K }> | undefined | "bad" => {
+      const rec = lookupRecord(stmt, attemptId);
+      if (rec === "missing") return undefined;
+      if (rec === "unreadable" || rec.kind !== kind || rec.seq <= attempt.seq) return "bad";
+      return rec as Extract<AuditRecord, { kind: K }>;
+    };
+    const outcome = later(outcomeRowStmt, "outcome");
+    const verification = later(latestVerificationRowStmt, "verification");
+    const approval = later(approvalRowStmt, "approval");
+    if (outcome === "bad" || verification === "bad" || approval === "bad") {
+      return bad("a record of the attempt is unreadable or out of order");
+    }
+    return ok(joinActivity(attempt, outcome, verification, approval));
+  }
+
+  const readAttemptTx = db.transaction(readAttemptInTx);
 
   /** Guard + catch-all for write paths: never throws, fails closed. */
   function guardedWrite(fn: () => Result<AuditRecord>): Result<AuditRecord> {
@@ -1143,22 +1358,71 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
       });
     },
 
-    readUnsettled(): Result<{ open: AuditActivity[]; unsettled: AuditActivity[] }> {
+    recordApproval(input: RecordApprovalInput): Result<AuditRecord> {
+      return guardedWrite(() => {
+        const parsed = approvalInputSchema.safeParse(input);
+        if (!parsed.success) {
+          return err("audit.invalid_input", "invalid approval input", {
+            issues: zodIssuePaths(parsed.error),
+          });
+        }
+        const p = parsed.data;
+        const id = resolveId(p.id);
+        if (!id.ok) return id;
+        const ts = resolveTs(p.ts);
+        if (!ts.ok) return ts;
+        const body: AuditApprovalBody = {
+          kind: "approval",
+          id: id.value,
+          attemptId: p.attemptId,
+          ts: ts.value.ts,
+          approvalId: p.approvalId,
+          decision: p.decision,
+        };
+        if (p.approver !== undefined) body.approver = p.approver;
+        return appendTx.immediate({ body, callerTs: ts.value.callerTs });
+      });
+    },
+
+    readAttempt(attemptId: string): Result<AuditActivity | undefined> {
+      if (!recordIdSchema.safeParse(attemptId).success) {
+        return err("audit.invalid_input", "invalid attempt id");
+      }
+      if (!db.open) return err("audit.read_failed", "audit store is closed");
+      try {
+        return readAttemptTx(attemptId);
+      } catch (e: unknown) {
+        return err("audit.read_failed", "could not read the attempt", describeError(e));
+      }
+    },
+
+    readUnsettled(): Result<{
+      open: AuditActivity[];
+      unsettled: AuditActivity[];
+      staleApprovals: AuditActivity[];
+    }> {
       const all = scanAll();
       if (!all.ok) return all;
       const open: AuditActivity[] = [];
       const unsettled: AuditActivity[] = [];
+      const staleApprovals: AuditActivity[] = [];
       for (const a of all.value) {
         const d = a.attempt.decision;
         if (a.outcome === undefined) {
           if (d === "allow" || d === "transform") open.push(a);
+          else if (d === "require_approval") {
+            // An approved action (or its retry) may have been sent before a crash; anything else never was.
+            if (a.attempt.retryOf !== undefined || a.approval?.decision === "approved")
+              open.push(a);
+            else staleApprovals.push(a);
+          }
           continue;
         }
         if (d === "deny") continue;
         if (a.outcome.outcome !== "timeout" && a.outcome.outcome !== "upstream_error") continue;
         if (a.verification === undefined || a.verification.result === "unknown") unsettled.push(a);
       }
-      return ok({ open, unsettled });
+      return ok({ open, unsettled, staleApprovals });
     },
 
     listNeedsHuman(): Result<AuditActivity[]> {

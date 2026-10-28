@@ -115,6 +115,14 @@ describe("readActivitySince", () => {
     unwrap(s.recordAttempt(attempt("old", { decision: "require_approval" })));
     unwrap(s.recordAttempt(attempt("old-pending", { decision: "require_approval" })));
     nowMs = T0 + 40 * MIN;
+    unwrap(
+      s.recordApproval({
+        attemptId: "old",
+        approvalId: "apr_1",
+        decision: "approved",
+        approver: "telegram:1",
+      }),
+    );
     unwrap(s.recordOutcome({ attemptId: "old", outcome: "success", latencyMs: 1 }));
     const rows = unwrap(s.readActivitySince(T0 + 30 * MIN));
     expect(rows.map((r) => [r.attempt.id, r.outcome?.outcome])).toEqual([["old", "success"]]);

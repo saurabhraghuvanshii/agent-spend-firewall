@@ -28,7 +28,7 @@ export const ERROR_CODE_RE: RegExp = /^[a-z0-9_.:-]{1,64}$/;
 /** Opaque approver / resolver id: `telegram:<1-20 digits>` or `dashboard:<[a-z0-9_-]{1,32}>`. Never PII. */
 export const APPROVER_RE: RegExp = /^(?:telegram:[0-9]{1,20}|dashboard:[a-z0-9_-]{1,32})$/;
 
-export type AuditKind = "attempt" | "outcome" | "verification";
+export type AuditKind = "attempt" | "outcome" | "verification" | "approval";
 
 export type AuditDecision = "allow" | "deny" | "require_approval" | "transform";
 
@@ -132,7 +132,40 @@ export interface AuditVerificationBody {
   resolver?: string;
 }
 
-export type AuditBody = AuditAttemptBody | AuditOutcomeBody | AuditVerificationBody;
+/** A human's (or the clock's) decision on a `require_approval` attempt (T011). */
+export type AuditApprovalDecision = "approved" | "rejected" | "expired";
+export const AUDIT_APPROVAL_DECISIONS: readonly AuditApprovalDecision[] = [
+  "approved",
+  "rejected",
+  "expired",
+];
+
+/** Approval id shape (`apr_<uuid>` from the proxy; any `RECORD_ID_RE` token is accepted by the chain). */
+export const APPROVAL_ID_RE: RegExp = RECORD_ID_RE;
+
+/**
+ * Chained record (T011) of the decision on a `require_approval` attempt, written BEFORE anything is executed (approved)
+ * or before the terminal `not_forwarded` outcome (rejected / expired). At most one per attempt, never after the
+ * attempt's outcome, only for a `require_approval` attempt that is not a retry. Validated strictly in `computeHash`:
+ * no extra keys; `decision` exact; `approvalId` ⇒ `APPROVAL_ID_RE`; `approver` ⇒ `APPROVER_RE`, required for
+ * `approved` / `rejected` and forbidden for `expired`.
+ *
+ * `verifyChain` then requires: a forwarded outcome (`success` / `upstream_error` / `timeout`) of a `require_approval`
+ * attempt (or of a retry of one) has an earlier `approved` record; a `rejected` / `expired` attempt's outcome is
+ * `not_forwarded`.
+ */
+export interface AuditApprovalBody {
+  kind: "approval";
+  id: string;
+  attemptId: string;
+  ts: string;
+  approvalId: string;
+  decision: AuditApprovalDecision;
+  approver?: string;
+}
+
+export type AuditBody =
+  AuditAttemptBody | AuditOutcomeBody | AuditVerificationBody | AuditApprovalBody;
 
 export type AuditRecord = AuditBody & { seq: number; prevHash: string; hash: string };
 
@@ -155,7 +188,13 @@ export type VerifyBreakReason =
   | "orphan_verification"
   | "verification_before_outcome"
   | "verification_after_settled"
-  | "bad_retry_of";
+  | "bad_retry_of"
+  | "orphan_approval"
+  | "approval_not_required"
+  | "approval_after_outcome"
+  | "duplicate_approval"
+  | "approval_missing"
+  | "approval_outcome_mismatch";
 
 export type VerifyResult =
   | { ok: true; count: number; headHash: string; danglingAttempts: string[] }

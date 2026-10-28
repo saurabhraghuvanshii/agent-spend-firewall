@@ -379,13 +379,21 @@ describe("outcome constraints", () => {
     verifyOk(s);
   });
 
-  it("require_approval attempts accept any outcome", () => {
+  it("approved require_approval attempts accept any outcome", () => {
     const s = open();
     for (const [i, outcome] of (
       ["success", "upstream_error", "timeout", "denied", "not_forwarded"] as const
     ).entries()) {
       const a = unwrap(
         s.recordAttempt(attempt({ id: `ra-${String(i)}`, decision: "require_approval" })),
+      );
+      unwrap(
+        s.recordApproval({
+          attemptId: a.id,
+          approvalId: `apr_${String(i)}`,
+          decision: "approved",
+          approver: "telegram:42",
+        }),
       );
       unwrap(s.recordOutcome({ attemptId: a.id, outcome, latencyMs: 1 }));
     }

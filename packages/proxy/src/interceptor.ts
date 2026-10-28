@@ -44,6 +44,9 @@
  *  6. require_approval ⇒ `ApprovalPort.create` bound to `sha256(canonicalJson({tool, args: finalArgs}))`; the
  *     attempt stays OPEN (counts toward limits) ⇒ `{ decision: "pending_approval", approvalId, message }`
  *     (`isError: false`). Create failure ⇒ outcome `not_forwarded` + deny `firewall.approval_unavailable`.
+ *     T011: approved ⇒ `executeApproved` (chained `approval` record, same locks, re-evaluation, forward, T010
+ *     verification, outcome on THIS attempt); rejected / expired ⇒ `resolveApproval` (`approval` record + outcome
+ *     `not_forwarded` `approval.rejected|approval.expired`, so it stops counting). See `MoneyPipeline`.
  *  7. allow / transform ⇒ forward exactly `finalArgs` and map the server's `ForwardReport` to an outcome (see
  *     `outcomeFor`). An outcome write failure latches the pipeline DEGRADED: every later money call is denied
  *     `audit_unavailable` until restart (the audit trail can no longer be trusted to be complete).
@@ -75,9 +78,11 @@ import {
   canonicalJson,
   err,
   evaluate,
+  ok,
   type Clock,
   type CompiledPolicy,
   type Decision,
+  type Args,
   type AuditRecord,
   type EvalResult,
   type Result,
@@ -162,7 +167,9 @@ import {
   retryForwardOf,
   type CallContext,
   type CallInterceptor,
+  type DirectCall,
   type ForwardReport,
+  type OpenDirectCall,
   type RetryForward,
 } from "./server.js";
 import { classifyTool } from "./tool-classes.js";
@@ -187,10 +194,20 @@ export const FIREWALL_RULES = {
   invalidAmount: "firewall.invalid_amount",
   forwardThrew: "firewall.forward_threw",
   approvalUnavailable: "firewall.approval_unavailable",
-  notImplemented: "firewall.not_implemented",
   duplicate: "firewall.duplicate",
   duplicateCheckFailed: "firewall.duplicate_check_failed",
   reconciling: "firewall.reconciling",
+} as const;
+
+/** T011 codes for approved actions that were not executed / approvals that were closed (audit `errorCode`). */
+export const APPROVAL_RULES = {
+  rejected: "approval.rejected",
+  expired: "approval.expired",
+  argsMismatch: "approval.args_mismatch",
+  policyDenied: "approval.policy_denied",
+  policyChanged: "approval.policy_changed",
+  reevaluationFailed: "approval.reevaluation_failed",
+  attemptClosed: "approval.attempt_closed",
 } as const;
 
 export const RECONCILING_MESSAGE =
@@ -203,7 +220,13 @@ export const NOT_RETRIED_MESSAGE =
 /** Store surface the pipeline needs. */
 export type PipelineStore = Pick<
   AuditStore,
-  "recordAttempt" | "recordOutcome" | "readActivitySince" | "recordVerification" | "readUnsettled"
+  | "recordAttempt"
+  | "recordOutcome"
+  | "readActivitySince"
+  | "recordVerification"
+  | "readUnsettled"
+  | "recordApproval"
+  | "readAttempt"
 >;
 
 export interface PreCheckDeny {
@@ -261,12 +284,53 @@ export interface MoneyPipelineOptions {
   readonly verifier?: ActionVerifier;
   /** T010: deny money calls `firewall.reconciling` until `reconcile()` has finished. */
   readonly startReconciling?: boolean;
+  /** T011: approval id of an attempt (approval store), for the `expired` records startup reconciliation writes. */
+  readonly approvalIdOf?: (attemptId: string) => string | undefined;
 }
 
+/** T011: an approved action to execute (from the approval store + the pending request the pipeline created). */
 export interface ExecuteApprovedRequest {
   readonly approvalId: string;
+  /** The OPEN `require_approval` attempt the approval belongs to. */
   readonly attemptId: string;
+  /** `approvalArgsHash(tool, finalArgs)` the approval was bound to when it was created. */
   readonly argsHash: string;
+  readonly tool: string;
+  /** The approval's post-transform args, UNSTAMPED (no `notes.asf_attempt`). */
+  readonly finalArgs: Args;
+  readonly untrustedReason: string;
+  readonly sessionId: string;
+  /** Rule that required the approval. */
+  readonly ruleId: string;
+  /** Opaque approver id (`telegram:<id>`), recorded in the chained `approval` record. */
+  readonly approver: string;
+}
+
+/**
+ * What happened to an approved action: `executed` (Razorpay applied it, possibly verified after a timeout);
+ * `failed` (Razorpay answered with an error); `unknown` (may have executed, flagged for a human); `not_executed`
+ * (nothing was sent, or it was verified not executed — e.g. the policy now denies, args changed, duplicate, busy).
+ */
+export type ApprovedExecutionStatus = "executed" | "failed" | "unknown" | "not_executed";
+
+export interface ExecuteApprovedResult {
+  readonly status: ApprovedExecutionStatus;
+  readonly attemptId: string;
+  /** Razorpay id of the executed resource, when known and redaction-safe. */
+  readonly upstreamRef?: string;
+  /** Machine code (deny rule / audit error code) for `not_executed` / `failed`. */
+  readonly code?: string;
+  /** Result a live call would have returned (UNFILTERED: never hand it to an agent without the result filter). */
+  readonly result: CallToolResult;
+}
+
+/** T011: a rejected / expired approval, closed as `not_forwarded` + `approval.rejected|approval.expired`. */
+export interface ResolveApprovalRequest {
+  readonly approvalId: string;
+  readonly attemptId: string;
+  readonly decision: "rejected" | "expired";
+  /** Required for `rejected`, forbidden for `expired`. */
+  readonly approver?: string;
 }
 
 export interface MoneyPipeline {
@@ -274,19 +338,30 @@ export interface MoneyPipeline {
   /** Wrap the composed chain: binds the server's exact tool name and audits denies the stage didn't produce. */
   envelope(inner: CallInterceptor): CallInterceptor;
   /**
-   * T011 seam — NOT IMPLEMENTED: always denies `firewall.not_implemented`.
-   *
-   * T009 duplicate check (must be kept when implementing): run `findDuplicate` inside the global lock with
-   * `excludeAttemptIds: new Set([attemptId])` (the approved attempt is open and would otherwise match itself), using
-   * the attempt's STORED `idempotencyKey` (recompute from its `argsRedacted` for legacy rows) as the key; a hit ⇒
-   * deny `firewall.duplicate`.
-   *
-   * Intended behaviour: take the same locks as a live call (sorted resource keys (`order:` / `payment:`) → global),
-   * re-evaluate the approved attempt's `finalArgs` with `excludeAttemptIds: {attemptId}` (so the pending attempt
-   * doesn't count against itself), require the re-evaluated args to hash to `argsHash` (else deny), require a non-deny decision, then forward and record the
-   * outcome on the ORIGINAL attempt id (D-023).
+   * T011: execute an APPROVED action through the normal money path. Order:
+   *  1. chain the `approval` record (approver, time) — before anything is sent; a write failure ⇒ nothing executes;
+   *  2. degraded / reconciling ⇒ not executed; the attempt must be the open, unretried `require_approval` attempt of
+   *     the same tool and session, and `approvalArgsHash(tool, finalArgs)`, the recorded (stamped, redacted) args and
+   *     the recorded idempotency key must all still match ⇒ else `approval.args_mismatch`;
+   *  3. the same locks as a live call (sorted resource locks → global), the INR invariant, the duplicate check
+   *     excluding this attempt, and a policy RE-EVALUATION with `excludeAttemptIds: {attemptId}`: deny (incl. engine
+   *     error / timeout) ⇒ not executed; `require_approval` by another rule ⇒ `approval.policy_changed`; the
+   *     re-evaluated args must pass `checkFinalArgs` and hash to `argsHash`;
+   *  4. stamp `notes.asf_attempt = attemptId` (after the `asf_*` check, so the firewall's own marker never trips it),
+   *     forward via `openCall`, record the outcome on the ORIGINAL attempt and run T010 verify-before-retry (a retry
+   *     records decision `require_approval` + `approver`, `retryOf` the original).
+   * Every "not executed" exit records outcome `not_forwarded` (errorCode = the reason) so the attempt stops counting.
+   * Never throws.
    */
-  executeApproved(req: ExecuteApprovedRequest): Promise<CallToolResult>;
+  executeApproved(
+    req: ExecuteApprovedRequest,
+    openCall: OpenDirectCall,
+  ): Promise<ExecuteApprovedResult>;
+  /**
+   * T011: close a rejected / expired approval: chained `approval` record, then outcome `not_forwarded` +
+   * `approval.rejected` / `approval.expired` (D-023: it stops counting). Write failures latch the pipeline degraded.
+   */
+  resolveApproval(req: ResolveApprovalRequest): Result<null>;
   /** True once an outcome write failed; all later money calls are denied. */
   isDegraded(): boolean;
   /**
@@ -362,7 +437,9 @@ interface SentAttempt {
 
 /** What a retry of the original attempt re-uses. */
 interface RetryContext {
-  readonly decision: "allow" | "transform";
+  /** `require_approval` only for an approved action (T011); the retry then carries `approver`. */
+  readonly decision: "allow" | "transform" | "require_approval";
+  readonly approver?: string;
   readonly matchedRules: string[];
   readonly recordedKey: string;
   /** Policy `finalArgs` (unstamped). */
@@ -370,6 +447,14 @@ interface RetryContext {
   readonly transformed: boolean;
   readonly reason: string;
 }
+
+/** T011: what a settled send amounted to, reported by `settleForward` (the last report wins: a retry's). */
+interface SettleStatus {
+  readonly status: ApprovedExecutionStatus;
+  readonly upstreamRef?: string;
+  readonly code?: string;
+}
+type SettleSink = (s: SettleStatus) => void;
 
 /** A flagged (unknown) action waiting for its late answer. */
 interface FlaggedLate {
@@ -979,6 +1064,41 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
           "another money action is in progress; try again shortly. The call was not sent",
         );
 
+  /** INR invariant (D-017) for the payment / order a call acts on; `undefined` = OK. */
+  const inrProblem = async (targets: ResourceTargets): Promise<FinalArgsProblem | undefined> => {
+    if (targets.payment !== undefined) {
+      const payment = await createRazorpayLookup(adapterBase).payment(targets.payment);
+      if (!payment.ok) {
+        return {
+          ruleId: FIREWALL_RULES.paymentLookupFailed,
+          message: "the payment could not be looked up to verify it; the call was not sent",
+        };
+      }
+      if (payment.value.currency !== "INR") {
+        return {
+          ruleId: FIREWALL_RULES.currencyNotInr,
+          message: "only INR payments are supported through the firewall; the call was not sent",
+        };
+      }
+    }
+    if (targets.order !== undefined) {
+      const order = await createOrderLookup(adapterBase).order(targets.order);
+      if (!order.ok) {
+        return {
+          ruleId: FIREWALL_RULES.orderLookupFailed,
+          message: "the order could not be looked up to verify it; the call was not sent",
+        };
+      }
+      if (order.value.currency !== "INR") {
+        return {
+          ruleId: FIREWALL_RULES.currencyNotInr,
+          message: "only INR orders are supported through the firewall; the call was not sent",
+        };
+      }
+    }
+    return undefined;
+  };
+
   const underResourceLocks = async (
     ctx: CallContext,
     next: Next,
@@ -989,44 +1109,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     const reason = base.reason;
 
     // 2. INR invariant for calls acting on an existing payment and/or order.
-    if (targets.payment !== undefined) {
-      const payment = await createRazorpayLookup(adapterBase).payment(targets.payment);
-      if (!payment.ok) {
-        return auditedDeny(
-          info,
-          base,
-          FIREWALL_RULES.paymentLookupFailed,
-          "the payment could not be looked up to verify it; the call was not sent",
-        );
-      }
-      if (payment.value.currency !== "INR") {
-        return auditedDeny(
-          info,
-          base,
-          FIREWALL_RULES.currencyNotInr,
-          "only INR payments are supported through the firewall; the call was not sent",
-        );
-      }
-    }
-    if (targets.order !== undefined) {
-      const order = await createOrderLookup(adapterBase).order(targets.order);
-      if (!order.ok) {
-        return auditedDeny(
-          info,
-          base,
-          FIREWALL_RULES.orderLookupFailed,
-          "the order could not be looked up to verify it; the call was not sent",
-        );
-      }
-      if (order.value.currency !== "INR") {
-        return auditedDeny(
-          info,
-          base,
-          FIREWALL_RULES.currencyNotInr,
-          "only INR orders are supported through the firewall; the call was not sent",
-        );
-      }
-    }
+    const inr = await inrProblem(targets);
+    if (inr !== undefined) return auditedDeny(info, base, inr.ruleId, inr.message);
     if (ctx.signal.aborted) {
       return auditedDeny(
         info,
@@ -1315,6 +1399,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     sent: SentAttempt,
     r: CallToolResult | undefined,
     retryCtx: RetryContext | undefined,
+    sink: SettleSink = () => undefined,
   ): Promise<CallToolResult> => {
     const report = r === undefined ? undefined : forwardReportOf(r);
     const spec: OutcomeSpec =
@@ -1325,6 +1410,11 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     const outcomeRec = writeOutcome(sent.id, spec);
     if (outcomeRec === undefined) {
       latch(`the outcome of attempt ${sent.id} (${spec.outcome}) could not be recorded`);
+      sink(
+        spec.outcome === "not_forwarded"
+          ? { status: "not_executed", code: spec.errorCode ?? "upstream.not_sent" }
+          : { status: "unknown", code: FIREWALL_RULES.auditUnavailable },
+      );
       return mark(info, fallback);
     }
     const trig =
@@ -1332,7 +1422,19 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         ? { trigger: "upstream_error" as const, toolError: false, failure: "none" as const }
         : unsettledTriggerOf(r, report);
     // Settled, or the audit log is degraded (verification records can't be trusted to land): result as is.
-    if (trig === undefined || degraded) return mark(info, fallback);
+    if (trig === undefined || degraded) {
+      if (spec.outcome === "success") {
+        sink({
+          status: "executed",
+          ...(spec.upstreamRef === undefined ? {} : { upstreamRef: spec.upstreamRef }),
+        });
+      } else if (spec.outcome === "not_forwarded") {
+        sink({ status: "not_executed", code: spec.errorCode ?? "upstream.not_sent" });
+      } else {
+        sink({ status: "unknown", code: FIREWALL_RULES.auditUnavailable });
+      }
+      return mark(info, fallback);
+    }
 
     const token: RetryForward | undefined =
       r !== undefined && retryCtx !== undefined && RETRYABLE_TOOLS.has(info.tool)
@@ -1356,14 +1458,22 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     });
     if (res.auditFailed) {
       latch(`the verification of attempt ${sent.id} could not be recorded`);
+      sink({ status: "unknown", code: FIREWALL_RULES.auditUnavailable });
       return mark(info, unknownOutcomeResult(sent.id));
     }
     const f = res.finding;
     if (f.result === "happened") {
+      sink({
+        status: "executed",
+        ...(f.upstreamRef === undefined ? {} : { upstreamRef: f.upstreamRef }),
+      });
       return mark(info, verifiedSuccessResult(sent.id, f.upstreamRef, f.refundStatus));
     }
     if (f.result === "not_happened") {
-      if (trig.toolError) return mark(info, fallback);
+      if (trig.toolError) {
+        sink({ status: "failed", code: spec.errorCode ?? "upstream.tool_error" });
+        return mark(info, fallback);
+      }
       // Retry preconditions: a timed-out refund (token + waitLate) whose LATE answer was a failure. `retryOnce`
       // re-checks cancellation and the degraded latch.
       if (
@@ -1372,14 +1482,16 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         waitLate !== undefined &&
         res.lateRejection
       ) {
-        return retryOnce(ctx, info, sent.id, retryCtx, token);
+        return retryOnce(ctx, info, sent.id, retryCtx, token, sink);
       }
       log(
         `attempt ${sent.id} was verified not executed; not retried (no late definite-rejection answer)`,
       );
+      sink({ status: "not_executed", code: "upstream.not_executed" });
       return mark(info, notRetriedResult());
     }
     flagUnresolved(info.tool, sent, outcomeRec, res.record, report, trig);
+    sink({ status: "unknown", code: "verify.unknown" });
     return mark(info, unknownOutcomeResult(sent.id));
   };
 
@@ -1482,9 +1594,11 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
     originalId: string,
     rc: RetryContext,
     token: RetryForward,
+    sink: SettleSink,
   ): Promise<CallToolResult> => {
     const notRetried = (why: string): CallToolResult => {
       log(`attempt ${originalId} was verified not executed but not retried: ${why}`);
+      sink({ status: "not_executed", code: "upstream.not_executed" });
       return mark(info, notRetriedResult());
     };
     if (ctx.signal.aborted) return notRetried("the request was cancelled");
@@ -1508,6 +1622,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       if (!dup.ok) return notRetried(dup.error.code);
       if (dup.value !== undefined) {
         log(`retry of attempt ${originalId} skipped: duplicate of ${dup.value.attemptId}`);
+        sink({ status: "not_executed", code: FIREWALL_RULES.duplicate });
         return mark(info, duplicateDenyResult(dup.value));
       }
       const retryId = redactionSafeUuid();
@@ -1525,6 +1640,7 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         decision: rc.decision,
         matchedRules: rc.matchedRules,
         idempotencyKey: rc.recordedKey,
+        ...(rc.approver === undefined ? {} : { approver: rc.approver }),
       });
     } finally {
       got.value();
@@ -1564,7 +1680,352 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
       },
       r2,
       undefined,
+      sink,
     );
+  };
+
+  // ---- T011: approved actions ----
+
+  /** Close an approved action without sending it: outcome `not_forwarded` + `code` (latch on write failure). */
+  const approvedNotExecuted = (
+    attemptId: string,
+    code: string,
+    message: string,
+    writeOutcome = true,
+  ): ExecuteApprovedResult => {
+    log(`approved attempt ${attemptId} not executed: ${code}`);
+    if (
+      writeOutcome &&
+      !recordOutcome(attemptId, { outcome: "not_forwarded", errorCode: code, latencyMs: 0 })
+    ) {
+      latch(`the not_forwarded outcome of approved attempt ${attemptId} could not be recorded`);
+    }
+    return { status: "not_executed", attemptId, code, result: denyResult(code, message) };
+  };
+
+  const executeApproved = async (
+    req: ExecuteApprovedRequest,
+    openCall: OpenDirectCall,
+  ): Promise<ExecuteApprovedResult> => {
+    const attemptId = req.attemptId;
+    // 1. The decision is chained BEFORE anything else (and before any outcome).
+    const appr = o.store.recordApproval({
+      attemptId,
+      approvalId: req.approvalId,
+      decision: "approved",
+      approver: req.approver,
+    });
+    if (!appr.ok) {
+      if (appr.error.code === "audit.write_failed") {
+        latch(`the approval of attempt ${attemptId} could not be recorded`);
+      }
+      // Not chained ⇒ never executed. The attempt may already be closed, so no outcome is forced on it.
+      return approvedNotExecuted(
+        attemptId,
+        appr.error.code === "audit.write_failed"
+          ? FIREWALL_RULES.auditUnavailable
+          : appr.error.code,
+        "the approval could not be recorded in the audit log; the action was not executed",
+        false,
+      );
+    }
+    if (degraded) {
+      return approvedNotExecuted(attemptId, FIREWALL_RULES.auditUnavailable, degradedMessage);
+    }
+    if (reconciling) {
+      return approvedNotExecuted(attemptId, FIREWALL_RULES.reconciling, RECONCILING_MESSAGE);
+    }
+    const mismatch = (): ExecuteApprovedResult =>
+      approvedNotExecuted(
+        attemptId,
+        APPROVAL_RULES.argsMismatch,
+        "the approved action no longer matches what was recorded; it was not executed",
+      );
+
+    // 2. Binding checks against the audit log.
+    const act = o.store.readAttempt(attemptId);
+    if (!act.ok) {
+      return approvedNotExecuted(
+        attemptId,
+        FIREWALL_RULES.auditUnavailable,
+        "the audit log could not be read; the action was not executed",
+      );
+    }
+    const a = act.value;
+    if (
+      a === undefined ||
+      a.attempt.tool !== req.tool ||
+      a.attempt.decision !== "require_approval" ||
+      a.attempt.retryOf !== undefined ||
+      a.attempt.sessionId !== req.sessionId ||
+      a.outcome !== undefined ||
+      a.approval?.decision !== "approved"
+    ) {
+      return mismatch();
+    }
+    if (classifyTool(req.tool) !== "money") return mismatch();
+    const hash = approvalArgsHash(req.tool, req.finalArgs);
+    if (!hash.ok || hash.value !== req.argsHash) return mismatch();
+    const stamped = stampAttemptMarker(req.tool, req.finalArgs, attemptId);
+    if (!stamped.ok || !sameJson(argsForDisplay(stamped.value as Args), a.attempt.argsRedacted))
+      return mismatch();
+    const key = idempotencyKey(req.tool, req.finalArgs);
+    if (!key.ok) return mismatch();
+    if (a.attempt.idempotencyKey !== undefined && a.attempt.idempotencyKey !== key.value) {
+      return mismatch();
+    }
+    const recordedKey = a.attempt.idempotencyKey ?? key.value;
+    /** `undefined` iff the attempt still has no outcome; else the not-executed result (nothing more written). */
+    const stillOpen = (): ExecuteApprovedResult | undefined => {
+      const now = o.store.readAttempt(attemptId);
+      if (now.ok && now.value !== undefined && now.value.outcome === undefined) return undefined;
+      return approvedNotExecuted(
+        attemptId,
+        now.ok ? APPROVAL_RULES.attemptClosed : FIREWALL_RULES.auditUnavailable,
+        "the approved action's audit attempt was closed meanwhile; it was not executed",
+        false,
+      );
+    };
+
+    // 3. Same locks as a live call: sorted resource locks, then the global lock.
+    const signal = new AbortController().signal;
+    const releases: Release[] = [];
+    let call: DirectCall | undefined;
+    try {
+      for (const k of resourceLockKeys(targetsOf(req.finalArgs))) {
+        const got = await resourceLocks.acquire(k, { timeoutMs: lockWaitMs });
+        if (!got.ok) {
+          return approvedNotExecuted(
+            attemptId,
+            FIREWALL_RULES.busy,
+            "another money action is in progress; the approved action was not executed",
+          );
+        }
+        releases.push(got.value);
+      }
+      const inr = await inrProblem(targetsOf(req.finalArgs));
+      if (inr !== undefined) return approvedNotExecuted(attemptId, inr.ruleId, inr.message);
+      const opened = await openCall(req.tool, signal);
+      if (!opened.ok) {
+        return approvedNotExecuted(
+          attemptId,
+          "upstream.unavailable",
+          "the upstream Razorpay MCP server is unavailable; the approved action was not executed",
+        );
+      }
+      call = opened.value;
+      const ctx: CallContext = {
+        tool: req.tool,
+        toolClass: "money",
+        args: req.finalArgs,
+        inputSchema: call.inputSchema,
+        untrustedReason: req.untrustedReason,
+        sessionId: req.sessionId,
+        signal,
+      };
+      const info: CallInfo = { tool: req.tool, audited: new WeakSet<CallToolResult>() };
+      // Same T012 pre-check (kill switch / shadow mode) as a live call; a deny or a throw ⇒ not executed.
+      if (o.preCheck !== undefined) {
+        let pre: PreCheckDeny | undefined;
+        try {
+          pre = await o.preCheck(ctx);
+        } catch (e: unknown) {
+          log(`preCheck threw ${e instanceof Error ? e.name : typeof e} for an approved action`);
+          return approvedNotExecuted(
+            attemptId,
+            FIREWALL_RULES.internalError,
+            "the firewall pre-check failed; the approved action was not executed",
+          );
+        }
+        if (pre !== undefined) return approvedNotExecuted(attemptId, pre.ruleId, pre.message);
+      }
+
+      const got = await globalLock.acquire({ timeoutMs: lockWaitMs });
+      if (!got.ok) {
+        return approvedNotExecuted(
+          attemptId,
+          FIREWALL_RULES.busy,
+          "another money action is in progress; the approved action was not executed",
+        );
+      }
+      let res: EvalResult;
+      try {
+        if (degraded) {
+          return approvedNotExecuted(attemptId, FIREWALL_RULES.auditUnavailable, degradedMessage);
+        }
+        const read = memoisedReader(o.store);
+        const scope = duplicateScope(read);
+        if ("failed" in scope) {
+          return approvedNotExecuted(
+            attemptId,
+            FIREWALL_RULES.duplicateCheckFailed,
+            "the firewall could not check for a duplicate of this action; it was not executed",
+          );
+        }
+        const dup = findDuplicate(scope.rows, req.tool, new Set([recordedKey]), {
+          nowMs: scope.nowMs,
+          windowMs: duplicateWindowMs,
+          openLookbackMs: DEFAULT_OPEN_LOOKBACK_MS,
+          excludeAttemptIds: new Set([attemptId]),
+        });
+        if (!dup.ok) {
+          return approvedNotExecuted(
+            attemptId,
+            FIREWALL_RULES.duplicateCheckFailed,
+            "the firewall could not check for a duplicate of this action; it was not executed",
+          );
+        }
+        if (dup.value !== undefined) {
+          return approvedNotExecuted(
+            attemptId,
+            FIREWALL_RULES.duplicate,
+            DUPLICATE_MESSAGES[dup.value.status],
+          );
+        }
+        const deps = createPolicyDeps({
+          ...adapterBase,
+          timer: o.timer,
+          read,
+          excludeAttemptIds: new Set([attemptId]),
+        });
+        try {
+          res = await evaluate(
+            o.policy,
+            {
+              tool: req.tool,
+              args: req.finalArgs,
+              reason: req.untrustedReason,
+              sessionId: req.sessionId,
+            },
+            deps,
+          );
+        } catch (e: unknown) {
+          log(`re-evaluation threw ${e instanceof Error ? e.name : typeof e}`);
+          return approvedNotExecuted(
+            attemptId,
+            APPROVAL_RULES.reevaluationFailed,
+            "the policy could not re-check the approved action; it was not executed",
+          );
+        }
+        const d = res.decision;
+        if (d.type === "deny") {
+          return approvedNotExecuted(
+            attemptId,
+            APPROVAL_RULES.policyDenied,
+            `the policy now denies this action (${d.ruleId}); it was not executed`,
+          );
+        }
+        if (d.type === "require_approval" && d.ruleId !== req.ruleId) {
+          return approvedNotExecuted(
+            attemptId,
+            APPROVAL_RULES.policyChanged,
+            "the policy now requires a different approval for this action; it was not executed",
+          );
+        }
+        const bad = checkFinalArgs({ ...ctx, tool: req.tool }, res.finalArgs);
+        if (bad !== undefined) return approvedNotExecuted(attemptId, bad.ruleId, bad.message);
+        const reHash = approvalArgsHash(req.tool, res.finalArgs);
+        if (!reHash.ok || reHash.value !== req.argsHash) return mismatch();
+        const closed = stillOpen();
+        if (closed !== undefined) return closed;
+      } finally {
+        got.value();
+      }
+
+      // 4. Forward the stamped args; the outcome goes on the ORIGINAL attempt; T010 handles unclear outcomes.
+      if (degraded) {
+        return approvedNotExecuted(attemptId, FIREWALL_RULES.auditUnavailable, degradedMessage);
+      }
+      // Re-read synchronously right before the send: if anything closed the attempt meanwhile (e.g. the approval
+      // request was reported failed), it must not be sent.
+      const closedNow = stillOpen();
+      if (closedNow !== undefined) return closedNow;
+      let r: CallToolResult | undefined;
+      try {
+        r = await call.forward(stamped.value);
+      } catch (e: unknown) {
+        log(
+          `forwarding approved ${escapeForTerminal(req.tool)} threw ${e instanceof Error ? e.name : typeof e}`,
+        );
+        r = undefined;
+      }
+      let settledStatus: SettleStatus | undefined;
+      const settled = await settleForward(
+        ctx,
+        info,
+        {
+          id: attemptId,
+          record: a.attempt,
+          args: stamped.value,
+        },
+        r,
+        {
+          decision: "require_approval",
+          approver: req.approver,
+          matchedRules: [...a.attempt.matchedRules],
+          recordedKey,
+          finalArgs: req.finalArgs,
+          transformed: false,
+          reason: req.untrustedReason,
+        },
+        (st) => {
+          settledStatus = st;
+        },
+      );
+      // The firewall's own settle result decides the status, never parsed upstream text.
+      const st: SettleStatus = settledStatus ?? {
+        status: "unknown",
+        code: "firewall.internal_error",
+      };
+      return {
+        status: st.status,
+        attemptId,
+        ...(isSafeUpstreamRef(st.upstreamRef) ? { upstreamRef: st.upstreamRef } : {}),
+        ...(st.code === undefined ? {} : { code: st.code }),
+        result: settled,
+      };
+    } catch (e: unknown) {
+      // Defensive: every step above returns typed results. Unknown (the attempt stays open and keeps counting).
+      log(
+        `executing approved attempt ${attemptId} failed: ${e instanceof Error ? e.name : typeof e}`,
+      );
+      return {
+        status: "unknown",
+        attemptId,
+        code: FIREWALL_RULES.internalError,
+        result: unknownOutcomeResult(attemptId),
+      };
+    } finally {
+      call?.settle();
+      for (const release of releases.reverse()) release();
+    }
+  };
+
+  const resolveApproval = (req: ResolveApprovalRequest): Result<null> => {
+    const appr = o.store.recordApproval({
+      attemptId: req.attemptId,
+      approvalId: req.approvalId,
+      decision: req.decision,
+      ...(req.approver === undefined ? {} : { approver: req.approver }),
+    });
+    if (!appr.ok) {
+      log(`approval ${req.decision} of attempt ${req.attemptId} not recorded: ${appr.error.code}`);
+      if (appr.error.code === "audit.write_failed") {
+        latch(`the ${req.decision} approval of attempt ${req.attemptId} could not be recorded`);
+      }
+      return err(appr.error.code, appr.error.message);
+    }
+    if (
+      !recordOutcome(req.attemptId, {
+        outcome: "not_forwarded",
+        errorCode: req.decision === "rejected" ? APPROVAL_RULES.rejected : APPROVAL_RULES.expired,
+        latencyMs: 0,
+      })
+    ) {
+      latch(`the ${req.decision} outcome of attempt ${req.attemptId} could not be recorded`);
+      return err("audit.write_failed", "the approval outcome could not be recorded");
+    }
+    return ok(null);
   };
 
   const reconcile = async (): Promise<Result<ReconcileSummary>> => {
@@ -1575,7 +2036,12 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
         log("startup reconciliation skipped: the audit log is degraded");
         return err("audit_unavailable", "the audit log is degraded");
       }
-      const r = await reconcileAtStartup({ store: o.store, verifier, logger: log });
+      const r = await reconcileAtStartup({
+        store: o.store,
+        verifier,
+        logger: log,
+        ...(o.approvalIdOf === undefined ? {} : { approvalIdOf: o.approvalIdOf }),
+      });
       if (!r.ok) {
         latch(`startup reconciliation failed (${r.error.code})`);
         return r;
@@ -1625,13 +2091,8 @@ export function createMoneyPipeline(o: MoneyPipelineOptions): MoneyPipeline {
   return {
     stage,
     envelope,
-    executeApproved: () =>
-      Promise.resolve(
-        denyResult(
-          FIREWALL_RULES.notImplemented,
-          "executing approved actions is not implemented yet (T011)",
-        ),
-      ),
+    executeApproved,
+    resolveApproval,
     isDegraded: () => degraded,
     reconcile,
     isReconciling: () => reconciling,

@@ -302,7 +302,7 @@ function rows(s: AuditStore): Rows {
     if ("invalid" in r) throw new Error("invalid row");
     if (r.kind === "attempt") out.attempts.push(r);
     else if (r.kind === "outcome") out.outcomes.push(r);
-    else out.verifications.push(r);
+    else if (r.kind === "verification") out.verifications.push(r);
   }
   return out;
 }

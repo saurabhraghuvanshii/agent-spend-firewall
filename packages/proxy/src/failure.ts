@@ -591,16 +591,26 @@ export function logNeedsHuman(log: Logger, tool: string, attemptId: string): voi
 // ---------------------------------------------------------------------------------------------------------------
 
 export interface ReconcileDeps {
-  readonly store: Pick<AuditStore, "readUnsettled" | "recordOutcome" | "recordVerification">;
+  readonly store: Pick<
+    AuditStore,
+    "readUnsettled" | "recordOutcome" | "recordVerification" | "recordApproval"
+  >;
   readonly verifier: ActionVerifier;
   readonly logger?: Logger;
   /** Max upstream lookups (default `STARTUP_LOOKUP_BUDGET`). */
   readonly lookupBudget?: number;
+  /** T011: approval id of a stale approval's attempt (approval store), for its `expired` record. */
+  readonly approvalIdOf?: (attemptId: string) => string | undefined;
 }
 
 export interface ReconcileSummary {
-  /** Open allow/transform attempts given an `upstream_error` / `firewall.orphaned` outcome. */
+  /** Open (possibly sent) attempts given an `upstream_error` / `firewall.orphaned` outcome. */
   readonly orphaned: number;
+  /**
+   * T011: approvals left undecided (or decided without their terminal outcome) by an earlier run, closed as
+   * `not_forwarded` + `approval.expired` / `approval.rejected`. Their args lived in memory only, so they can never run.
+   */
+  readonly approvalsClosed: number;
   readonly happened: number;
   readonly notHappened: number;
   /** Actions still unknown (incl. ones left unknown from an earlier run), to keep blocking duplicates. */
@@ -626,6 +636,31 @@ export async function reconcileAtStartup(deps: ReconcileDeps): Promise<Result<Re
   if (!scan.ok) return scan;
   const work: AuditActivity[] = [];
   let orphaned = 0;
+  let approvalsClosed = 0;
+  for (const a of scan.value.staleApprovals) {
+    let decision = a.approval?.decision;
+    if (decision === undefined) {
+      const rec = deps.store.recordApproval({
+        attemptId: a.attempt.id,
+        approvalId: deps.approvalIdOf?.(a.attempt.id) ?? "unknown",
+        decision: "expired",
+      });
+      if (!rec.ok) return err(rec.error.code, "could not expire a stale approval");
+      decision = "expired";
+    }
+    if (decision === "approved") continue; // not possible: approved rows are `open`
+    const out = deps.store.recordOutcome({
+      attemptId: a.attempt.id,
+      outcome: "not_forwarded",
+      errorCode: decision === "rejected" ? "approval.rejected" : "approval.expired",
+      latencyMs: 0,
+    });
+    if (!out.ok) return err(out.error.code, "could not close a stale approval");
+    approvalsClosed++;
+    log(
+      `startup: approval for attempt ${escapeForTerminal(a.attempt.id)} (${escapeForTerminal(a.attempt.tool)}) was not executed before the restart; closed as ${decision}`,
+    );
+  }
   for (const a of scan.value.open) {
     const out = deps.store.recordOutcome({
       attemptId: a.attempt.id,
@@ -709,5 +744,5 @@ export async function reconcileAtStartup(deps: ReconcileDeps): Promise<Result<Re
       unresolved.push({ attempt: a.attempt, outcome, verification: written.value });
     }
   }
-  return ok({ orphaned, happened, notHappened, unresolved, lookups });
+  return ok({ orphaned, approvalsClosed, happened, notHappened, unresolved, lookups });
 }

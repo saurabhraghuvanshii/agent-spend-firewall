@@ -530,17 +530,6 @@ describe("require_approval", () => {
       errorCode: "approval.unavailable",
     });
   });
-
-  it("executeApproved is a T011 stub that never executes", async () => {
-    const h = await setup();
-    const r = await h.pipeline.executeApproved({
-      approvalId: "apr_x",
-      attemptId: "a",
-      argsHash: "0".repeat(64),
-    });
-    expect(denyRuleOf(r)).toBe("firewall.not_implemented");
-    expect(upstreamCalls(h, "create_refund")).toEqual([]);
-  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -601,6 +590,8 @@ function failing(s: AuditStore, flags: { attempt?: boolean; outcome?: boolean })
       flags.outcome === true ? err("audit.write_failed", "disk full") : s.recordOutcome(i),
     recordVerification: (i) => s.recordVerification(i),
     readUnsettled: () => s.readUnsettled(),
+    recordApproval: (i) => s.recordApproval(i),
+    readAttempt: (id) => s.readAttempt(id),
     readActivitySince: (ms) => s.readActivitySince(ms),
   };
 }
@@ -1427,6 +1418,8 @@ describe("pipeline failure paths", () => {
         recordOutcome: (i) => s.recordOutcome(i),
         recordVerification: (i) => s.recordVerification(i),
         readUnsettled: () => s.readUnsettled(),
+        recordApproval: (i) => s.recordApproval(i),
+        readAttempt: (id) => s.readAttempt(id),
         readActivitySince: (ms) => s.readActivitySince(ms),
       }),
     });

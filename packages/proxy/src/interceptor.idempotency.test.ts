@@ -532,6 +532,8 @@ describe("fail closed", () => {
         recordOutcome: (i) => s.recordOutcome(i),
         recordVerification: (i) => s.recordVerification(i),
         readUnsettled: () => s.readUnsettled(),
+        recordApproval: (i) => s.recordApproval(i),
+        readAttempt: (id) => s.readAttempt(id),
         readActivitySince: () => err("audit.read_failed", "disk gone"),
       }),
     });
@@ -606,6 +608,8 @@ describe("audit trail", () => {
         recordOutcome: (i) => s.recordOutcome(i),
         recordVerification: (i) => s.recordVerification(i),
         readUnsettled: () => s.readUnsettled(),
+        recordApproval: (i) => s.recordApproval(i),
+        readAttempt: (id) => s.readAttempt(id),
         readActivitySince: (ms) => {
           reads++;
           return s.readActivitySince(ms);

@@ -23,6 +23,7 @@
     "dev": "tsx --conditions=@asf/source src/cli/proxy.ts"
   },
   "dependencies": {
+    "@asf/approvals": "workspace:*",
     "@asf/core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "better-sqlite3": "^12.11.1",

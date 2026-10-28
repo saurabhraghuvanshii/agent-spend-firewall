@@ -1,7 +1,9 @@
 import { err, ok, type Result } from "../result.js";
 import { canonicalJson } from "./canonical-json.js";
 import {
+  APPROVAL_ID_RE,
   APPROVER_RE,
+  AUDIT_APPROVAL_DECISIONS,
   AUDIT_VERIFICATION_METHODS,
   AUDIT_VERIFICATION_RESULTS,
   AUDIT_VERIFICATION_TRIGGERS,
@@ -10,6 +12,7 @@ import {
   IDEMPOTENCY_KEY_RE,
   RECORD_ID_RE,
   UPSTREAM_REF_RE,
+  type AuditApprovalDecision,
   type AuditVerificationResult,
   type AuditBody,
   type AuditRecord,
@@ -123,11 +126,50 @@ function checkVerification(body: AuditBody): Result<true> {
   return ok(true);
 }
 
+const APPROVAL_KEYS: ReadonlySet<string> = new Set([
+  "kind",
+  "id",
+  "attemptId",
+  "ts",
+  "approvalId",
+  "decision",
+  "approver",
+]);
+
+/** Strict shape check for `approval` records (T011). Other kinds pass through unchanged. */
+function checkApproval(body: AuditBody): Result<true> {
+  const kind: string = body.kind;
+  if (kind !== "approval") return ok(true);
+  const bad = (msg: string): Result<true> => err("audit.invalid_approval", msg);
+  const b = body as unknown as Record<string, unknown>;
+  for (const k of Object.keys(b)) {
+    if (!APPROVAL_KEYS.has(k) && b[k] !== undefined) return bad("unexpected field");
+  }
+  if (typeof b["id"] !== "string" || !RECORD_ID_RE.test(b["id"])) return bad("invalid id");
+  if (typeof b["attemptId"] !== "string" || !RECORD_ID_RE.test(b["attemptId"])) {
+    return bad("invalid attemptId");
+  }
+  if (typeof b["ts"] !== "string" || b["ts"] === "") return bad("invalid ts");
+  if (typeof b["approvalId"] !== "string" || !APPROVAL_ID_RE.test(b["approvalId"])) {
+    return bad("invalid approvalId");
+  }
+  if (!(AUDIT_APPROVAL_DECISIONS as readonly unknown[]).includes(b["decision"])) {
+    return bad("invalid decision");
+  }
+  if (b["decision"] === "expired") {
+    if (b["approver"] !== undefined) return bad("an expired approval has no approver");
+  } else if (typeof b["approver"] !== "string" || !APPROVER_RE.test(b["approver"])) {
+    return bad("an approved / rejected approval requires a valid approver");
+  }
+  return ok(true);
+}
+
 /**
  * `hash = sha256Hex(prevHash + canonicalJson({ ...body, seq }))`. Never throws.
  * Rejects (`audit.invalid_idempotency_key`) a malformed `idempotencyKey` or one on a non-attempt record,
  * (`audit.invalid_retry_of`) a malformed `retryOf` or one on a non-attempt record, and
- * (`audit.invalid_verification`) a malformed `verification` record (see `AuditVerificationBody`).
+ * (`audit.invalid_verification`) a malformed `verification` record (see `AuditVerificationBody`), and
+ * (`audit.invalid_approval`) a malformed `approval` record (see `AuditApprovalBody`).
  */
 export function computeHash(
   h: Hasher,
@@ -141,6 +183,8 @@ export function computeHash(
   if (!retryCheck.ok) return retryCheck;
   const verificationCheck = checkVerification(body);
   if (!verificationCheck.ok) return verificationCheck;
+  const approvalCheck = checkApproval(body);
+  if (!approvalCheck.ok) return approvalCheck;
   const canon = canonicalJson({ ...body, seq });
   if (!canon.ok) return canon;
   let digest: string;
@@ -184,7 +228,12 @@ function isInvalid(r: AuditRecord | InvalidAuditRow): r is InvalidAuditRow {
  * T010 retries: an attempt with `retryOf` must reference an earlier attempt of the same tool whose latest
  * verification so far is `not_happened`, that is not itself a retry, and that has not been retried already
  * (`bad_retry_of`).
- * The id/outcome/verification checks catch tampered rows that otherwise chain correctly.
+ * T011 approvals: an approval record must reference an earlier attempt (`orphan_approval`) whose decision is
+ * `require_approval` and that is not a retry (`approval_not_required`), with no outcome yet (`approval_after_outcome`)
+ * and no earlier approval (`duplicate_approval`). An outcome `success` / `upstream_error` / `timeout` (the action was
+ * sent) of a `require_approval` attempt needs an earlier `approved` record — for a retry, on its original
+ * (`approval_missing`); a `rejected` / `expired` attempt's outcome must be `not_forwarded` (`approval_outcome_mismatch`).
+ * The id/outcome/verification/approval checks catch tampered rows that otherwise chain correctly.
  * Attempts with no outcome are reported in `danglingAttempts` (a warning, not a break).
  */
 export function verifyChain(
@@ -201,6 +250,9 @@ export function verifyChain(
   const isRetry = new Set<string>();
   const retried = new Set<string>();
   const latestVerification = new Map<string, AuditVerificationResult>();
+  const attemptDecision = new Map<string, string>();
+  /** Approval decision per attempt; a retry of an approved attempt inherits `approved`. */
+  const approvalOf = new Map<string, AuditApprovalDecision>();
 
   const broken = (seq: number, id: string | null, reason: VerifyBreakReason): VerifyResult => ({
     ok: false,
@@ -211,7 +263,12 @@ export function verifyChain(
     if (isInvalid(r)) return broken(r.seq, null, "invalid_row");
     // Rows come from storage; re-check the discriminant at runtime rather than trusting the type.
     const kind: string = r.kind;
-    if (kind !== "attempt" && kind !== "outcome" && kind !== "verification") {
+    if (
+      kind !== "attempt" &&
+      kind !== "outcome" &&
+      kind !== "verification" &&
+      kind !== "approval"
+    ) {
       return broken(r.seq, null, "invalid_row");
     }
     const id = typeof r.id === "string" ? r.id : null;
@@ -246,10 +303,21 @@ export function verifyChain(
         }
         retried.add(original);
         isRetry.add(r.id);
+        const inherited = approvalOf.get(original);
+        if (inherited === "approved") approvalOf.set(r.id, inherited);
       }
       attempts.add(r.id);
       attemptOrder.push(r.id);
       attemptTool.set(r.id, r.tool);
+      attemptDecision.set(r.id, r.decision);
+    } else if (r.kind === "approval") {
+      if (!attempts.has(r.attemptId)) return broken(r.seq, id, "orphan_approval");
+      if (attemptDecision.get(r.attemptId) !== "require_approval" || isRetry.has(r.attemptId)) {
+        return broken(r.seq, id, "approval_not_required");
+      }
+      if (answered.has(r.attemptId)) return broken(r.seq, id, "approval_after_outcome");
+      if (approvalOf.has(r.attemptId)) return broken(r.seq, id, "duplicate_approval");
+      approvalOf.set(r.attemptId, r.decision);
     } else if (r.kind === "verification") {
       if (!attempts.has(r.attemptId)) return broken(r.seq, id, "orphan_verification");
       if (!answered.has(r.attemptId)) return broken(r.seq, id, "verification_before_outcome");
@@ -261,6 +329,15 @@ export function verifyChain(
     } else {
       if (!attempts.has(r.attemptId)) return broken(r.seq, id, "orphan_outcome");
       if (answered.has(r.attemptId)) return broken(r.seq, id, "duplicate_outcome");
+      if (attemptDecision.get(r.attemptId) === "require_approval") {
+        const approval = approvalOf.get(r.attemptId);
+        const sent =
+          r.outcome === "success" || r.outcome === "upstream_error" || r.outcome === "timeout";
+        if (sent && approval !== "approved") return broken(r.seq, id, "approval_missing");
+        if ((approval === "rejected" || approval === "expired") && r.outcome !== "not_forwarded") {
+          return broken(r.seq, id, "approval_outcome_mismatch");
+        }
+      }
       answered.add(r.attemptId);
     }
     prevHash = r.hash;

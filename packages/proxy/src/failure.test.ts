@@ -785,18 +785,24 @@ describe("reconcileAtStartup", () => {
   const D = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
   const E = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
-  it("orphans get firewall.orphaned; timeout / upstream_error verified; require_approval and success untouched", async () => {
+  it("orphans get firewall.orphaned; timeout / upstream_error verified; pending approval expired; success untouched", async () => {
     const s = memStore();
     sentRefund(s, A); // open allow ⇒ orphan
     sentRefund(s, B, { outcome: "timeout", errorCode: "upstream.timeout" }); // refund exists ⇒ happened
     sentRefund(s, C, { outcome: "upstream_error", errorCode: REJECTED_ERROR_CODE }); // absent + definite rejection ⇒ not_happened
-    sentRefund(s, D, undefined, "require_approval"); // pending approval: untouched
+    sentRefund(s, D, undefined, "require_approval"); // pending approval: expired (args were in memory only)
     sentRefund(s, E, { outcome: "success" }); // settled
     const verifier = createActionVerifier({
       upstream: refundPages([[refund("rfnd_B00000001", 5_000, B)]]),
     });
-    const r = unwrap(await reconcileAtStartup({ store: s, verifier }));
-    expect(r).toMatchObject({ orphaned: 1, happened: 1, notHappened: 1 });
+    const r = unwrap(
+      await reconcileAtStartup({
+        store: s,
+        verifier,
+        approvalIdOf: (id) => (id === D ? "apr_D" : undefined),
+      }),
+    );
+    expect(r).toMatchObject({ orphaned: 1, approvalsClosed: 1, happened: 1, notHappened: 1 });
     expect(r.unresolved.map((a) => a.attempt.id)).toEqual([A]);
     const rows: AuditRecord[] = [];
     for (const x of unwrap(s.readAll())) if (!("invalid" in x)) rows.push(x);
@@ -813,10 +819,67 @@ describe("reconcileAtStartup", () => {
       [B, "happened", "startup"],
       [C, "not_happened", "startup"],
     ]);
-    expect(rows.some((x) => "attemptId" in x && x.attemptId === D)).toBe(false);
+    expect(rows.filter((x) => "attemptId" in x && x.attemptId === D)).toEqual([
+      expect.objectContaining({ kind: "approval", decision: "expired", approvalId: "apr_D" }),
+      expect.objectContaining({
+        kind: "outcome",
+        outcome: "not_forwarded",
+        errorCode: "approval.expired",
+      }),
+    ]);
+    expect(rows.some((x) => x.kind === "verification" && x.attemptId === D)).toBe(false);
     expect(rows.some((x) => x.kind === "verification" && x.attemptId === E)).toBe(false);
     expect(unwrap(s.verify()).ok).toBe(true);
     // Nothing is retried at startup: only read lookups.
+  });
+
+  it("T011: a rejected approval without its outcome is closed; an approved orphan is verified, never retried", async () => {
+    const s = memStore();
+    sentRefund(s, A, undefined, "require_approval");
+    unwrap(
+      s.recordApproval({
+        attemptId: A,
+        approvalId: "apr_A",
+        decision: "rejected",
+        approver: "telegram:7",
+      }),
+    );
+    sentRefund(s, B, undefined, "require_approval");
+    unwrap(
+      s.recordApproval({
+        attemptId: B,
+        approvalId: "apr_B",
+        decision: "approved",
+        approver: "telegram:7",
+      }),
+    );
+    const r = unwrap(
+      await reconcileAtStartup({
+        store: s,
+        verifier: createActionVerifier({ upstream: refundPages([[]]) }),
+      }),
+    );
+    expect(r).toMatchObject({ orphaned: 1, approvalsClosed: 1 });
+    const rows: AuditRecord[] = [];
+    for (const x of unwrap(s.readAll())) if (!("invalid" in x)) rows.push(x);
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        kind: "outcome",
+        attemptId: A,
+        outcome: "not_forwarded",
+        errorCode: "approval.rejected",
+      }),
+    );
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        kind: "outcome",
+        attemptId: B,
+        outcome: "upstream_error",
+        errorCode: "firewall.orphaned",
+      }),
+    );
+    expect(r.unresolved.map((a) => a.attempt.id)).toEqual([B]);
+    expect(unwrap(s.verify()).ok).toBe(true);
   });
 
   it("an ambiguous tool error (upstream.tool_error) + absent ⇒ unknown + flagged at startup", async () => {

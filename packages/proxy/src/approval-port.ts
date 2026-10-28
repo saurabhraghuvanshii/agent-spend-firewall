@@ -6,8 +6,10 @@
  * `argsHash` = SHA-256 of `canonicalJson({ tool, args: finalArgs })`: exactly the post-transform args that would be
  * forwarded. T011 must refuse to execute if the args to forward don't hash to the same value.
  *
- * Until T011 the CLI wires `createInMemoryApprovalStub()`: it records requests (the last `STUB_MAX_REQUESTS`) and
- * returns an id, but NOTHING is ever executed (approved actions stay unexecuted; their attempts stay open).
+ * T011: with `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` the CLI wires `createApprovalService` (`approval-service.ts`):
+ * SQLite store, Telegram buttons, `executeApproved` on approval. Without them it wires `createInMemoryApprovalStub()`:
+ * it records requests (the last `STUB_MAX_REQUESTS`) and returns an id, but NOTHING is ever executed (the attempts
+ * stay open until a restart's reconciliation expires them).
  *
  * DISPLAY RULE (T011 Telegram / dashboard): approvers must only ever be shown `finalArgsRedacted` and
  * `reasonForDisplay` (`formatUntrustedReason` over the PII-scrubbed reason). Never render `finalArgs` or
@@ -91,7 +93,7 @@ export interface InMemoryApprovalStub extends ApprovalPort {
   readonly requests: readonly PendingApprovalRequest[];
 }
 
-/** Placeholder until T011: returns `apr_<uuid>`, keeps recent requests in memory, never executes anything. */
+/** Fallback without Telegram config: returns `apr_<uuid>`, keeps recent requests in memory, never executes anything. */
 export function createInMemoryApprovalStub(): InMemoryApprovalStub {
   const requests: PendingApprovalRequest[] = [];
   return {

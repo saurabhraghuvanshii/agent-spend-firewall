@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildRecord, computeHash, verifyChain } from "./chain.js";
 import {
   GENESIS_PREV_HASH,
+  type AuditApprovalBody,
   type AuditAttemptBody,
   type AuditBody,
   type AuditOutcomeBody,
@@ -60,7 +61,7 @@ function chainOf(bodies: AuditBody[]): AuditRecord[] {
 const bodies = (): AuditBody[] => [
   attempt("a1"),
   outcome("o1", "a1"),
-  attempt("a2", { decision: "require_approval", approver: "ops@tg" }),
+  attempt("a2", { decision: "transform", approver: "ops@tg" }),
   outcome("o2", "a2"),
 ];
 
@@ -776,5 +777,141 @@ describe("verification records and retryOf (T010)", () => {
       ]);
       expect(r).toMatchObject({ ok: true, count: 6 });
     });
+  });
+});
+
+describe("approval records (T011)", () => {
+  const ra = (id: string, extra: Partial<AuditAttemptBody> = {}): AuditAttemptBody =>
+    attempt(id, { decision: "require_approval", matchedRules: ["refund.approval"], ...extra });
+  function approval(
+    id: string,
+    attemptId: string,
+    extra: Partial<AuditApprovalBody> = {},
+  ): AuditApprovalBody {
+    return {
+      kind: "approval",
+      id,
+      attemptId,
+      ts: "2026-10-23T10:00:05.000Z",
+      approvalId: "apr_1",
+      decision: "approved",
+      approver: "telegram:12345",
+      ...extra,
+    };
+  }
+  const out = (
+    id: string,
+    attemptId: string,
+    o: AuditOutcomeBody["outcome"],
+    errorCode?: string,
+  ): AuditOutcomeBody => ({
+    kind: "outcome",
+    id,
+    attemptId,
+    ts: "2026-10-23T10:00:10.000Z",
+    outcome: o,
+    latencyMs: 0,
+    ...(errorCode === undefined ? {} : { errorCode }),
+  });
+  const reason = (bs: AuditBody[]): string | undefined => {
+    const r = verifyChain(hasher, chainOf(bs));
+    return r.ok ? undefined : r.brokenAt.reason;
+  };
+  const codeOf = (b: AuditBody): string | undefined => {
+    const r = computeHash(hasher, GENESIS_PREV_HASH, 1, b);
+    return r.ok ? undefined : r.error.code;
+  };
+  const asBody = (o: object): AuditBody => o as unknown as AuditBody;
+
+  it("accepts approved ⇒ success, rejected / expired ⇒ not_forwarded", () => {
+    expect(reason([ra("a1"), approval("p1", "a1"), out("o1", "a1", "success")])).toBeUndefined();
+    expect(
+      reason([
+        ra("a1"),
+        approval("p1", "a1", { decision: "rejected" }),
+        out("o1", "a1", "not_forwarded", "approval.rejected"),
+      ]),
+    ).toBeUndefined();
+    const expired = approval("p1", "a1", { decision: "expired" });
+    delete expired.approver;
+    expect(
+      reason([ra("a1"), expired, out("o1", "a1", "not_forwarded", "approval.expired")]),
+    ).toBeUndefined();
+    // Approved but re-evaluation denied: nothing sent.
+    expect(
+      reason([ra("a1"), approval("p1", "a1"), out("o1", "a1", "not_forwarded")]),
+    ).toBeUndefined();
+  });
+
+  it("rejects a sent outcome of a require_approval attempt without an approved record", () => {
+    for (const o of ["success", "upstream_error", "timeout"] as const) {
+      expect(reason([ra("a1"), out("o1", "a1", o)])).toBe("approval_missing");
+      expect(
+        reason([ra("a1"), approval("p1", "a1", { decision: "rejected" }), out("o1", "a1", o)]),
+      ).toBe("approval_missing");
+    }
+    // Not forwarded without any approval (e.g. the approval service was unavailable) is fine.
+    expect(reason([ra("a1"), out("o1", "a1", "not_forwarded")])).toBeUndefined();
+  });
+
+  it("rejects a rejected / expired approval followed by a denied outcome", () => {
+    expect(
+      reason([ra("a1"), approval("p1", "a1", { decision: "rejected" }), out("o1", "a1", "denied")]),
+    ).toBe("approval_outcome_mismatch");
+  });
+
+  it("rejects an approval that is orphaned, not required, after the outcome or duplicated", () => {
+    expect(reason([approval("p1", "a1")])).toBe("orphan_approval");
+    expect(reason([attempt("a1"), approval("p1", "a1")])).toBe("approval_not_required");
+    expect(reason([ra("a1"), out("o1", "a1", "not_forwarded"), approval("p1", "a1")])).toBe(
+      "approval_after_outcome",
+    );
+    expect(reason([ra("a1"), approval("p1", "a1"), approval("p2", "a1")])).toBe(
+      "duplicate_approval",
+    );
+  });
+
+  it("a retry of an approved attempt inherits the approval; an approval on a retry is refused", () => {
+    const verification: AuditBody = {
+      kind: "verification",
+      id: "v1",
+      attemptId: "a1",
+      ts: "2026-10-23T10:00:20.000Z",
+      trigger: "timeout",
+      result: "not_happened",
+      method: "refund_notes_marker",
+      needsHuman: false,
+    };
+    const base = [ra("a1"), approval("p1", "a1"), out("o1", "a1", "timeout"), verification];
+    expect(reason([...base, ra("a2", { retryOf: "a1" }), out("o2", "a2", "success")])).toBe(
+      undefined,
+    );
+    expect(reason([...base, ra("a2", { retryOf: "a1" }), approval("p2", "a2")])).toBe(
+      "approval_not_required",
+    );
+  });
+
+  it("approval fields are hashed (tampering detected)", () => {
+    const chain = chainOf([ra("a1"), approval("p1", "a1"), out("o1", "a1", "success")]);
+    const tampered = chain.map((r) => (r.id === "p1" ? { ...r, approver: "telegram:999" } : r));
+    const r = verifyChain(hasher, tampered);
+    expect(r.ok ? undefined : r.brokenAt.reason).toBe("hash_mismatch");
+  });
+
+  it("rejects malformed approval records", () => {
+    expect(codeOf(approval("p1", "a1"))).toBeUndefined();
+    expect(codeOf(asBody({ ...approval("p1", "a1"), extra: 1 }))).toBe("audit.invalid_approval");
+    expect(codeOf(approval("p1", "a1", { decision: "maybe" as "approved" }))).toBe(
+      "audit.invalid_approval",
+    );
+    expect(codeOf(approval("p1", "a1", { approver: "bob@example.com" }))).toBe(
+      "audit.invalid_approval",
+    );
+    const noApprover = approval("p1", "a1");
+    delete noApprover.approver;
+    expect(codeOf(noApprover)).toBe("audit.invalid_approval");
+    expect(codeOf(approval("p1", "a1", { decision: "expired" }))).toBe("audit.invalid_approval");
+    expect(codeOf(approval("p1", "a1", { approvalId: "bad id!" }))).toBe("audit.invalid_approval");
+    expect(codeOf(approval("p1", "bad id!"))).toBe("audit.invalid_approval");
   });
 });

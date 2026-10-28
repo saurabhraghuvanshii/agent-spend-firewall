@@ -24,6 +24,12 @@
  *   deciding (retry once only after a late FAILURE answer + a complete refund list without the marker), integer ms
  *   1000..120000, default 15000 ⇒ else exit 2.
  *
+ * - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (T011; shell or `.env`): both set ⇒ `require_approval` actions are sent to
+ *   that Telegram chat with Approve / Reject buttons, approved ones execute through the normal money path, and the
+ *   agent can poll `firewall_check_approval`. Pending approvals live in `<audit DB dir>/approvals.db`; their args stay
+ *   in memory, so a restart expires them. Neither set ⇒ the in-memory stub (nothing awaiting approval ever executes).
+ *   Only one set, or a malformed value ⇒ exit 2. The token is never logged.
+ *
  * T010 startup reconciliation: right after start the money pipeline is `reconciling` (money calls denied
  * `firewall.reconciling`, reads work) while open attempts left by a crash and unsettled timeouts / upstream errors are
  * verified with Razorpay (never retried); still-unknown actions are flagged for a human and keep blocking duplicates.
@@ -59,7 +65,16 @@ import { fileURLToPath } from "node:url";
 import { err, ok, type CompiledPolicy, type Result } from "@asf/core";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  createGrammyTransport,
+  createTelegramApprover,
+  openApprovalStore,
+  CHAT_ID_RE,
+  type ApprovalStore,
+  type TelegramApprover,
+} from "@asf/approvals";
 import { createInMemoryApprovalStub, type ApprovalPort } from "../approval-port.js";
+import { createApprovalService, type ApprovalService } from "../approval-service.js";
 import { openAuditStore, type AuditStore } from "../audit-store.js";
 import { systemClock, systemTimer } from "../context-adapters.js";
 import {
@@ -154,6 +169,8 @@ export interface ProxyConfig {
   readonly moneyCallTimeoutMs: number;
   /** `ASF_VERIFY_WAIT_MS` (shell env only, T010). */
   readonly verifyWaitMs: number;
+  /** T011: Telegram approvals (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`); `undefined` ⇒ in-memory stub. SECRET token. */
+  readonly telegram?: TelegramConfig;
   /** Non-fatal notes for the log (secret-free). */
   readonly notes: readonly string[];
 }
@@ -166,6 +183,39 @@ export interface ConfigDeps {
   /** Contents of a file, or `undefined` if it doesn't exist. */
   readonly readFile: (path: string) => string | undefined;
   readonly baseChildEnv: () => Record<string, string>;
+}
+
+export interface TelegramConfig {
+  /** SECRET: never log it. */
+  readonly token: string;
+  readonly chatId: string;
+}
+
+/** Bot API token shape: `<bot id>:<secret>`. */
+export const TELEGRAM_TOKEN_RE = /^[0-9]{5,20}:[A-Za-z0-9_-]{30,64}$/;
+
+/** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`: both or neither (fail closed on half a configuration). */
+export function parseTelegramConfig(
+  rawToken: string | undefined,
+  rawChatId: string | undefined,
+): Result<TelegramConfig | undefined> {
+  const token = rawToken === undefined || rawToken === "" ? undefined : rawToken;
+  const chatId = rawChatId === undefined || rawChatId === "" ? undefined : rawChatId;
+  if (token === undefined && chatId === undefined) return ok(undefined);
+  if (token === undefined || chatId === undefined) {
+    return err(
+      "proxy.bad_telegram",
+      "set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (or neither) for Telegram approvals",
+    );
+  }
+  // Messages never echo the values.
+  if (!TELEGRAM_TOKEN_RE.test(token)) {
+    return err("proxy.bad_telegram", "TELEGRAM_BOT_TOKEN is not a valid bot token");
+  }
+  if (!CHAT_ID_RE.test(chatId)) {
+    return err("proxy.bad_telegram", "TELEGRAM_CHAT_ID must be a numeric chat id");
+  }
+  return ok({ token, chatId });
 }
 
 export function parseTimeoutMs(raw: string | undefined): Result<number> {
@@ -340,6 +390,8 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
   if (!moneyTimeout.ok) return moneyTimeout;
   const verifyWait = parseVerifyWaitMs(shellValue("ASF_VERIFY_WAIT_MS"));
   if (!verifyWait.ok) return verifyWait;
+  const telegram = parseTelegramConfig(env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"]);
+  if (!telegram.ok) return telegram;
 
   const image = validateImageRef(
     shellValue("ASF_RAZORPAY_MCP_IMAGE") ?? DEFAULT_RAZORPAY_MCP_IMAGE,
@@ -367,6 +419,7 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
     duplicateWindowMs: duplicateWindow.value,
     moneyCallTimeoutMs: moneyTimeout.value,
     verifyWaitMs: verifyWait.value,
+    ...(telegram.value === undefined ? {} : { telegram: telegram.value }),
     notes,
   });
 }
@@ -540,6 +593,55 @@ export function stderrLogger(write: (s: string) => void): Logger {
   };
 }
 
+/** Interval of the approval expiry sweep. */
+export const APPROVAL_SWEEP_MS = 15_000;
+
+export interface ApprovalWiring {
+  readonly service: ApprovalService;
+  readonly store: ApprovalStore;
+  /** Started by `startProxy`, stopped by `shutdown`. */
+  readonly telegram?: Pick<TelegramApprover, "start" | "stop">;
+}
+
+/** Approvals DB next to the audit DB (inside `<repo>/data/`, already confined). */
+export function approvalsDbPath(auditDbPath: string): string {
+  return join(dirname(auditDbPath), "approvals.db");
+}
+
+/**
+ * T011: approval store + Telegram approver + service for `config.telegram` (`err` ⇒ exit 2). `transport` is
+ * injectable for tests (default: grammy long polling with the bot token).
+ */
+export function openApprovals(
+  config: ProxyConfig,
+  logger: Logger,
+  transport?: Parameters<typeof createTelegramApprover>[0]["transport"],
+): Result<ApprovalWiring | undefined> {
+  const tg = config.telegram;
+  if (tg === undefined) return ok(undefined);
+  const store = openApprovalStore({ path: approvalsDbPath(config.auditDbPath) });
+  if (!store.ok) return store;
+  const ref: { service?: ApprovalService } = {};
+  const approver = createTelegramApprover({
+    transport: transport ?? createGrammyTransport(tg.token, logger),
+    chatId: tg.chatId,
+    store: store.value,
+    logger,
+    onDecision: (d) =>
+      ref.service === undefined
+        ? Promise.resolve({ answer: "The firewall is starting; nothing was executed." })
+        : ref.service.decide(d),
+  });
+  const service = createApprovalService({
+    store: store.value,
+    notifier: approver,
+    clock: systemClock,
+    logger,
+  });
+  ref.service = service;
+  return ok({ service, store: store.value, telegram: approver });
+}
+
 export interface RunningProxy {
   readonly proxy: ProxyServer;
   readonly upstream: Upstream;
@@ -555,8 +657,10 @@ export interface StartProxyOptions {
   readonly logger: Logger;
   /** Policy + audit store from `openFirewall`. Closed by `shutdown`. */
   readonly firewall: Firewall;
-  /** Default: in-memory stub (T011 replaces it); nothing awaiting approval is ever executed. */
+  /** Default: in-memory stub; nothing awaiting approval is ever executed. Ignored when `approvalWiring` is set. */
   readonly approvals?: ApprovalPort;
+  /** T011: the real approval workflow (`openApprovals`). Closed by `shutdown`. */
+  readonly approvalWiring?: ApprovalWiring;
   /** Start the money pipeline degraded (see `startupDegradation`); `main` derives it from `openFirewall`'s report. */
   readonly startDegraded?: { readonly reason: string; readonly message: string };
   /** Injected for tests; default: hardened docker. */
@@ -584,11 +688,15 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
     callTimeoutMs: config.callTimeoutMs,
     clientInfo: { name: "agent-spend-firewall", version: "0.0.0" },
   });
+  const wiring = opts.approvalWiring;
   const pipeline = createMoneyPipeline({
     policy: opts.firewall.policy,
     store: opts.firewall.store,
     upstream,
-    approvals: opts.approvals ?? createInMemoryApprovalStub(),
+    approvals: wiring?.service ?? opts.approvals ?? createInMemoryApprovalStub(),
+    ...(wiring === undefined
+      ? {}
+      : { approvalIdOf: (id: string) => wiring.service.approvalIdOf(id) }),
     clock: systemClock,
     timer: systemTimer,
     redact,
@@ -614,7 +722,24 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
     moneyCallTimeoutMs: config.moneyCallTimeoutMs,
     logger,
     redact,
+    // T011: the agent polls approvals through a firewall-implemented tool.
+    ...(wiring === undefined ? {} : { localTools: [wiring.service.checkTool] }),
   });
+  let sweep: ReturnType<typeof setInterval> | undefined;
+  if (wiring !== undefined) {
+    wiring.service.attach({ pipeline, openCall: proxy.openDirectCall });
+    // Approvals of an earlier run can't execute (their args were in memory): retire them before reconciling.
+    const stale = wiring.service.expireStale();
+    if (!stale.ok) logger(`approval store: expiring stale approvals failed (${stale.error.code})`);
+    const started = wiring.telegram?.start();
+    if (started !== undefined && !started.ok) {
+      logger(`telegram approvals not started (${started.error.code})`);
+    }
+    sweep = setInterval(() => {
+      void wiring.service.sweepExpired();
+    }, APPROVAL_SWEEP_MS);
+    sweep.unref();
+  }
   upstream.onLateResponse((e) => {
     // Metadata only — the response body is never logged (T010 reconciles money calls from this event).
     logger(
@@ -640,9 +765,13 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
           logger(`closing the agent channel failed: ${redact(errorText(e))}`);
         }
         try {
+          if (sweep !== undefined) clearInterval(sweep);
+          await wiring?.telegram?.stop();
+          await wiring?.service.idle();
           pipeline.close();
           await upstream.close();
         } finally {
+          wiring?.store.close();
           opts.firewall.store.close();
         }
       })();
@@ -694,10 +823,23 @@ async function main(): Promise<void> {
   }
 
   const startDegraded = startupDegradation(firewall.value.report);
+  const approvals = openApprovals(config.value, logger);
+  if (!approvals.ok) {
+    logger(`error: ${approvals.error.message} (${approvals.error.code})`);
+    firewall.value.store.close();
+    process.exitCode = 2;
+    return;
+  }
+  logger(
+    approvals.value === undefined
+      ? "approvals: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; actions needing approval are never executed"
+      : `approvals: Telegram chat ${config.value.telegram?.chatId ?? "?"}; store ${approvals.value.store.path}`,
+  );
   const running = startProxy({
     config: config.value,
     logger,
     firewall: firewall.value,
+    ...(approvals.value === undefined ? {} : { approvalWiring: approvals.value }),
     ...(startDegraded === undefined ? {} : { startDegraded }),
   });
   const redact: Redactor = (s) => redactSecrets(s, config.value.keys);
