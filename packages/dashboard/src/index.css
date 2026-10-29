@@ -1,4 +1,173 @@
 @import "tailwindcss";
 
-/* Dark mode follows the `dark` class on <html>, set from the theme toggle or prefers-color-scheme (theme.ts). */
+/* Dark mode follows the `dark` class on <html> (theme.ts; dark is the default). */
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------------------------------------
+ * Design tokens. Light = off-white paper with ink; dark (default) = ink with off-white type.
+ * One electric-blue accent; semantic colours desaturated to sit inside the palette.
+ * ------------------------------------------------------------------------------------------- */
+:root {
+  --bg: #f3f0e8;
+  --surface: #f8f6f0;
+  --surface-2: #ebe7dc;
+  --fg: #0b0b0d;
+  --muted: #5d5a54;
+  --faint: #6b675f;
+  --line: #d8d2c4;
+  --line-strong: #b9b2a2;
+  --accent: #2433ff;
+  --accent-ink: #ffffff;
+  --danger: #b23a30;
+  --warn: #946200;
+  --ok: #2c7a52;
+  --field: 11 11 13;
+}
+
+.dark {
+  --bg: #0a0a0c;
+  --surface: #111114;
+  --surface-2: #18181c;
+  --fg: #f3f0e8;
+  --muted: #a19d94;
+  --faint: #8f8b83;
+  --line: #25252a;
+  --line-strong: #3a3a41;
+  --accent: #2f3dff;
+  --accent-ink: #ffffff;
+  --danger: #e2685e;
+  --warn: #d8a748;
+  --ok: #6cbf92;
+  --field: 243 240 232;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-danger: var(--danger);
+  --color-warn: var(--warn);
+  --color-ok: var(--ok);
+  --font-display: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+    background: var(--bg);
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply font-sans text-fg antialiased;
+    overflow-x: clip;
+  }
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Chips: one height, pill, hairline border, small caps tracking. */
+@utility chip {
+  @apply inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-line-strong px-2.5 text-[10.5px] leading-none font-medium tracking-[0.08em] whitespace-nowrap text-muted uppercase;
+}
+@utility chip-ok {
+  @apply border-ok/50 bg-ok/10 text-ok;
+}
+@utility chip-danger {
+  @apply border-danger/55 bg-danger/12 text-danger;
+}
+@utility chip-warn {
+  @apply border-warn/55 bg-warn/10 text-warn;
+}
+@utility chip-accent {
+  @apply border-accent/60 bg-accent/15 text-fg;
+}
+@utility chip-solid-danger {
+  @apply border-danger bg-danger text-bg;
+}
+@utility chip-dashed {
+  @apply border-dashed;
+}
+
+/* Buttons: sharp rectangles. Primary is the electric blue, secondary is outlined. */
+@utility btn {
+  @apply inline-flex h-9 items-center justify-center gap-2 px-4 text-sm font-medium transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-45;
+}
+@utility btn-primary {
+  @apply btn bg-accent text-accent-ink hover:brightness-110;
+}
+@utility btn-secondary {
+  @apply btn border border-line-strong text-fg hover:border-fg hover:bg-fg/5;
+}
+@utility btn-danger {
+  @apply btn border border-danger/70 text-danger hover:bg-danger/10;
+}
+@utility btn-solid-danger {
+  @apply btn bg-danger text-bg hover:brightness-110;
+}
+@utility btn-link {
+  @apply text-xs text-muted underline-offset-4 hover:text-fg hover:underline;
+}
+
+@utility card {
+  @apply min-w-0 border border-line bg-surface;
+}
+@utility card-head {
+  @apply flex items-baseline justify-between gap-3 border-b border-line px-5 py-4;
+}
+@utility card-title {
+  @apply font-display text-2xl leading-none tracking-tight;
+}
+@utility eyebrow {
+  @apply text-[10.5px] font-medium tracking-[0.14em] text-muted uppercase;
+}
+@utility input {
+  @apply h-10 w-full min-w-0 border border-line-strong bg-bg px-3 font-mono text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none;
+}
+
+/* Marquee: one track holding the items twice, shifted by half its width. */
+@keyframes asf-marquee {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+.asf-marquee-track {
+  animation: asf-marquee 48s linear infinite;
+  will-change: transform;
+}
+.asf-marquee-mask {
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 5rem,
+    #000 calc(100% - 5rem),
+    transparent
+  );
+}
+.asf-marquee:hover .asf-marquee-track {
+  animation-play-state: paused;
+}
+@media (prefers-reduced-motion: reduce) {
+  .asf-marquee-track {
+    animation: none;
+  }
+}

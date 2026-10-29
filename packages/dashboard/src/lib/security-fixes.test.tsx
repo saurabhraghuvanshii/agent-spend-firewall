@@ -24,7 +24,7 @@ describe("security review fixes (T014)", () => {
     const b = screen.getByTestId("chain-badge");
     expect(b.dataset.state).toBe("pending");
     expect(b.textContent).toBe("Chain OK · 2 pending outcome");
-    expect(b.className).not.toContain("emerald");
+    expect(b.dataset.tone).toBe("warn");
   });
 
   it("a preformatted reason with an unescaped inner quote or trailing backslash is re-formatted", () => {

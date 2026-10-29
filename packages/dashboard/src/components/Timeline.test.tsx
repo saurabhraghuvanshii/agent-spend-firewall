@@ -19,7 +19,7 @@ describe("AttemptRow layout", () => {
     const row = screen.getByTestId("timeline-row");
     expect(row.dataset.variant).toBe("full");
     expect(row.innerHTML).toContain(
-      "md:grid-cols-[4.5rem_minmax(0,1fr)_7rem_8rem_minmax(0,1.4fr)_6rem]",
+      "md:grid-cols-[4.5rem_minmax(0,1fr)_7.5rem_10rem_minmax(0,1.35fr)_6.5rem]",
     );
   });
 

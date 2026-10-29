@@ -7,10 +7,7 @@ import { displayReason, flattenArgs, UNTRUSTED_REASON_LABEL } from "../lib/untru
 
 export function UntrustedLabel({ title = UNTRUSTED_REASON_LABEL }: { title?: string }) {
   return (
-    <span
-      title={title}
-      className="mr-1.5 inline-block rounded border border-amber-400 bg-amber-50 px-1 py-px align-middle text-[10px] font-semibold tracking-wide text-amber-800 uppercase dark:border-amber-600 dark:bg-amber-950 dark:text-amber-300"
-    >
+    <span title={title} className="chip chip-warn mr-2 h-5 px-2 align-[1px] text-[9.5px]">
       untrusted
     </span>
   );
@@ -18,11 +15,11 @@ export function UntrustedLabel({ title = UNTRUSTED_REASON_LABEL }: { title?: str
 
 export function UntrustedReason({ reason }: { reason: UntrustedTextView | undefined }) {
   return (
-    <span data-testid="untrusted-reason" className="break-words">
+    <span data-testid="untrusted-reason" className="block min-w-0 break-words">
       <UntrustedLabel />
       <span
         dir="ltr"
-        className="font-mono text-xs [unicode-bidi:isolate] text-slate-700 dark:text-slate-300"
+        className="font-mono text-[12.5px] leading-relaxed [unicode-bidi:isolate] text-fg/85"
         aria-label={UNTRUSTED_REASON_LABEL}
       >
         {displayReason(reason)}
@@ -36,21 +33,20 @@ export function UntrustedArgs({ args, title }: { args: JsonValue | undefined; ti
   if (args === undefined) return null;
   const lines = flattenArgs(args);
   return (
-    <div data-testid="untrusted-args" className="text-xs">
-      <div className="mb-1 text-slate-500 dark:text-slate-400">
+    <div data-testid="untrusted-args" className="min-w-0 text-xs">
+      <div className="mb-2 flex items-center text-muted">
         <UntrustedLabel title="Agent-supplied arguments (untrusted, redacted)" />
-        {title} <span className="text-slate-400">(redacted)</span>
+        <span>
+          {title} <span className="text-faint">· redacted</span>
+        </span>
       </div>
-      <dl className="grid grid-cols-[minmax(0,max-content)_minmax(0,1fr)] gap-x-3 gap-y-0.5 font-mono">
+      <dl className="grid grid-cols-[minmax(0,max-content)_minmax(0,1fr)] gap-x-4 gap-y-1 border-l border-line pl-3 font-mono text-[11.5px]">
         {lines.map((l, i) => (
           <div key={`${l.path}-${String(i)}`} className="contents">
-            <dt className="truncate text-slate-500 dark:text-slate-400" dir="ltr">
+            <dt className="max-w-[12rem] truncate text-faint" dir="ltr" title={l.path}>
               {l.path}
             </dt>
-            <dd
-              className="break-all text-slate-800 [unicode-bidi:isolate] dark:text-slate-200"
-              dir="ltr"
-            >
+            <dd className="min-w-0 break-all text-fg/85 [unicode-bidi:isolate]" dir="ltr">
               {l.value}
             </dd>
           </div>

@@ -90,7 +90,7 @@ describe("untrusted rendering", () => {
     );
     const row = screen.getByTestId("timeline-row");
     expect(row.dataset.decision).toBe("deny");
-    expect(row.className).toContain("bg-red-50");
+    expect(row.className).toContain("row-deny");
     expect(row.textContent).toContain("max-refund");
     expect(row.textContent).toContain("₹1,23,456.78");
   });

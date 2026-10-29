@@ -6,24 +6,24 @@ import type { OutcomeView } from "../api/schemas";
 import type { StreamStatus } from "../lib/sse";
 import { formatTime, type AttemptEntry, type TimelineEntry } from "../lib/timeline";
 import { displayId } from "../lib/untrusted";
-import { Amount, Chip, DecisionBadge } from "./Badges";
+import { Amount, Chip, DecisionBadge, type Tone } from "./Badges";
 import { UntrustedArgs, UntrustedReason } from "./Untrusted";
 
-const OUTCOME_TONE: Record<OutcomeView["outcome"], "slate" | "red" | "amber" | "emerald"> = {
-  success: "emerald",
-  denied: "red",
-  not_forwarded: "slate",
-  timeout: "amber",
-  upstream_error: "amber",
+const OUTCOME_TONE: Record<OutcomeView["outcome"], Tone> = {
+  success: "ok",
+  denied: "danger",
+  not_forwarded: "neutral",
+  timeout: "warn",
+  upstream_error: "warn",
 };
 
 export function StreamIndicator({ status }: { status: StreamStatus }) {
   const map: Record<StreamStatus["state"], { dot: string; text: string }> = {
-    connecting: { dot: "bg-slate-400", text: "connecting…" },
-    open: { dot: "bg-emerald-500", text: "live" },
-    reconnecting: { dot: "bg-amber-500", text: "reconnecting" },
-    unauthorized: { dot: "bg-red-500", text: "unauthorized" },
-    stopped: { dot: "bg-slate-400", text: "stopped" },
+    connecting: { dot: "bg-faint", text: "connecting…" },
+    open: { dot: "bg-ok", text: "live" },
+    reconnecting: { dot: "bg-warn", text: "reconnecting" },
+    unauthorized: { dot: "bg-danger", text: "unauthorized" },
+    stopped: { dot: "bg-faint", text: "stopped" },
   };
   const m = map[status.state];
   const title =
@@ -35,10 +35,15 @@ export function StreamIndicator({ status }: { status: StreamStatus }) {
   return (
     <span
       data-testid="stream-status"
-      className="inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400"
+      className="inline-flex items-center gap-2 text-[10.5px] font-medium tracking-[0.12em] text-muted uppercase"
       title={title}
     >
-      <span className={`h-2 w-2 rounded-full ${m.dot}`} aria-hidden="true" />
+      <span className="relative inline-flex h-2 w-2" aria-hidden="true">
+        {status.state === "open" && (
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-ok opacity-50 motion-reduce:hidden" />
+        )}
+        <span className={`relative inline-flex h-2 w-2 rounded-full ${m.dot}`} />
+      </span>
       {m.text}
     </span>
   );
@@ -61,29 +66,35 @@ export function AttemptRow({
   const denied = a.decision === "deny";
   const wouldDeny = a.shadow === true && a.wouldDecision === "deny";
   const tone = denied
-    ? "border-red-300 bg-red-50 dark:border-red-900 dark:bg-red-950/60"
+    ? "row-deny bg-danger/[0.07]"
     : wouldDeny
-      ? "border-dashed border-amber-400 bg-amber-50/60 dark:border-amber-700 dark:bg-amber-950/40"
-      : "border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900";
+      ? "row-would-deny bg-warn/[0.05]"
+      : "";
+  const bar = denied
+    ? "bg-danger"
+    : wouldDeny
+      ? "bg-warn"
+      : a.decision === "require_approval"
+        ? "bg-accent"
+        : "bg-transparent";
   return (
     <li
       data-testid="timeline-row"
       data-decision={a.decision}
       data-variant={compact ? "compact" : "full"}
-      className={`rounded-md border p-3 ${tone}`}
+      className={`relative min-w-0 py-4 pr-4 pl-5 ${tone}`}
     >
-      <div
-        className={`grid grid-cols-2 items-center gap-x-3 gap-y-1 text-sm ${wide("md:grid-cols-[4.5rem_minmax(0,1fr)_7rem_8rem_minmax(0,1.4fr)_6rem]")}`}
-      >
+      <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-[3px] ${bar}`} />
+      <div className={`grid grid-cols-2 items-center gap-x-3 gap-y-2 ${wide(COLS)}`}>
         <time
           dateTime={a.ts}
           title={a.ts}
-          className="text-xs text-slate-500 tabular-nums dark:text-slate-400"
+          className="font-mono text-[11.5px] text-muted tabular-nums"
         >
           {formatTime(a.ts)}
         </time>
         <span
-          className={`truncate text-right font-mono font-semibold ${wide("md:text-left")}`}
+          className={`truncate text-right font-mono text-[13px] font-medium ${wide("md:text-left")}`}
           title={displayId(a.tool)}
         >
           {displayId(a.tool)}
@@ -91,42 +102,59 @@ export function AttemptRow({
         <span className={wide("md:text-right")}>
           <Amount amountPaise={a.amountPaise} />
         </span>
-        <span className={`text-right ${wide("md:text-left")}`}>
+        <span className={`min-w-0 text-right ${wide("md:text-left")}`}>
           <DecisionBadge decision={a.decision} wouldDecision={a.wouldDecision} />
         </span>
         <span
           data-testid="matched-rules"
           title={a.matchedRules.length === 0 ? undefined : rulesText}
-          className={`col-span-2 font-mono text-xs break-words text-slate-600 dark:text-slate-300 ${wide("md:col-span-1 md:truncate")}`}
+          className={`col-span-2 flex min-w-0 flex-wrap gap-1 ${wide("md:col-span-1")}`}
         >
           {a.matchedRules.length === 0 ? (
-            <span className="text-slate-400">no rule matched</span>
+            <span className="font-mono text-[11.5px] text-faint">no rule matched</span>
           ) : (
-            <span className={denied ? "font-semibold text-red-700 dark:text-red-300" : ""}>
-              {rulesText}
-            </span>
+            a.matchedRules.map((r, i) => (
+              <span
+                key={`${String(i)}-${r}`}
+                title={displayId(r)}
+                className={`inline-block max-w-full truncate rounded-full border px-1.5 py-px font-mono text-[10px] leading-4 whitespace-nowrap ${
+                  denied
+                    ? "border-danger/50 bg-danger/10 text-danger"
+                    : "border-line-strong text-muted"
+                }`}
+              >
+                {displayId(r)}
+              </span>
+            ))
           )}
         </span>
         <span className={`col-span-2 flex flex-wrap gap-1 ${wide("md:col-span-1 md:justify-end")}`}>
-          {entry.approval !== undefined && <Chip tone="amber">{entry.approval.decision}</Chip>}
-          {entry.outcome !== undefined && (
+          {entry.approval !== undefined && <Chip tone="accent">{entry.approval.decision}</Chip>}
+          {entry.outcome !== undefined ? (
             <Chip tone={OUTCOME_TONE[entry.outcome.outcome]}>{entry.outcome.outcome}</Chip>
+          ) : (
+            <Chip tone="warn" title="No outcome recorded yet (awaiting approval or in flight)">
+              pending
+            </Chip>
           )}
           {entry.verification !== undefined && (
-            <Chip tone={entry.verification.result === "unknown" ? "amber" : "slate"}>
+            <Chip tone={entry.verification.result === "unknown" ? "warn" : "neutral"}>
               verified: {entry.verification.result}
             </Chip>
           )}
         </span>
       </div>
-      <div className="mt-2 text-sm">
+      <div className="mt-3 text-sm">
         <UntrustedReason reason={a.reason} />
       </div>
-      <details className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-        <summary className="cursor-pointer select-none">
-          details · session <span className="font-mono">{displayId(a.sessionId)}</span>
+      <details className="group mt-2 text-xs text-muted">
+        <summary className="cursor-pointer list-none select-none hover:text-fg">
+          <span className="mr-1 inline-block transition-transform group-open:rotate-90 motion-reduce:transition-none">
+            ›
+          </span>
+          Details · session <span className="font-mono">{displayId(a.sessionId)}</span>
         </summary>
-        <div className="mt-2 flex flex-col gap-2">
+        <div className="mt-3 flex min-w-0 flex-col gap-3">
           <UntrustedArgs
             args={a.argsRedacted}
             title={a.originalArgsRedacted === undefined ? "Arguments" : "Forwarded arguments"}
@@ -134,9 +162,15 @@ export function AttemptRow({
           {a.originalArgsRedacted !== undefined && (
             <UntrustedArgs args={a.originalArgsRedacted} title="Agent's original arguments" />
           )}
-          {a.approver !== undefined && <span>approver {displayId(a.approver)}</span>}
+          {a.approver !== undefined && (
+            <span>
+              approver <span className="font-mono">{displayId(a.approver)}</span>
+            </span>
+          )}
           {entry.outcome?.errorCode !== undefined && (
-            <span>error {displayId(entry.outcome.errorCode)}</span>
+            <span>
+              error <span className="font-mono">{displayId(entry.outcome.errorCode)}</span>
+            </span>
           )}
           {onPickSession !== undefined && (
             <button
@@ -144,9 +178,9 @@ export function AttemptRow({
               onClick={() => {
                 onPickSession(a.sessionId);
               }}
-              className="self-start text-sky-700 underline-offset-2 hover:underline dark:text-sky-300"
+              className="btn-secondary h-8 self-start px-3 text-xs"
             >
-              Replay this session
+              Replay this session →
             </button>
           )}
         </div>
@@ -155,24 +189,39 @@ export function AttemptRow({
   );
 }
 
+/** Shared column template so the header, money rows and mode-change rows line up. */
+const COLS = "md:grid-cols-[4.5rem_minmax(0,1fr)_7.5rem_10rem_minmax(0,1.35fr)_6.5rem]";
+
 function SystemRow({ entry }: { entry: Exclude<TimelineEntry, AttemptEntry> }) {
   if (entry.kind === "invalid") {
     return (
-      <li className="rounded-md border border-red-400 bg-red-50 p-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-300">
+      <li className="relative bg-danger/[0.08] py-3 pr-4 pl-5 text-sm text-danger">
+        <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-danger" />
         Invalid audit row at seq {entry.seq} (could not be parsed by the firewall)
       </li>
     );
   }
   const r = entry.record;
   return (
-    <li className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-800/50 dark:text-slate-300">
-      <time dateTime={r.ts} title={r.ts} className="tabular-nums">
-        {formatTime(r.ts)}
-      </time>
-      <span className="font-semibold">Mode change</span>
-      <span>kill switch {r.killSwitch ? "ON" : "off"}</span>·
-      <span>{r.shadow ? "shadow" : "enforce"}</span>
-      <span>by {displayId(r.actor)}</span>
+    <li className="bg-surface-2/60 py-2.5 pr-4 pl-5 text-xs text-muted">
+      <div className={`grid grid-cols-2 items-center gap-x-3 gap-y-1.5 ${COLS}`}>
+        <time dateTime={r.ts} title={r.ts} className="font-mono text-muted tabular-nums">
+          {formatTime(r.ts)}
+        </time>
+        <span className="eyebrow text-muted">Mode change</span>
+        <span aria-hidden="true" className="hidden md:block" />
+        <span>
+          <Chip tone={r.shadow ? "warn" : "neutral"}>{r.shadow ? "shadow" : "enforce"}</Chip>
+        </span>
+        <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+          <Chip tone={r.killSwitch ? "danger" : "neutral"}>
+            kill switch {r.killSwitch ? "ON" : "off"}
+          </Chip>
+          <span className="truncate">
+            by <span className="font-mono">{displayId(r.actor)}</span>
+          </span>
+        </span>
+      </div>
     </li>
   );
 }
@@ -189,25 +238,43 @@ export function Timeline({
   onPickSession: (id: string) => void;
 }) {
   return (
-    <section aria-labelledby="timeline-title" className="min-w-0">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h2 id="timeline-title" className="text-base font-semibold">
-          Live timeline
-        </h2>
+    <section aria-labelledby="timeline-title" className="card">
+      <div className="card-head">
+        <div className="min-w-0">
+          <p className="eyebrow">Every money action, newest first</p>
+          <h2 id="timeline-title" className="card-title mt-1.5 text-3xl">
+            Live <em>timeline</em>
+          </h2>
+        </div>
         <StreamIndicator status={status} />
       </div>
+      {entries.length > 0 && (
+        <div
+          aria-hidden="true"
+          className={`hidden ${COLS} gap-x-3 border-b border-line py-2 pr-4 pl-5 eyebrow md:grid`}
+        >
+          <span>Time</span>
+          <span>Tool</span>
+          <span className="text-right">Amount</span>
+          <span>Decision</span>
+          <span>Rules</span>
+          <span className="text-right">Outcome</span>
+        </div>
+      )}
       {error !== undefined && (
         <p
           role="alert"
-          className="mb-3 rounded-md border border-red-300 bg-red-50 p-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-300"
+          className="mx-5 my-4 border border-danger/50 bg-danger/10 p-3 text-sm break-words text-danger"
         >
           {error}
         </p>
       )}
       {entries.length === 0 ? (
-        <p className="text-sm text-slate-500 dark:text-slate-400">No money actions yet.</p>
+        <p className="px-5 py-12 text-center font-display text-2xl text-muted italic">
+          No money actions yet.
+        </p>
       ) : (
-        <ul className="flex flex-col gap-2">
+        <ul className="divide-y divide-line">
           {entries.map((e) =>
             e.kind === "attempt" ? (
               <AttemptRow key={e.seq} entry={e} onPickSession={onPickSession} />

@@ -15,6 +15,7 @@ const csp = (): Plugin => ({
       "script-src 'self'",
       "style-src 'self'",
       "img-src 'self' data:",
+      "font-src 'self'",
       "connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*",
       "object-src 'none'",
       "base-uri 'none'",

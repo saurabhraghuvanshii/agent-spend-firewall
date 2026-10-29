@@ -2,6 +2,10 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { resolveApiBaseUrl } from "./config";
+import "@fontsource/instrument-serif/400.css";
+import "@fontsource/instrument-serif/400-italic.css";
+import "@fontsource-variable/inter";
+import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import { applyTheme, readThemePref } from "./theme";
 
@@ -17,7 +21,7 @@ createRoot(root).render(
       <App apiUrl={api.value} />
     ) : (
       <main className="p-6">
-        <p role="alert" className="text-red-700">
+        <p role="alert" className="text-danger">
           Configuration error: {api.error}
         </p>
       </main>

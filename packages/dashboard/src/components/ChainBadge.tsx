@@ -1,60 +1,84 @@
 /**
- * Hash-chain integrity from `GET /audit/verify`. Three distinct states: `ok` (green), `broken` (red, where), `error`
- * (could not verify — amber, NEVER shown as ok). Loading is neutral.
+ * Hash-chain integrity from `GET /audit/verify`. Distinct states: `ok` (green), `pending` (intact but some attempts
+ * have no outcome yet — amber), `broken` (red, where), `error` (could not verify — amber, NEVER shown as ok).
  */
 import type { VerifyView } from "../api/schemas";
 import { displayId } from "../lib/untrusted";
+import type { Tone } from "./Badges";
 
 export type VerifyState =
   | { readonly state: "loading" }
   | { readonly state: "done"; readonly result: VerifyView; readonly at: string }
   | { readonly state: "error"; readonly message: string };
 
+export type ChainStatus = "loading" | "ok" | "pending" | "broken" | "error";
+
+export function chainStatus(verify: VerifyState): ChainStatus {
+  if (verify.state !== "done") return verify.state;
+  if (!verify.result.ok) return "broken";
+  return verify.result.danglingAttempts > 0 ? "pending" : "ok";
+}
+
+const TONE: Record<ChainStatus, Tone> = {
+  loading: "neutral",
+  ok: "ok",
+  pending: "warn",
+  broken: "danger",
+  error: "warn",
+};
+
+const TONE_CLASS: Record<Tone, string> = {
+  neutral: "",
+  ok: "chip-ok",
+  danger: "chip-solid-danger",
+  warn: "chip-warn",
+  accent: "chip-accent",
+};
+
 export function ChainBadge({ verify, onRefresh }: { verify: VerifyState; onRefresh: () => void }) {
-  let cls: string;
+  const status = chainStatus(verify);
   let label: string;
   let title: string;
   if (verify.state === "loading") {
-    cls = "border-slate-300 text-slate-600 dark:border-slate-600 dark:text-slate-300";
     label = "Chain: checking…";
     title = "Verifying the audit hash chain";
   } else if (verify.state === "error") {
-    cls = "border-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200";
     label = "Chain: unverified";
     title = `Could not verify the audit chain: ${verify.message}`;
   } else if (verify.result.ok && verify.result.danglingAttempts > 0) {
-    // Intact chain, but some money actions have no recorded outcome yet: not all-clear.
-    cls = "border-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200";
     label = `Chain OK · ${String(verify.result.danglingAttempts)} pending outcome`;
     title = `Verified at ${verify.at}. ${String(verify.result.danglingAttempts)} attempt(s) without outcome.`;
   } else if (verify.result.ok) {
-    cls =
-      "border-emerald-500 bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300";
     label = `Chain OK · ${String(verify.result.count)} records`;
     title = `Verified at ${verify.at}. Head ${verify.result.headHash?.slice(0, 12) ?? "-"}…`;
   } else {
     const b = verify.result.brokenAt;
-    cls = "border-red-500 bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300";
     label = `Chain BROKEN at seq ${String(b.seq)}`;
     title = `Tamper evidence: ${displayId(b.reason)} at record ${b.id === null ? "?" : displayId(b.id)}`;
   }
+  const tone = TONE[status];
   return (
     <button
       type="button"
       data-testid="chain-badge"
-      data-state={
-        verify.state !== "done"
-          ? verify.state
-          : !verify.result.ok
-            ? "broken"
-            : verify.result.danglingAttempts > 0
-              ? "pending"
-              : "ok"
-      }
+      data-state={status}
+      data-tone={tone}
       onClick={onRefresh}
       title={`${title} (click to re-verify)`}
-      className={`rounded-full border px-3 py-1 text-xs font-semibold whitespace-nowrap ${cls}`}
+      className={`chip h-8 cursor-pointer px-3.5 ${TONE_CLASS[tone]} hover:brightness-110`}
     >
+      <span
+        aria-hidden="true"
+        className={`h-1.5 w-1.5 rounded-full ${
+          status === "ok"
+            ? "bg-ok"
+            : status === "broken"
+              ? "bg-bg"
+              : status === "loading"
+                ? "bg-faint"
+                : "bg-warn"
+        }`}
+      />
       {label}
     </button>
   );

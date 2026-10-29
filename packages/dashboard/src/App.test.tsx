@@ -87,7 +87,7 @@ describe("App", () => {
     const user = userEvent.setup();
     await user.type(screen.getByLabelText("Admin token"), TOKEN);
     await user.click(screen.getByRole("button", { name: "Connect" }));
-    await screen.findByText("Live timeline");
+    await screen.findByRole("heading", { name: "Live timeline" });
     expect(window.sessionStorage.getItem(TOKEN_STORAGE_KEY)).toBe(TOKEN);
     expect(window.localStorage.getItem(TOKEN_STORAGE_KEY)).toBeNull();
     expect(JSON.stringify(window.localStorage)).not.toContain(TOKEN);
@@ -159,7 +159,12 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Next →" }));
     expect(screen.getByTestId("replay-position").textContent).toBe("Step 2 of 2");
     expect(screen.getByRole("button", { name: "Next →" })).toHaveProperty("disabled", true);
-    expect(screen.getByText(/Executed in this session: ₹500.00/)).toBeTruthy();
+    expect(
+      screen.getAllByText(
+        (_c, el) =>
+          el?.tagName === "P" && /Executed in this session: ₹500\.00/.test(el.textContent),
+      ),
+    ).toHaveLength(1);
   });
 
   it("401 on the stream asks for a new token", async () => {

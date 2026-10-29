@@ -1,11 +1,13 @@
 /**
- * Firewall mode (enforce / shadow) and the kill switch. Both changes need a confirm; the UI only shows the new state
- * once the API confirmed it (no optimistic toggle) and shows every failure. An unreadable mode is shown as unknown.
+ * Firewall mode (enforce / shadow) and the kill switch, as switches. Both changes need a confirm; the UI only shows
+ * the new state once the API confirmed it (no optimistic toggle) and shows every failure. An unreadable mode is
+ * shown as unknown (switch disabled), never as "off".
  */
 import { useState } from "react";
 import { describeError, type ApiClient, type ApiResult } from "../api/client";
 import type { ModeState } from "../api/schemas";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { Switch } from "./Switch";
 
 export type ModeLoad =
   | { readonly state: "loading" }
@@ -43,51 +45,36 @@ export function ModeControls({
   const shadow = known?.shadow;
 
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <button
-        type="button"
-        data-testid="mode-toggle"
-        disabled={known === undefined}
-        onClick={() => {
+    <>
+      <Switch
+        testId="mode-toggle"
+        label="Shadow mode"
+        stateText={
+          shadow === undefined ? "unknown" : shadow ? "on · observe only" : "off · enforcing"
+        }
+        checked={shadow}
+        tone="warn"
+        onToggle={() => {
           setPending({ kind: "mode", mode: shadow === true ? "enforce" : "shadow" });
         }}
-        title="Shadow mode logs what the policy WOULD do but does not enforce it"
-        className={`rounded-full border px-3 py-1 text-xs font-semibold whitespace-nowrap disabled:opacity-60 ${
-          shadow === true
-            ? "border-dashed border-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
-            : "border-slate-300 text-slate-700 dark:border-slate-600 dark:text-slate-200"
-        }`}
-      >
-        Mode: {shadow === undefined ? "unknown" : shadow ? "SHADOW" : "enforce"}
-      </button>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={kill === true}
-        data-testid="kill-switch"
-        disabled={known === undefined}
-        onClick={() => {
+      />
+      <Switch
+        testId="kill-switch"
+        label="Kill switch"
+        stateText={kill === undefined ? "unknown" : kill ? "ON · all blocked" : "off"}
+        checked={kill}
+        tone="danger"
+        onToggle={() => {
           setPending({ kind: "kill", on: kill !== true });
         }}
-        className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold whitespace-nowrap disabled:opacity-60 ${
-          kill === true
-            ? "border-red-600 bg-red-600 text-white"
-            : "border-slate-300 text-slate-700 dark:border-slate-600 dark:text-slate-200"
-        }`}
-      >
-        <span
-          className={`h-2 w-2 rounded-full ${kill === true ? "bg-white" : "bg-slate-400"}`}
-          aria-hidden="true"
-        />
-        Kill switch: {kill === undefined ? "unknown" : kill ? "ON" : "off"}
-      </button>
+      />
       {mode.state === "error" && (
-        <span role="alert" className="text-xs text-red-700 dark:text-red-300">
+        <span role="alert" className="basis-full text-xs text-danger">
           Mode unreadable: {mode.message}
         </span>
       )}
       {error !== undefined && (
-        <span role="alert" className="text-xs text-red-700 dark:text-red-300">
+        <span role="alert" className="basis-full text-xs break-words text-danger">
           {error}
         </span>
       )}
@@ -123,6 +110,6 @@ export function ModeControls({
               : "Policies will be enforced again."}
         </ConfirmDialog>
       )}
-    </div>
+    </>
   );
 }

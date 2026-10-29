@@ -64,56 +64,63 @@ export function SessionReplay({
   );
 
   return (
-    <section
-      aria-labelledby="replay-title"
-      className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
-    >
-      <h2 id="replay-title" className="mb-3 text-base font-semibold">
-        Session replay
-      </h2>
-      <label className="block text-xs text-slate-500 dark:text-slate-400" htmlFor="replay-session">
-        Session
-      </label>
-      <select
-        id="replay-session"
-        value={selected ?? ""}
-        onChange={(e) => {
-          const v = e.target.value;
-          onSelect(v === "" || !SESSION_ID_RE.test(v) ? undefined : v);
-        }}
-        className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 font-mono text-sm dark:border-slate-700 dark:bg-slate-950"
-      >
-        <option value="">Choose a session…</option>
-        {options.map((id) => (
-          <option key={id} value={id}>
-            {displayId(id)}
-          </option>
-        ))}
-      </select>
+    <section aria-labelledby="replay-title" className="card">
+      <div className="card-head">
+        <div className="min-w-0">
+          <p className="eyebrow">Step through one agent run</p>
+          <h2 id="replay-title" className="card-title mt-1.5">
+            Session <em>replay</em>
+          </h2>
+        </div>
+      </div>
+      <div className="px-5 py-4">
+        <label className="eyebrow block" htmlFor="replay-session">
+          Session
+        </label>
+        <select
+          id="replay-session"
+          value={selected ?? ""}
+          onChange={(e) => {
+            const v = e.target.value;
+            onSelect(v === "" || !SESSION_ID_RE.test(v) ? undefined : v);
+          }}
+          className="input mt-2"
+        >
+          <option value="">Choose a session…</option>
+          {options.map((id) => (
+            <option key={id} value={id}>
+              {displayId(id)}
+            </option>
+          ))}
+        </select>
 
-      {load.state === "loading" && <p className="mt-3 text-sm text-slate-500">Loading…</p>}
-      {load.state === "error" && (
-        <p role="alert" className="mt-3 text-sm text-red-700 dark:text-red-300">
-          Could not load the session: {load.message}
-        </p>
-      )}
-      {load.state === "ok" && steps.length === 0 && (
-        <p className="mt-3 text-sm text-slate-500">No money actions in this session.</p>
-      )}
+        {load.state === "loading" && <p className="mt-4 text-sm text-muted">Loading…</p>}
+        {load.state === "error" && (
+          <p role="alert" className="mt-4 text-sm break-words text-danger">
+            Could not load the session: {load.message}
+          </p>
+        )}
+        {load.state === "ok" && steps.length === 0 && (
+          <p className="mt-4 text-sm text-muted">No money actions in this session.</p>
+        )}
+      </div>
       {load.state === "ok" && current !== undefined && (
-        <div className="mt-3">
-          <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="border-t border-line">
+          <div className="flex items-center justify-between gap-2 px-5 pt-4">
             <button
               type="button"
               disabled={step === 0}
               onClick={() => {
                 setStep((s) => Math.max(0, s - 1));
               }}
-              className="rounded-md border border-slate-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-slate-700"
+              className="btn-secondary h-8 px-3 text-xs"
             >
               ← Prev
             </button>
-            <span className="text-sm tabular-nums" data-testid="replay-position">
+            <span
+              className="font-mono text-xs text-muted tabular-nums"
+              data-testid="replay-position"
+            >
               Step {step + 1} of {steps.length}
             </span>
             <button
@@ -122,12 +129,12 @@ export function SessionReplay({
               onClick={() => {
                 setStep((s) => Math.min(steps.length - 1, s + 1));
               }}
-              className="rounded-md border border-slate-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-slate-700"
+              className="btn-secondary h-8 px-3 text-xs"
             >
               Next →
             </button>
           </div>
-          <div className="mb-2 flex flex-wrap gap-1" aria-label="Steps">
+          <div className="flex flex-wrap gap-1 px-5 pt-3 pb-1" aria-label="Steps">
             {steps.map((s, i) => (
               <button
                 key={s.seq}
@@ -137,21 +144,22 @@ export function SessionReplay({
                 onClick={() => {
                   setStep(i);
                 }}
-                className={`h-2.5 w-6 rounded-full ${
+                className={`h-1.5 w-7 transition-opacity ${
                   s.attempt.decision === "deny"
-                    ? "bg-red-500"
+                    ? "bg-danger"
                     : s.attempt.decision === "allow"
-                      ? "bg-emerald-500"
-                      : "bg-sky-500"
-                } ${i === step ? "ring-2 ring-slate-900 ring-offset-1 dark:ring-white dark:ring-offset-slate-900" : "opacity-60"}`}
+                      ? "bg-ok"
+                      : "bg-accent"
+                } ${i === step ? "opacity-100 outline outline-offset-2 outline-fg/70" : "opacity-40 hover:opacity-80"}`}
               />
             ))}
           </div>
-          <ul>
+          <ul className="mt-2 border-y border-line">
             <AttemptRow entry={current} compact />
           </ul>
-          <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-            Executed in this session: {formatPaise(total) ?? "—"}
+          <p className="px-5 py-3 text-xs text-muted">
+            Executed in this session:{" "}
+            <span className="font-mono text-fg">{formatPaise(total) ?? "—"}</span>
             {load.truncated && " (session truncated)"}
           </p>
         </div>

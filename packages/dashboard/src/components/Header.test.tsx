@@ -39,7 +39,7 @@ describe("ChainBadge", () => {
     const b = screen.getByTestId("chain-badge");
     expect(b.dataset.state).toBe("broken");
     expect(b.textContent).toContain("BROKEN at seq 5");
-    expect(b.className).toContain("red");
+    expect(b.dataset.tone).toBe("danger");
   });
 
   it("an error is never shown as ok", () => {
@@ -48,7 +48,7 @@ describe("ChainBadge", () => {
     expect(b.dataset.state).toBe("error");
     expect(b.textContent).toBe("Chain: unverified");
     expect(b.textContent).not.toMatch(/OK/);
-    expect(b.className).not.toContain("emerald");
+    expect(b.dataset.tone).toBe("warn");
   });
 
   it("click re-verifies", async () => {
@@ -109,7 +109,8 @@ describe("ModeControls", () => {
     expect(setMode).toHaveBeenCalledWith("shadow");
     expect(onChanged).not.toHaveBeenCalled();
     expect(screen.getByRole("alert").textContent).toContain("NOT applied");
-    expect(screen.getByTestId("mode-toggle").textContent).toBe("Mode: enforce");
+    expect(screen.getByTestId("mode-toggle").getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByTestId("mode-toggle").textContent).toContain("off · enforcing");
   });
 
   it("an unreadable mode is unknown, not 'off'", () => {
