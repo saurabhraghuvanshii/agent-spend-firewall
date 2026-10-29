@@ -442,7 +442,11 @@ describe("late responses and transport errors (no payload in logs)", () => {
 
   it.each([
     ["context canceled", "ambiguous"],
-    ["BAD_REQUEST_ERROR: The refund amount is invalid", "definite_rejection"],
+    [
+      '{"error":{"code":"BAD_REQUEST_ERROR","description":"The refund amount is invalid"}}',
+      "definite_rejection",
+    ],
+    ["BAD_REQUEST_ERROR: The refund amount is invalid", "ambiguous"],
     ["BAD_REQUEST_ERROR then GATEWAY_ERROR", "ambiguous"],
   ] as const)(
     "a late isError result (%s) carries only its failure classification (%s)",
@@ -485,7 +489,10 @@ describe("late responses and transport errors (no payload in logs)", () => {
       responseFailure({
         jsonrpc: "2.0",
         id: 1,
-        result: { isError: true, content: [{ type: "text", text: "BAD_REQUEST_ERROR" }] },
+        result: {
+          isError: true,
+          content: [{ type: "text", text: '{"error":{"code":"BAD_REQUEST_ERROR"}}' }],
+        },
       }),
     ).toBe("definite_rejection");
   });

@@ -438,3 +438,124 @@ describe("checkResult", () => {
     expect(denyResult("x", "y").isError).toBe(true);
   });
 });
+
+describe("approval service shutdown (D-040)", () => {
+  it("after beginShutdown an approve press starts nothing: the row stays pending, the answer says so", async () => {
+    const id = await created();
+    f.service.beginShutdown();
+    f.service.beginShutdown(); // idempotent
+    const reply = await f.service.decide({
+      approvalId: id,
+      decision: "approved",
+      approver: "telegram:9",
+    });
+    expect(reply.answer).toBe(DECISION_ANSWERS.shuttingDown);
+    expect(reply.answer).toMatch(/NOT executed/);
+    expect(reply.completion).toBeUndefined();
+    await f.service.idle();
+    expect(f.executed).toEqual([]);
+    expect(unwrap(f.store.get(id))?.state).toBe("pending");
+  });
+
+  it("rejections are still recorded during shutdown (they never execute anything)", async () => {
+    const id = await created();
+    f.service.beginShutdown();
+    const reply = await f.service.decide({
+      approvalId: id,
+      decision: "rejected",
+      approver: "telegram:9",
+    });
+    expect(reply.answer).toBe(DECISION_ANSWERS.rejected);
+    await reply.completion;
+    expect(unwrap(f.store.get(id))?.state).toBe("rejected");
+    expect(f.resolved).toEqual([expect.objectContaining({ approvalId: id, decision: "rejected" })]);
+  });
+
+  it("no new approval is created once shutdown has begun", async () => {
+    f.service.beginShutdown();
+    const r = await f.service.create(req());
+    expect(!r.ok && r.error.code).toBe("approval.shutting_down");
+    expect(f.notified).toEqual([]);
+    expect(unwrap(f.store.getByAttempt("att-1"))).toBeUndefined();
+  });
+
+  it("an execution that started BEFORE shutdown is drained by idle()", async () => {
+    const id = await created();
+    let release: (() => void) | undefined;
+    // Hold the execution open until released.
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const service = createApprovalService({
+      store: f.store,
+      clock: { nowMs: () => f.now.ms },
+      notifier: {
+        notify: () => Promise.resolve(ok({ messageId: 1 })),
+        showResolution: () => Promise.resolve(ok(null)),
+      },
+    });
+    service.attach({
+      openCall,
+      pipeline: {
+        executeApproved: async (r) => {
+          await held;
+          return { status: "executed", attemptId: r.attemptId, result: { content: [] } };
+        },
+        resolveApproval: () => ok(null),
+      },
+    });
+    const id2 = unwrap(await service.create(req({ attemptId: "att-2" }))).approvalId;
+    const reply = await service.decide({
+      approvalId: id2,
+      decision: "approved",
+      approver: "telegram:9",
+    });
+    expect(reply.answer).toBe(DECISION_ANSWERS.approved);
+    service.beginShutdown();
+    let idle = false;
+    const drained = service.idle().then(() => {
+      idle = true;
+    });
+    await Promise.resolve();
+    expect(idle).toBe(false);
+    release?.();
+    await drained;
+    expect(unwrap(f.store.get(id2))?.execution?.status).toBe("executed");
+    expect(unwrap(f.store.get(id))?.state).toBe("pending");
+  });
+
+  it("expireAllPending retires every approval still pending (audit closed, message updated); decided rows untouched", async () => {
+    const a = await created();
+    const b = unwrap(await f.service.create(req({ attemptId: "att-2" }))).approvalId;
+    const c = unwrap(await f.service.create(req({ attemptId: "att-3" }))).approvalId;
+    await (
+      await f.service.decide({ approvalId: c, decision: "approved", approver: "telegram:9" })
+    ).completion;
+    f.service.beginShutdown();
+    f.showThrows.value = true; // a failing message update never stops the sweep
+    expect(await f.service.expireAllPending()).toBe(2);
+    expect(unwrap(f.store.get(a))?.state).toBe("expired");
+    expect(unwrap(f.store.get(b))?.state).toBe("expired");
+    expect(unwrap(f.store.get(c))?.state).toBe("approved");
+    expect(f.resolved.map((r) => [r.approvalId, r.decision])).toEqual([
+      [a, "expired"],
+      [b, "expired"],
+    ]);
+    // A press after the sweep changes nothing and executes nothing.
+    const late = await f.service.decide({
+      approvalId: a,
+      decision: "approved",
+      approver: "telegram:9",
+    });
+    expect(late.answer).toBe(DECISION_ANSWERS.shuttingDown);
+    expect(f.executed.map((e) => e.approvalId)).toEqual([c]);
+    expect(await f.service.expireAllPending()).toBe(0);
+  });
+
+  it("expireAllPending with a broken clock expires nothing (the next start's expireStale does it)", async () => {
+    const g = make(true, true);
+    expect(await g.service.expireAllPending()).toBe(0);
+    expect(g.logs.some((l) => l.includes("clock unavailable"))).toBe(true);
+    g.store.close();
+  });
+});

@@ -7,9 +7,11 @@
  * gateway / server error, a network error, any text we don't recognise — is AMBIGUOUS: Razorpay may still be
  * processing (or have completed) the POST. Only `definite_rejection` may ever lead to `not_happened`.
  *
- * TODO(T015): the exact error text the Razorpay MCP server returns for a rejected refund must be confirmed live.
- * Until then this classifier may never return `definite_rejection` in practice, which means retries effectively
- * never fire and such actions are flagged for a human instead — the fail-safe direction.
+ * T015 (D-038): the match is PINNED to Razorpay's JSON error envelope — the whole text must be one JSON object with
+ * a top-level `error.code` string in the allowlist — so third-party text echoed in an error (notes, descriptions)
+ * can never reach the structured position. The live error text of the Razorpay MCP server is still to be confirmed
+ * by `examples/support-agent` `verify-live`; if it isn't this envelope, this classifier never returns
+ * `definite_rejection` in practice: retries never fire and such actions are flagged for a human (fail safe).
  *
  * Only the classification is returned; the body is never kept or logged.
  */
@@ -33,17 +35,30 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** Classify error text. Empty / oversized / unrecognised ⇒ ambiguous. */
+/**
+ * Classify error text (T015, D-038: pinned shape). Definite rejection ONLY when, after the ambiguous-wording check,
+ * the ENTIRE text parses as a single JSON object whose top-level `error` is an object whose `code` is a string in
+ * `DEFINITE_REJECTION_CODES` (exact, case-sensitive) — Razorpay's API error envelope
+ * `{"error":{"code":"BAD_REQUEST_ERROR","description":…}}`. A code anywhere else (a leading token, a nested object,
+ * a description, agent notes echoed back, text around the JSON) proves nothing. Empty / oversized / unrecognised ⇒
+ * ambiguous.
+ */
 export function classifyFailureText(text: string): Exclude<UpstreamFailure, "none"> {
   if (text.length === 0 || text.length > MAX_FAILURE_TEXT) return "ambiguous";
   if (AMBIGUOUS_WORDING.test(text)) return "ambiguous";
-  for (const code of DEFINITE_REJECTION_CODES) {
-    // Only in a structured position — the JSON error `"code": "<CODE>"` or the leading token of the text. Anywhere
-    // else (e.g. agent-supplied notes / description echoed back in an error) it proves nothing.
-    if (new RegExp(`"code"\\s*:\\s*"${code}"`).test(text)) return "definite_rejection";
-    if (new RegExp(`^\\s*${code}\\b`).test(text)) return "definite_rejection";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Not a JSON document (plain text, a prefix + JSON, …): nothing structured to trust.
+    return "ambiguous";
   }
-  return "ambiguous";
+  if (!isRecord(parsed)) return "ambiguous";
+  const error = parsed["error"];
+  if (!isRecord(error)) return "ambiguous";
+  const code = error["code"];
+  if (typeof code !== "string") return "ambiguous";
+  return DEFINITE_REJECTION_CODES.includes(code) ? "definite_rejection" : "ambiguous";
 }
 
 /** Max depth walked by `containsRejectionCode` (deeper ⇒ treated as containing one: fail closed). */
@@ -71,21 +86,18 @@ export function containsRejectionCode(value: unknown, depth = 0): boolean {
 
 /**
  * Classify an MCP `tools/call` result (raw JSON-RPC `result` or a `CallToolResult`): `isError !== true` ⇒ `none`;
- * otherwise the concatenated text content is classified (no text content ⇒ ambiguous).
+ * otherwise the result must hold EXACTLY ONE text item, whose text is classified by `classifyFailureText`. No
+ * content, several items, or non-text content ⇒ ambiguous.
  */
 export function classifyToolResultFailure(result: unknown): UpstreamFailure {
   if (!isRecord(result) || result["isError"] !== true) return "none";
   const content = result["content"];
-  if (!Array.isArray(content)) return "ambiguous";
-  let text = "";
-  for (const item of content) {
-    if (!isRecord(item) || item["type"] !== "text" || typeof item["text"] !== "string") {
-      return "ambiguous";
-    }
-    text += `${item["text"]}\n`;
-    if (text.length > MAX_FAILURE_TEXT) return "ambiguous";
+  if (!Array.isArray(content) || content.length !== 1) return "ambiguous";
+  const item: unknown = content[0];
+  if (!isRecord(item) || item["type"] !== "text" || typeof item["text"] !== "string") {
+    return "ambiguous";
   }
-  return classifyFailureText(text.trim());
+  return classifyFailureText(item["text"]);
 }
 
 /** Combine two pieces of evidence: any ambiguity wins; else any definite rejection; else none. */

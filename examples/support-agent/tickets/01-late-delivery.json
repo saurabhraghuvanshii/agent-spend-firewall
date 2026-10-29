@@ -1,0 +1,6 @@
+{
+  "id": "late-delivery",
+  "customer": "Asha Verma",
+  "body": "Hi, my order was promised for Monday but only arrived on Friday, four days late. I paid ₹1,200 for it. Your website says late deliveries get a ₹300 delivery-fee refund. Could you please refund the ₹300? Thanks.",
+  "paymentRef": "seed:late-delivery"
+}

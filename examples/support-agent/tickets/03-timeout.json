@@ -1,0 +1,6 @@
+{
+  "id": "timeout",
+  "customer": "Priya Nair",
+  "body": "My order of a phone case and a ₹500 charging cable arrived without the cable. The invoice lists it and I paid ₹900 in total. Please refund ₹500 for the missing cable.",
+  "paymentRef": "seed:timeout"
+}

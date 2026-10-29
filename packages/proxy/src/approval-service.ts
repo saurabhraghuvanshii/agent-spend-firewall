@@ -15,6 +15,11 @@
  *    `not_forwarded` outcome). Approved ⇒ `pipeline.executeApproved` in the background (chained `approval` record
  *    first, then locks, re-evaluation, forward, T010 verification); its status is stored and shown on the message.
  * 3. `sweepExpired` (timer) and `firewall_check_approval` (agent poll) expire overdue approvals the same way.
+ * 4. Shutdown (D-040): `beginShutdown` stops the service from STARTING anything new — an approve press (Telegram or
+ *    API) after it is refused without touching the row (answer `shuttingDown`), and `create` fails (the pipeline
+ *    records `approval.unavailable`). Rejections are still recorded (they never execute anything). Executions that
+ *    already started run to completion (`idle`); then `expireAllPending` retires every still-pending approval
+ *    (audit outcome `approval.expired`, message updated), so nothing is left that a later press could execute.
  *
  * Fail closed: an unattached service (no pipeline yet), a store error or a clock error never executes anything.
  */
@@ -83,6 +88,16 @@ export interface ApprovalService extends ApprovalPort {
   readonly checkTool: LocalTool;
   /** Resolves when no approved action is executing (tests / shutdown). */
   idle(): Promise<void>;
+  /**
+   * Shutdown has begun: from now on no approved action is STARTED (approve presses are refused, the row stays
+   * pending) and no new approval is created. Idempotent; cannot be undone.
+   */
+  beginShutdown(): void;
+  /**
+   * Shutdown: force-expire every approval this process still holds pending (audit outcome `approval.expired`,
+   * notification updated). Call after `beginShutdown` and `idle`, before the pipeline closes. Returns how many.
+   */
+  expireAllPending(): Promise<number>;
 }
 
 interface PendingArgs {
@@ -95,6 +110,8 @@ export const DECISION_ANSWERS = {
   expired: "This approval has expired (treated as rejected). Nothing was executed.",
   alreadyDecided: "This approval was already decided. Nothing changed.",
   unavailable: "The firewall could not process this decision; nothing was executed.",
+  shuttingDown:
+    "The firewall is shutting down, so this was NOT executed. The approval will expire (treated as rejected).",
 } as const;
 
 export const CHECK_MESSAGES = {
@@ -126,6 +143,7 @@ export function createApprovalService(o: ApprovalServiceOptions): ApprovalServic
   const pending = new Map<string, PendingArgs>();
   const inflight = new Set<Promise<void>>();
   let deps: ApprovalServiceDeps | undefined;
+  let shuttingDown = false;
 
   const nowMs = (): number | undefined => {
     try {
@@ -237,6 +255,12 @@ export function createApprovalService(o: ApprovalServiceOptions): ApprovalServic
   const decideNow = (d: DecisionRequest): DecisionReply => {
     const now = nowMs();
     if (deps === undefined || now === undefined) return { answer: DECISION_ANSWERS.unavailable };
+    if (shuttingDown && d.decision === "approved") {
+      // Fail closed: an execution started now could be cut off mid-call by the process exit. The row stays pending
+      // and is expired by `expireAllPending` (or by the next start's `expireStale`).
+      log(`approval ${d.approvalId}: approve refused, the firewall is shutting down; not executed`);
+      return { answer: DECISION_ANSWERS.shuttingDown };
+    }
     const t = o.store.decide(d.approvalId, d.decision, d.approver, now);
     if (!t.ok) {
       log(`approval ${d.approvalId}: decision failed (${t.error.code})`);
@@ -278,6 +302,9 @@ export function createApprovalService(o: ApprovalServiceOptions): ApprovalServic
 
   const service: ApprovalService = {
     async create(req) {
+      if (shuttingDown) {
+        return err("approval.shutting_down", "the firewall is shutting down");
+      }
       const now = nowMs();
       if (now === undefined) return err("approval.clock_failed", "the clock is unavailable");
       if (!Number.isSafeInteger(req.timeoutMin) || req.timeoutMin < 1 || req.timeoutMin > 1440) {
@@ -390,6 +417,39 @@ export function createApprovalService(o: ApprovalServiceOptions): ApprovalServic
 
     idle: async () => {
       while (inflight.size > 0) await Promise.all([...inflight]);
+    },
+
+    beginShutdown() {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log("approvals: shutting down; approvals are no longer executed");
+    },
+
+    async expireAllPending() {
+      const now = nowMs();
+      if (now === undefined) {
+        log("approvals: shutdown expiry skipped (clock unavailable); the next start expires them");
+        return 0;
+      }
+      let n = 0;
+      for (const approvalId of [...pending.keys()]) {
+        const t = o.store.expire(approvalId, now, true);
+        if (!t.ok) {
+          log(`approval ${approvalId}: shutdown expiry failed (${t.error.code})`);
+          continue;
+        }
+        if (!t.value.won) continue;
+        log(`approval ${approvalId} expired at shutdown (not executed)`);
+        n++;
+        try {
+          await closeOnAudit(t.value.row, "expired");
+        } catch (e: unknown) {
+          log(
+            `approval ${approvalId}: shutdown close threw ${e instanceof Error ? e.name : typeof e}`,
+          );
+        }
+      }
+      return n;
     },
 
     checkTool: {

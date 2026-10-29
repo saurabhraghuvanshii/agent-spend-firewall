@@ -1,0 +1,25 @@
+{
+  "name": "@asf/support-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent": "tsx --conditions=@asf/source src/run.ts",
+    "seed": "tsx --conditions=@asf/source src/seed.ts",
+    "verify-live": "tsx --conditions=@asf/source src/verify-live.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.312",
+    "@asf/core": "workspace:*",
+    "@asf/proxy": "workspace:*",
+    "razorpay": "^2.9.8",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@asf/policies": "workspace:*",
+    "tsx": "^4.23.15",
+    "vitest": "^4.1.12"
+  }
+}

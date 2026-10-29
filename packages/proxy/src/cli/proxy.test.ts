@@ -31,6 +31,7 @@ import {
   parseTimeoutMs,
   resolveProxyConfig,
   startProxy,
+  startupConfigLine,
   startupDegradation,
   stderrLogger,
   type ConfigDeps,
@@ -973,6 +974,64 @@ describe("T010 settings: ASF_MONEY_CALL_TIMEOUT_MS / ASF_VERIFY_WAIT_MS (shell e
     expect(bad.ok === false && bad.error.code).toBe("proxy.bad_verify_wait");
     const bad2 = resolveProxyConfig({ ...SHELL, ASF_MONEY_CALL_TIMEOUT_MS: "999999" }, deps());
     expect(bad2.ok === false && bad2.error.code).toBe("proxy.bad_money_timeout");
+  });
+});
+
+describe("T015 demo fault: ASF_DEMO_DELAY_REFUND_MS (shell env only)", () => {
+  it("unset ⇒ off (no field, no warning in the config line)", () => {
+    const r = resolveProxyConfig(SHELL, deps());
+    expect(r.ok && r.value.demoDelayRefundMs).toBeUndefined();
+    expect(r.ok && startupConfigLine(r.value)).not.toMatch(/DEMO/);
+  });
+
+  it("a shell value turns it on and shows up in the startup config line", () => {
+    const r = resolveProxyConfig({ ...SHELL, ASF_DEMO_DELAY_REFUND_MS: "15000" }, deps());
+    expect(r.ok && r.value.demoDelayRefundMs).toBe(15_000);
+    expect(r.ok && startupConfigLine(r.value)).toMatch(
+      /DEMO FAULT: first create_refund response delayed 15000 ms/,
+    );
+  });
+
+  it("a value only in .env is ignored with a note", () => {
+    const r = resolveProxyConfig(
+      SHELL,
+      deps({ [`${ROOT}/.env`]: "ASF_DEMO_DELAY_REFUND_MS=15000\n" }),
+    );
+    expect(r.ok && r.value.demoDelayRefundMs).toBeUndefined();
+    expect(r.ok && r.value.notes.join(" ")).toMatch(
+      /ASF_DEMO_DELAY_REFUND_MS from \.env is ignored/,
+    );
+  });
+
+  it.each(["999", "120001", "abc", "1e4", "-1"])("bad shell value %j refuses to start", (v) => {
+    const r = resolveProxyConfig({ ...SHELL, ASF_DEMO_DELAY_REFUND_MS: v }, deps());
+    expect(r.ok === false && r.error.code).toBe("proxy.bad_demo_delay");
+  });
+
+  it("startProxy wraps the upstream: the first refund's answer is held back (timeout ⇒ verified, not retried)", async () => {
+    const fake = fakeUpstream();
+    const cfg = resolveProxyConfig({ ...SHELL, ASF_DEMO_DELAY_REFUND_MS: "1000" }, deps());
+    if (!cfg.ok) throw new Error("config");
+    const logs: string[] = [];
+    const running = startProxy({
+      config: { ...cfg.value, cachedTools: [] },
+      logger: (l) => logs.push(l),
+      firewall: memFirewall(),
+      factory: fake.factory,
+    });
+    try {
+      await running.upstream.connect();
+      const r = await running.upstream.callTool(
+        "create_refund",
+        { payment_id: "pay_DEMOabcdef", amount: 100 },
+        { timeoutMs: 50 },
+      );
+      expect(r).toMatchObject({ kind: "error", error: "upstream_timeout", forwarded: true });
+      expect(fake.calls.map((c) => c.name)).toEqual(["create_refund"]);
+      expect(logs.join("\n")).toMatch(/DEMO FAULT: holding back the first create_refund response/);
+    } finally {
+      await running.shutdown();
+    }
   });
 });
 

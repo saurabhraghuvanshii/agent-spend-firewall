@@ -682,7 +682,11 @@ describe("startDegraded (audit chain failed verification at startup)", () => {
 describe("upstream failures are audited", () => {
   it("tool-level error (isError): definite rejection ⇒ upstream.rejected; anything else ⇒ upstream.tool_error", async () => {
     for (const [text, errorCode] of [
-      ["BAD_REQUEST_ERROR", "upstream.rejected"],
+      [
+        '{"error":{"code":"BAD_REQUEST_ERROR","description":"invalid amount"}}',
+        "upstream.rejected",
+      ],
+      ["BAD_REQUEST_ERROR", "upstream.tool_error"],
       ["context canceled", "upstream.tool_error"],
       ["BAD_REQUEST_ERROR after SERVER_ERROR", "upstream.tool_error"],
     ] as const) {

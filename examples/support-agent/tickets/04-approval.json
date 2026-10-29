@@ -1,0 +1,6 @@
+{
+  "id": "approval",
+  "customer": "Vikram Singh",
+  "body": "The ₹4,500 blender in my order arrived broken (cracked jar, attached photos to the earlier email) and your courier picked it up yesterday. I paid ₹6,000 in total; I am keeping the other items. Please refund ₹4,500 for the blender.",
+  "paymentRef": "seed:approval"
+}

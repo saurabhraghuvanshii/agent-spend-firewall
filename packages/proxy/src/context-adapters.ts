@@ -329,7 +329,11 @@ function topLevelAmount(args: unknown): number | undefined {
 // Razorpay payment lookup (via upstream MCP `fetch_payment`)
 // ---------------------------------------------------------------------------------------------------------------
 
-const paymentSchema = z
+/**
+ * Shape a `fetch_payment` result must have for the firewall's payment lookups (exported for T015's live check).
+ * Extra keys are allowed; amounts are integer paise.
+ */
+export const razorpayPaymentSchema = z
   .looseObject({
     id: z.string(),
     status: z.string(),
@@ -426,7 +430,7 @@ export function createRazorpayLookup(o: AdapterOpts): RazorpayLookupPort {
         "payment",
       );
       if (!json.ok) return json;
-      const parsed = paymentSchema.safeParse(json.value);
+      const parsed = razorpayPaymentSchema.safeParse(json.value);
       if (!parsed.success) return lookupErr("malformed", "payment lookup result failed validation");
       const p = parsed.data;
       if (p.id !== id)
@@ -463,7 +467,8 @@ export interface OrderLookupPort {
   order(id: string): Promise<Result<OrderInfo>>;
 }
 
-const orderSchema = z.looseObject({
+/** Shape a `fetch_order` result must have for the firewall's order lookups (exported for T015's live check). */
+export const razorpayOrderSchema = z.looseObject({
   id: z.string(),
   amount: z.int().nonnegative(),
   currency: z.string(),
@@ -486,7 +491,7 @@ export function createOrderLookup(o: AdapterOpts): OrderLookupPort {
         "order",
       );
       if (!json.ok) return json;
-      const parsed = orderSchema.safeParse(json.value);
+      const parsed = razorpayOrderSchema.safeParse(json.value);
       if (!parsed.success) return lookupErr("malformed", "order lookup result failed validation");
       const p = parsed.data;
       if (p.id !== id) return lookupErr("id_mismatch", "order lookup returned a different order");

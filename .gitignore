@@ -10,3 +10,7 @@ dist/
 .claude/settings.local.json
 coverage/
 .plan
+
+# T015 demo agent: test-mode payment ids from `seed collect` (machine-specific)
+examples/support-agent/seed-output.json
+examples/support-agent/seed-output.json.*.tmp

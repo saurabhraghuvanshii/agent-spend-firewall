@@ -66,7 +66,13 @@ export { TOOL_CLASSES, classifyTool, isMoneyTool, type ToolClass } from "./tool-
 export {
   DEFAULT_DISCOVERY_TIMEOUT_MS,
   DEFAULT_RAZORPAY_MCP_IMAGE,
+  DOCKER_ENV_PASSTHROUGH,
+  buildChildEnv,
   checkTestKeys,
+  redactSecrets,
+  validateImageRef,
+  type EnvLike,
+  type TestKeys,
   discoverTools,
   toolsFileSchema,
   type DiscoveredTool,
@@ -82,6 +88,7 @@ export {
   Upstream,
   backoffDelayMs,
   dockerUpstreamFactory,
+  upstreamContainerName,
   upstreamDockerRunArgs,
   type CallOptions,
   type LateResponse,
@@ -157,6 +164,9 @@ export {
   MAX_LOOKUP_TEXT_CHARS,
   ORDER_ID_PATTERN,
   PAYMENT_ID_PATTERN,
+  parseSingleJson,
+  razorpayOrderSchema,
+  razorpayPaymentSchema,
   systemClock,
   systemTimer,
   type ActivitySource,
@@ -190,6 +200,19 @@ export {
   type PreCheckShadow,
   type PreCheckVerdict,
 } from "./interceptor.js";
+export {
+  DEMO_DELAY_ENV,
+  DEMO_DELAYED_TOOL,
+  MAX_DEMO_DELAY_MS,
+  MIN_DEMO_DELAY_MS,
+  demoFaultFactory,
+  demoFaultWarnings,
+  parseDemoDelayMs,
+  type DemoFaultOptions,
+} from "./demo-fault.js";
+export { CHECK_APPROVAL_TOOL } from "./approval-service.js";
+export { findRepoRoot, mergeEnv } from "./cli/discover-tools.js";
+export { escapeForTerminal } from "./cli/audit-verify.js";
 export {
   createModePreCheck,
   createModeStore,

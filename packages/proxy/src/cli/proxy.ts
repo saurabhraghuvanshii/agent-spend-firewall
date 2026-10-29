@@ -23,6 +23,9 @@
  * - `ASF_VERIFY_WAIT_MS` — SHELL env only (T010): how long a timed-out refund waits for upstream's late answer before
  *   deciding (retry once only after a late FAILURE answer + a complete refund list without the marker), integer ms
  *   1000..120000, default 15000 ⇒ else exit 2.
+ * - `ASF_DEMO_DELAY_REFUND_MS` — SHELL env only, DEMO ONLY (T015): delay the FIRST `create_refund` response from
+ *   upstream by this many ms (integer 1000..120000 ⇒ else exit 2) to demo a timeout mid-refund (`demo-fault.ts`).
+ *   Logged as a WARNING at startup. Unset ⇒ off.
  *
  * - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (T011; shell or `.env`): both set ⇒ `require_approval` actions are sent to
  *   that Telegram chat with Approve / Reject buttons, approved ones execute through the normal money path, and the
@@ -125,6 +128,13 @@ import {
   DEFAULT_LOCK_WAIT_MS,
   type MoneyPipeline,
 } from "../interceptor.js";
+import {
+  DEMO_DELAY_ENV,
+  DEMO_DELAYED_TOOL,
+  demoFaultFactory,
+  demoFaultWarnings,
+  parseDemoDelayMs,
+} from "../demo-fault.js";
 import { createModePreCheck, createModeStore, describeMode, type ModeStore } from "../modes.js";
 import { loadPolicy, resolvePolicyPath } from "../policy-loader.js";
 import { redactSensitiveResult } from "../result-redaction.js";
@@ -143,7 +153,9 @@ import {
   type TestKeys,
 } from "../tool-discovery.js";
 import {
+  DEFAULT_VERIFY_LOOKUP_TIMEOUT_MS,
   DEFAULT_VERIFY_WAIT_MS,
+  MAX_REFUND_PAGES,
   MAX_VERIFY_WAIT_MS,
   MIN_VERIFY_WAIT_MS,
   type ReconcileSummary,
@@ -173,8 +185,32 @@ import { DEFAULT_TOOLS_OUT, findRepoRoot, mergeEnv } from "./discover-tools.js";
 
 export const MIN_UPSTREAM_TIMEOUT_MS = 1_000;
 export const MAX_UPSTREAM_TIMEOUT_MS = 600_000;
-/** Upper bound for graceful shutdown (closing upstream + `docker rm -f`) before a forced exit. */
+/** Base budget of a graceful shutdown (closing the agent channel, upstream + `docker rm -f`). */
 export const SHUTDOWN_TIMEOUT_MS = 20_000;
+
+/**
+ * Grace before a forced exit (D-040). Shutdown first drains money actions already in flight (an approved action that
+ * started executing before shutdown began), so the budget must cover the worst case of ONE money action — otherwise a
+ * forced exit could cut it off after it reached Razorpay and before its audit outcome was written:
+ * global + resource lock waits, the money call, verify-before-retry (up to `MAX_REFUND_PAGES` lookups, the late-answer
+ * wait, a second verification), the single T010 retry (another money call + its verification), plus the base budget.
+ * With the defaults: 20 s + 2 × 5 s + 2 × 10 s + 15 s + 3 × 5 × 5 s = 140 s. Only an action in flight uses it; an
+ * idle proxy still exits at once. Only APPROVED executions are drained: an agent-initiated money call in flight when
+ * the agent channel closes is cancelled by the MCP SDK and not awaited, so its outcome may be left to the next start's
+ * reconciliation (never `not_happened`; T025).
+ */
+export function shutdownGraceMs(
+  c: Pick<ProxyConfig, "moneyCallTimeoutMs" | "verifyWaitMs" | "lockWaitMs">,
+): number {
+  const verification = MAX_REFUND_PAGES * DEFAULT_VERIFY_LOOKUP_TIMEOUT_MS;
+  return (
+    SHUTDOWN_TIMEOUT_MS +
+    2 * c.lockWaitMs +
+    2 * c.moneyCallTimeoutMs +
+    c.verifyWaitMs +
+    3 * verification
+  );
+}
 /**
  * Max bytes of one buffered (not yet newline-terminated) agent message on stdio. Tool arguments are small; the SDK
  * default is 10 MiB. Exceeding it makes the SDK drop the buffer and close the agent channel.
@@ -190,6 +226,7 @@ export const SHELL_ONLY_SETTINGS = [
   "ASF_VERIFY_WAIT_MS",
   "ASF_API_APPROVALS",
   "ASF_ADMIN_TOKEN_FILE",
+  "ASF_DEMO_DELAY_REFUND_MS",
 ] as const;
 export const MIN_LOCK_WAIT_MS = 1;
 export const MAX_LOCK_WAIT_MS_CONFIG = 60_000;
@@ -215,6 +252,11 @@ export interface ProxyConfig {
   readonly moneyCallTimeoutMs: number;
   /** `ASF_VERIFY_WAIT_MS` (shell env only, T010). */
   readonly verifyWaitMs: number;
+  /**
+   * T015 DEMO-ONLY: `ASF_DEMO_DELAY_REFUND_MS` (shell env only). Set ⇒ the first `create_refund` response is delayed
+   * this long (`demo-fault.ts`); `undefined` ⇒ no fault injection.
+   */
+  readonly demoDelayRefundMs?: number;
   /** T013: dashboard API (`ASF_API_PORT` set); `undefined` ⇒ no HTTP listener. */
   readonly api?: ApiConfig;
   /** T011: Telegram approvals (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`); `undefined` ⇒ in-memory stub. SECRET token. */
@@ -547,6 +589,8 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
   if (!moneyTimeout.ok) return moneyTimeout;
   const verifyWait = parseVerifyWaitMs(shellValue("ASF_VERIFY_WAIT_MS"));
   if (!verifyWait.ok) return verifyWait;
+  const demoDelay = parseDemoDelayMs(shellValue(DEMO_DELAY_ENV));
+  if (!demoDelay.ok) return demoDelay;
   const telegram = parseTelegramConfig(env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"]);
   if (!telegram.ok) return telegram;
   const api = parseApiConfig(env, { shell: shellValue });
@@ -578,10 +622,20 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
     duplicateWindowMs: duplicateWindow.value,
     moneyCallTimeoutMs: moneyTimeout.value,
     verifyWaitMs: verifyWait.value,
+    ...(demoDelay.value === undefined ? {} : { demoDelayRefundMs: demoDelay.value }),
     ...(telegram.value === undefined ? {} : { telegram: telegram.value }),
     ...(api.value === undefined ? {} : { api: api.value }),
     notes,
   });
+}
+
+/** The startup config log line (secret-free). Includes the DEMO fault flag when it is on. */
+export function startupConfigLine(c: ProxyConfig): string {
+  const demo =
+    c.demoDelayRefundMs === undefined
+      ? ""
+      : `; DEMO FAULT: first ${DEMO_DELAYED_TOOL} response delayed ${String(c.demoDelayRefundMs)} ms`;
+  return `upstream image ${c.image}; call timeout ${String(c.callTimeoutMs)} ms; money call timeout ${String(c.moneyCallTimeoutMs)} ms; verify wait ${String(c.verifyWaitMs)} ms${demo}`;
 }
 
 /** What the money pipeline needs from startup: a compiled deny-by-default policy and a writable audit store. */
@@ -795,7 +849,7 @@ export interface StartProxyOptions {
 export function startProxy(opts: StartProxyOptions): RunningProxy {
   const { config, logger } = opts;
   const redact: Redactor = (s) => redactSecrets(s, config.keys);
-  const factory =
+  const baseFactory =
     opts.factory ??
     dockerUpstreamFactory({
       image: config.image,
@@ -805,6 +859,19 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
       redact,
       logger,
     });
+  // T015 DEMO-ONLY fault injection (shell `ASF_DEMO_DELAY_REFUND_MS`); off unless explicitly configured.
+  const demoDelayMs = config.demoDelayRefundMs;
+  const factory =
+    demoDelayMs === undefined
+      ? baseFactory
+      : demoFaultFactory(baseFactory, {
+          delayMs: demoDelayMs,
+          onDelayed: () => {
+            logger(
+              `WARNING: DEMO FAULT: holding back the first ${DEMO_DELAYED_TOOL} response for ${String(demoDelayMs)} ms`,
+            );
+          },
+        });
   const upstream = new Upstream({
     factory,
     logger,
@@ -898,6 +965,8 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
     pipeline,
     reconciled,
     shutdown: () => {
+      // D-040: synchronously, before anything awaits — no approval may START executing once shutdown has begun.
+      wiring?.service.beginShutdown();
       shuttingDown ??= (async () => {
         try {
           await proxy.close();
@@ -907,6 +976,10 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
         try {
           if (sweep !== undefined) clearInterval(sweep);
           await wiring?.telegram?.stop();
+          // Executions that started before shutdown finish (bounded by `shutdownGraceMs`); then nothing pending
+          // is left that a later press could execute.
+          await wiring?.service.idle();
+          await wiring?.service.expireAllPending();
           await wiring?.service.idle();
           pipeline.close();
           await upstream.close();
@@ -1005,9 +1078,16 @@ async function main(): Promise<void> {
     return;
   }
   for (const n of config.value.notes) logger(`note: ${n}`);
-  logger(
-    `upstream image ${config.value.image}; call timeout ${String(config.value.callTimeoutMs)} ms; money call timeout ${String(config.value.moneyCallTimeoutMs)} ms; verify wait ${String(config.value.verifyWaitMs)} ms`,
-  );
+  logger(startupConfigLine(config.value));
+  if (config.value.demoDelayRefundMs !== undefined) {
+    for (const w of demoFaultWarnings(
+      config.value.demoDelayRefundMs,
+      config.value.moneyCallTimeoutMs,
+      config.value.verifyWaitMs,
+    )) {
+      logger(w);
+    }
+  }
   const firewall = await openFirewall(config.value);
   if (!firewall.ok) {
     logger(`error: ${firewall.error.message} (${firewall.error.code})`);
@@ -1067,14 +1147,19 @@ async function main(): Promise<void> {
   const redact: Redactor = (s) => redactSecrets(s, config.value.keys);
 
   let exiting = false;
+  const graceMs = shutdownGraceMs(config.value);
   const exit = (why: string, code: 0 | 1): void => {
     if (exiting) return;
     exiting = true;
-    logger(`shutting down (${why})`);
+    logger(
+      `shutting down (${why}); new approvals are no longer executed; waiting up to ${String(graceMs)} ms for actions in flight`,
+    );
     const force = setTimeout(() => {
-      logger("shutdown timed out; exiting (check: docker ps --filter name=asf-upstream-)");
+      logger(
+        "shutdown timed out; exiting (check: docker ps --filter name=asf-upstream-; an action in flight may need reconciling at the next start)",
+      );
       process.exit(code === 0 ? 1 : code);
-    }, SHUTDOWN_TIMEOUT_MS);
+    }, graceMs);
     force.unref();
     void Promise.allSettled([apiServer?.close(), running.shutdown()]).finally(() => {
       process.exit(code);

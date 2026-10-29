@@ -68,6 +68,8 @@ const TOOLS = (
 const REASON = "Customer cust_123 was double charged for order_456; refunding it.";
 const PAY = "pay_FAILabcdef";
 const A1 = { payment_id: PAY, amount: 5_000 };
+/** Razorpay's API error envelope: the only text that proves a rejection (D-038). */
+const REJECTION_TEXT = '{"error":{"code":"BAD_REQUEST_ERROR","description":"invalid amount"}}';
 
 function compiled(spec: PolicySpec): CompiledPolicy {
   const c = compilePolicy(spec);
@@ -166,7 +168,7 @@ const executesNoAnswer =
   };
 const failsLate = (delayMs: number) => (): ScriptedReply => ({
   delayMs,
-  result: { isError: true, content: [{ type: "text", text: "BAD_REQUEST_ERROR: try later" }] },
+  result: { isError: true, content: [{ type: "text", text: REJECTION_TEXT }] },
 });
 const hangs = (): ScriptedReply => ({ never: true });
 const executesLate =
@@ -520,11 +522,11 @@ describe("timeout ⇒ verify before anything else", () => {
   it("a tool error (isError) with no marker in a complete list ⇒ settled not_happened; upstream error returned; no retry", async () => {
     const h = await setup();
     h.world.refundScript.push(() => ({
-      result: { isError: true, content: [{ type: "text", text: "BAD_REQUEST_ERROR" }] },
+      result: { isError: true, content: [{ type: "text", text: REJECTION_TEXT }] },
     }));
     const r = await refund(h, A1);
     expect(r.isError).toBe(true);
-    expect(r.content[0]).toMatchObject({ type: "text", text: "BAD_REQUEST_ERROR" });
+    expect(r.content[0]).toMatchObject({ type: "text", text: REJECTION_TEXT });
     expect(rows(h.store).verifications).toEqual([
       expect.objectContaining({
         trigger: "upstream_error",
@@ -616,7 +618,10 @@ describe("only a DEFINITE Razorpay rejection proves non-execution (security revi
   it("late BAD_REQUEST_ERROR + marker absent ⇒ exactly one retry", async () => {
     const h = await setup();
     h.world.refundScript.push(
-      lateToolError(80, "BAD_REQUEST_ERROR: The id provided does not exist"),
+      lateToolError(
+        80,
+        '{"error":{"code":"BAD_REQUEST_ERROR","description":"The id provided does not exist"}}',
+      ),
     );
     const r = await refund(h, A1);
     expect(r.isError).not.toBe(true);
@@ -721,7 +726,7 @@ describe("only a DEFINITE Razorpay rejection proves non-execution (security revi
     h.world.refundScript.push(() => ({
       result: {
         isError: true,
-        content: [{ type: "text", text: "BAD_REQUEST_ERROR: invalid amount" }],
+        content: [{ type: "text", text: REJECTION_TEXT }],
       },
     }));
     const r = await refund(h, A1);

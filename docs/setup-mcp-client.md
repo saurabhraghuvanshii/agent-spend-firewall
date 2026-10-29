@@ -46,6 +46,7 @@ Optional settings:
 | `ASF_AUDIT_DB`              | `data/audit.db`       | **Shell environment only** (a value only in `.env` is ignored with a note). Audit log SQLite file; must be **inside `<repo>/data/`** (relative paths resolve against the repo root; the parent directory's real path is checked, and the file must not be a symlink) ⇒ else exit 2. `<repo>/data/` is created if missing; other subdirectories must already exist. Can't be opened ⇒ exit 2. |
 | `ASF_LOCK_WAIT_MS`          | `5000`                | Max wait (1–60000 ms) for the money-path locks; a call that waits longer is denied `firewall.busy`.                                                                                                                                                                                                                                                                                          |
 | `ASF_DUPLICATE_WINDOW_MS`   | `600000`              | **Shell environment only** (a value only in `.env` is ignored with a note). How long (60000–86400000 ms) an executed or possibly executed money action blocks an identical one (`firewall.duplicate`); in-flight actions and pending approvals block for 24 h regardless. Out of range ⇒ exit 2.                                                                                             |
+| `ASF_DEMO_DELAY_REFUND_MS`  | unset (off)           | **Shell environment only. DEMO ONLY.** Delays the FIRST `create_refund` response from Razorpay by this many ms (1000–120000 ⇒ else exit 2) to demo a timeout mid-refund; see "Demo fault injection" below. Logged as a `WARNING` at startup. Never set it for real use.                                                                                                                      |
 | `ASF_RAZORPAY_MCP_IMAGE`    | pinned digest         | Image override. Read from the **shell** environment only (ignored in `.env`).                                                                                                                                                                                                                                                                                                                |
 | `DOCKER_HOST`, …            | —                     | Docker client settings, shell environment only.                                                                                                                                                                                                                                                                                                                                              |
 
@@ -73,6 +74,25 @@ repaired"); each such deny is still written to the audit log on a best-effort ba
 log, then restart the proxy. Attempts that have no outcome (reported by `audit:verify` as a warning) do **not**
 disable money actions. An audit DB that can't be opened or read still makes the proxy exit with code 2.
 
+## Demo fault injection (`ASF_DEMO_DELAY_REFUND_MS`)
+
+For roadmap demo scenario 3 ("upstream timeout mid-refund") the proxy can hold back **one** upstream answer:
+
+```bash
+ASF_DEMO_DELAY_REFUND_MS=15000 ASF_MONEY_CALL_TIMEOUT_MS=5000 \
+  pnpm -s --dir /absolute/path/to/agent-spend-firewall --filter @asf/proxy start
+```
+
+- Only the **first** `create_refund` of the proxy process is affected (once, across reconnects); every other call
+  and every later refund passes through untouched. The request is sent to Razorpay immediately, so the refund
+  really happens; only its response reaches the firewall late.
+- With a delay longer than `ASF_MONEY_CALL_TIMEOUT_MS` the money call times out, and the normal T010 path runs:
+  the firewall looks the refund up by its `asf_attempt` marker and answers `verifiedAfterTimeout: true` (or
+  `unknown` + flagged for a human) — it never blindly retries. A delay shorter than the timeout only makes the
+  refund slow (a second startup warning says so).
+- Read from the **shell environment only** (a value in `.env` is ignored with a note); not an integer in
+  1000–120000 ⇒ the proxy exits 2. The startup config line and a `WARNING: DEMO FAULT INJECTION IS ON` line show it.
+
 ## The command
 
 ```bash
@@ -83,7 +103,10 @@ pnpm -s --dir /absolute/path/to/agent-spend-firewall --filter @asf/proxy start
   the protocol. The proxy itself logs only to stderr (lines prefixed `[asf-proxy]`).
 - `--dir` lets the client launch it from any working directory.
 - Shutdown: closing stdin, SIGINT, SIGTERM or SIGHUP closes the upstream connection and force-removes the container
-  (`asf-upstream-<hex>`). The container runs as `nobody` (`--user 65534:65534`) with `--memory 512m`,
+  (`asf-upstream-<hex>`). Once shutdown begins no approval starts executing (an approve press is answered "shutting
+  down … NOT executed"), an approved action already executing is finished first, and every still-pending approval is
+  expired; the forced exit waits long enough for one money action (money timeout + verify wait + lookups + its single
+  retry; 140 s with the defaults, D-040). The container runs as `nobody` (`--user 65534:65534`) with `--memory 512m`,
   `--pids-limit 256`, a read-only filesystem and no capabilities.
 - Leftover containers (e.g. after `kill -9` of the proxy): list them with
   `docker ps -a --filter name=asf-upstream- --format '{{.Names}} {{.Status}}'` and remove them with

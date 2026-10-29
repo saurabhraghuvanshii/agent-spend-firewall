@@ -87,7 +87,12 @@ describe("approved create_refund × T010 retry", () => {
               delayMs: 80,
               result: {
                 isError: true,
-                content: [{ type: "text", text: "BAD_REQUEST_ERROR: try later" }],
+                content: [
+                  {
+                    type: "text",
+                    text: '{"error":{"code":"BAD_REQUEST_ERROR","description":"try later"}}',
+                  },
+                ],
               },
             };
           }

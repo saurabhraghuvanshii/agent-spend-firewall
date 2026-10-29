@@ -14,11 +14,20 @@ const toolError = (...texts: string[]) => ({
   content: texts.map((text) => ({ type: "text", text })),
 });
 
+/** Razorpay's API error envelope — the only shape that proves a rejection (D-038). */
+const REJECTION = '{"error":{"code":"BAD_REQUEST_ERROR","description":"invalid amount"}}';
+
 describe("classifyFailureText", () => {
-  it("BAD_REQUEST_ERROR alone ⇒ definite rejection", () => {
-    expect(classifyFailureText("BAD_REQUEST_ERROR")).toBe("definite_rejection");
+  it("the whole text is a JSON object with top-level error.code BAD_REQUEST_ERROR ⇒ definite rejection", () => {
+    expect(classifyFailureText(REJECTION)).toBe("definite_rejection");
+    expect(classifyFailureText('{ "error": { "code" :  "BAD_REQUEST_ERROR" } }')).toBe(
+      "definite_rejection",
+    );
+    expect(classifyFailureText(`  ${REJECTION}\n`)).toBe("definite_rejection");
     expect(
-      classifyFailureText('{"error":{"code":"BAD_REQUEST_ERROR","description":"invalid amount"}}'),
+      classifyFailureText(
+        '{"error":{"code":"BAD_REQUEST_ERROR","description":"x","field":"amount","metadata":{}}}',
+      ),
     ).toBe("definite_rejection");
   });
 
@@ -43,26 +52,70 @@ describe("classifyFailureText", () => {
     expect(classifyFailureText(text)).toBe("ambiguous");
   });
 
-  it("the code counts only as the JSON error code or the leading token; echoed elsewhere ⇒ ambiguous", () => {
-    expect(classifyFailureText('{ "error": { "code" :  "BAD_REQUEST_ERROR" } }')).toBe(
-      "definite_rejection",
-    );
-    expect(classifyFailureText("  BAD_REQUEST_ERROR: invalid amount")).toBe("definite_rejection");
+  it("ambiguous wording wins even inside the pinned JSON shape", () => {
+    expect(
+      classifyFailureText(
+        '{"error":{"code":"BAD_REQUEST_ERROR","description":"gateway timed out"}}',
+      ),
+    ).toBe("ambiguous");
+    expect(
+      classifyFailureText('{"error":{"code":"BAD_REQUEST_ERROR","description":"SERVER_ERROR"}}'),
+    ).toBe("ambiguous");
+  });
+
+  it("a leading token without the JSON envelope ⇒ ambiguous", () => {
+    for (const t of [
+      "BAD_REQUEST_ERROR",
+      "  BAD_REQUEST_ERROR: invalid amount",
+      "BAD_REQUEST_ERROR: The refund amount is invalid",
+    ]) {
+      expect(classifyFailureText(t)).toBe("ambiguous");
+    }
+  });
+
+  it("the code nested anywhere but top-level error.code ⇒ ambiguous", () => {
     for (const echoed of [
       'refund failed; notes: {"memo":"BAD_REQUEST_ERROR"}',
       "invalid request: BAD_REQUEST_ERROR",
       '{"error":{"code":"X","description":"BAD_REQUEST_ERROR"}}',
       '{"description":"\\"code\\":\\"BAD_REQUEST_ERROR\\""}',
+      '{"code":"BAD_REQUEST_ERROR"}',
+      '{"notes":{"error":{"code":"BAD_REQUEST_ERROR"}}}',
+      '{"error":{"details":{"code":"BAD_REQUEST_ERROR"}}}',
+      '{"error":{"code":"X"},"nested":{"error":{"code":"BAD_REQUEST_ERROR"}}}',
+      '[{"error":{"code":"BAD_REQUEST_ERROR"}}]',
+      '{"error":[{"code":"BAD_REQUEST_ERROR"}]}',
+      '{"error":"BAD_REQUEST_ERROR"}',
       "BAD_REQUEST_ERRORX",
     ]) {
       expect(classifyFailureText(echoed)).toBe("ambiguous");
     }
   });
 
+  it("text around the JSON, or two JSON documents ⇒ ambiguous", () => {
+    expect(classifyFailureText(`creating refund failed: ${REJECTION}`)).toBe("ambiguous");
+    expect(classifyFailureText(`${REJECTION} trailing`)).toBe("ambiguous");
+    expect(classifyFailureText(`${REJECTION}\n${REJECTION}`)).toBe("ambiguous");
+  });
+
+  it("a non-string or differently-cased error.code ⇒ ambiguous", () => {
+    for (const t of [
+      '{"error":{"code":null}}',
+      '{"error":{"code":400}}',
+      '{"error":{"code":["BAD_REQUEST_ERROR"]}}',
+      '{"error":{"code":{"BAD_REQUEST_ERROR":true}}}',
+      '{"error":{"code":"bad_request_error"}}',
+      '{"error":{"code":" BAD_REQUEST_ERROR"}}',
+      '{"error":{}}',
+      '{"error":null}',
+    ]) {
+      expect(classifyFailureText(t)).toBe("ambiguous");
+    }
+  });
+
   it("oversized text ⇒ ambiguous", () => {
-    expect(classifyFailureText(`BAD_REQUEST_ERROR ${"x".repeat(MAX_FAILURE_TEXT)}`)).toBe(
-      "ambiguous",
-    );
+    const big = `{"error":{"code":"BAD_REQUEST_ERROR","description":"${"x".repeat(MAX_FAILURE_TEXT)}"}}`;
+    expect(classifyFailureText(big)).toBe("ambiguous");
   });
 
   it("the allowlist is frozen and only holds BAD_REQUEST_ERROR", () => {
@@ -78,18 +131,27 @@ describe("classifyToolResultFailure", () => {
     expect(classifyToolResultFailure(null)).toBe("none");
   });
 
-  it("isError: text classified across items; no / non-text content ⇒ ambiguous", () => {
-    expect(classifyToolResultFailure(toolError("BAD_REQUEST_ERROR"))).toBe("definite_rejection");
-    expect(classifyToolResultFailure(toolError("BAD_REQUEST_ERROR", "context canceled"))).toBe(
-      "ambiguous",
-    );
+  it("exactly one text item in the pinned shape ⇒ definite rejection", () => {
+    expect(classifyToolResultFailure(toolError(REJECTION))).toBe("definite_rejection");
+  });
+
+  it("two text items ⇒ ambiguous (even if both are the pinned shape)", () => {
+    expect(classifyToolResultFailure(toolError(REJECTION, REJECTION))).toBe("ambiguous");
+    expect(classifyToolResultFailure(toolError(REJECTION, "context canceled"))).toBe("ambiguous");
+  });
+
+  it("no / non-text / leading-token-only content ⇒ ambiguous", () => {
+    expect(classifyToolResultFailure(toolError("BAD_REQUEST_ERROR"))).toBe("ambiguous");
     expect(classifyToolResultFailure(toolError())).toBe("ambiguous");
     expect(classifyToolResultFailure({ isError: true })).toBe("ambiguous");
     expect(
       classifyToolResultFailure({
         isError: true,
-        content: [{ type: "image", data: "BAD_REQUEST_ERROR", mimeType: "image/png" }],
+        content: [{ type: "image", data: REJECTION, mimeType: "image/png" }],
       }),
+    ).toBe("ambiguous");
+    expect(
+      classifyToolResultFailure({ isError: true, content: [{ type: "text", text: 42 }] }),
     ).toBe("ambiguous");
   });
 });

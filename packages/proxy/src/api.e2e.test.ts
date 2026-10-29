@@ -451,6 +451,7 @@ describe("api-wiring adapters", () => {
     expect(decisionStatusOf(DECISION_ANSWERS.expired, "approved")).toBe("expired");
     expect(decisionStatusOf(DECISION_ANSWERS.alreadyDecided, "approved")).toBe("already_decided");
     expect(decisionStatusOf(DECISION_ANSWERS.unavailable, "approved")).toBe("unavailable");
+    expect(decisionStatusOf(DECISION_ANSWERS.shuttingDown, "approved")).toBe("unavailable");
     expect(decisionStatusOf("something else", "approved")).toBe("unavailable");
   });
 
