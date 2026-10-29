@@ -268,11 +268,46 @@ export interface AuditStore {
    * the current mode record is unreadable the merge starts from kill ON / shadow off and a record is always written.
    */
   changeMode(input: ChangeModeInput): Result<ChangeModeResult>;
+  /**
+   * T013 (dashboard API): at most `limit` rows (1..`MAX_PAGE_ROWS`). With `afterSeq`: rows with seq > afterSeq, oldest
+   * first (live tail). Otherwise newest first, below `beforeSeq` if given (pagination cursor). Unparseable rows become
+   * `{ invalid: true, seq }` (like `readAll`). Bad input / closed store / read failure ⇒ `err`. Never throws.
+   */
+  readPage(query: AuditPageQuery): Result<Array<AuditRecord | InvalidAuditRow>>;
+  /**
+   * T013: one session's timeline, oldest first: its attempts plus every record that references one of them by
+   * `attemptId` (outcomes, verifications, approvals), at most `limit` rows (1..`MAX_PAGE_ROWS`). Never throws.
+   */
+  readSession(sessionId: string, limit: number): Result<Array<AuditRecord | InvalidAuditRow>>;
   /** `verifyChain` over `readAll()`. `err` only if the DB cannot be read. */
   verify(): Result<VerifyResult>;
   /** Idempotent. */
   close(): void;
 }
+
+/** T013: hard cap on rows one `readPage` / `readSession` call returns. */
+export const MAX_PAGE_ROWS = 1000;
+
+export interface AuditPageQuery {
+  readonly limit: number;
+  /** Newest-first page of rows with seq < beforeSeq. Mutually exclusive with `afterSeq`. */
+  readonly beforeSeq?: number;
+  /** Oldest-first rows with seq > afterSeq (live tail). */
+  readonly afterSeq?: number;
+}
+
+const pageLimitSchema = z.number().int().min(1).max(MAX_PAGE_ROWS);
+const pageSeqSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const pageQuerySchema = z
+  .strictObject({
+    limit: pageLimitSchema,
+    beforeSeq: pageSeqSchema.optional(),
+    afterSeq: pageSeqSchema.optional(),
+  })
+  .refine((q) => q.beforeSeq === undefined || q.afterSeq === undefined, {
+    message: "beforeSeq and afterSeq are mutually exclusive",
+  });
+const sessionIdQuerySchema = z.string().min(1).max(256);
 
 export interface OpenAuditStoreOptions {
   /** File path (parent directory is created for writable stores) or `":memory:"`. */
@@ -802,6 +837,10 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
   let latestVerificationRowStmt: Database.Statement;
   let ascStmt: Database.Statement;
   let latestModeStmt: Database.Statement;
+  let pageDescStmt: Database.Statement;
+  let pageBeforeStmt: Database.Statement;
+  let pageAfterStmt: Database.Statement;
+  let sessionStmt: Database.Statement;
   let warnings: string[] = [];
   try {
     db.pragma(`busy_timeout = ${String(Math.max(0, Math.trunc(busyTimeoutMs)))}`);
@@ -884,6 +923,21 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
     );
     latestModeStmt = db.prepare(
       "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE kind = 'mode' ORDER BY seq DESC LIMIT 1",
+    );
+    pageDescStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log ORDER BY seq DESC LIMIT ?",
+    );
+    pageBeforeStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE seq < ? ORDER BY seq DESC LIMIT ?",
+    );
+    pageAfterStmt = db.prepare(
+      "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+    );
+    sessionStmt = db.prepare(
+      "WITH att AS (SELECT id FROM audit_log WHERE kind = 'attempt' AND json_extract(body_json, '$.sessionId') = ?) " +
+        "SELECT seq, id, kind, body_json, prev_hash, hash FROM audit_log " +
+        "WHERE id IN (SELECT id FROM att) OR (kind <> 'attempt' AND json_extract(body_json, '$.attemptId') IN (SELECT id FROM att)) " +
+        "ORDER BY seq ASC LIMIT ?",
     );
   } catch (e: unknown) {
     if (db.open) db.close();
@@ -1660,6 +1714,43 @@ export function openAuditStore(opts: OpenAuditStoreOptions): Result<AuditStore> 
         return changeModeTx.immediate(p);
       } catch (e: unknown) {
         return err("audit.write_failed", "mode change failed", describeError(e));
+      }
+    },
+
+    readPage(query: AuditPageQuery): Result<Array<AuditRecord | InvalidAuditRow>> {
+      const q = pageQuerySchema.safeParse(query);
+      if (!q.success) {
+        return err("audit.invalid_input", "invalid page query", {
+          issues: zodIssuePaths(q.error),
+        });
+      }
+      if (!db.open) return err("audit.read_failed", "audit store is closed");
+      try {
+        const { limit, beforeSeq, afterSeq } = q.data;
+        const rows: unknown[] =
+          afterSeq !== undefined
+            ? pageAfterStmt.all(afterSeq, limit)
+            : beforeSeq !== undefined
+              ? pageBeforeStmt.all(beforeSeq, limit)
+              : pageDescStmt.all(limit);
+        return ok(rows.map((r) => parseRow(r, 0)));
+      } catch (e: unknown) {
+        return err("audit.read_failed", "could not read audit page", describeError(e));
+      }
+    },
+
+    readSession(sessionId: string, limit: number): Result<Array<AuditRecord | InvalidAuditRow>> {
+      const id = sessionIdQuerySchema.safeParse(sessionId);
+      const lim = pageLimitSchema.safeParse(limit);
+      if (!id.success || !lim.success) {
+        return err("audit.invalid_input", "invalid session query");
+      }
+      if (!db.open) return err("audit.read_failed", "audit store is closed");
+      try {
+        const rows: unknown[] = sessionStmt.all(id.data, lim.data);
+        return ok(rows.map((r) => parseRow(r, 0)));
+      } catch (e: unknown) {
+        return err("audit.read_failed", "could not read session", describeError(e));
       }
     },
 

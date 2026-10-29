@@ -55,6 +55,18 @@
  * The policy is loaded and the audit store opened BEFORE serving: if either fails the proxy exits 2 (never serves
  * money tools without a policy and an audit log).
  *
+ * - `ASF_API_PORT` (T013; shell or `.env`): set ⇒ the dashboard HTTP API (`@asf/api`) runs IN this process on
+ *   `ASF_API_HOST` (loopback only, default `127.0.0.1`), port 1024..65535 ⇒ else exit 2; a listen failure ⇒ exit 2.
+ *   Every route except `/health` needs `x-admin-token` = `ASF_ADMIN_TOKEN` (shell or `.env`, >= 32 chars, not a
+ *   placeholder); without a valid token the API answers 503 (fail closed). `ASF_API_ALLOWED_ORIGINS`: comma-separated
+ *   loopback origins (default: the API's own + `http://localhost:5173` / `http://127.0.0.1:5173`).
+ *   `ASF_ADMIN_TOKEN_FILE` (SHELL only, absolute path): preferred over `ASF_ADMIN_TOKEN`; read once at startup; must be
+ *   a regular file owned by this user and not group / world accessible (mode 0600 / 0400) ⇒ else the API is disabled.
+ *   The AGENT must never hold the token: keep it out of the agent's env, `.env` and working directory.
+ *   `ASF_API_APPROVALS=1` (SHELL only) enables approve / reject through the API (same approval service as Telegram);
+ *   default off (403), so an agent that got hold of the token still can't self-approve. Enabled + valid token and no
+ *   Telegram ⇒ approvals are dashboard-only.
+ *
  * T012 modes: the kill switch / shadow mode live in the audit log (`mode` records) and are read on EVERY money call
  * (`createModePreCheck`), so `asf-proxy mode kill on|off`, `mode shadow on|off`, `mode status` (`cli/mode.ts`; this
  * entry point dispatches `mode …` there) take effect on the next call. An unreadable mode ⇒ kill switch ON.
@@ -64,7 +76,16 @@
 import { randomBytes } from "node:crypto";
 import { userInfo } from "node:os";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { err, ok, type CompiledPolicy, type Result } from "@asf/core";
@@ -79,6 +100,17 @@ import {
   type TelegramApprover,
 } from "@asf/approvals";
 import { createInMemoryApprovalStub, type ApprovalPort } from "../approval-port.js";
+import {
+  createApi,
+  parseAdminToken,
+  parseAllowedOrigins,
+  parseApiHost,
+  parseApiPort,
+  startApiServer,
+  type LoopbackHost,
+  type RunningApi,
+} from "@asf/api";
+import { createApiPorts, dashboardOnlyNotifier } from "../api-wiring.js";
 import { createApprovalService, type ApprovalService } from "../approval-service.js";
 import { openAuditStore, type AuditStore } from "../audit-store.js";
 import { systemClock, systemTimer } from "../context-adapters.js";
@@ -156,6 +188,8 @@ export const SHELL_ONLY_SETTINGS = [
   "ASF_DUPLICATE_WINDOW_MS",
   "ASF_MONEY_CALL_TIMEOUT_MS",
   "ASF_VERIFY_WAIT_MS",
+  "ASF_API_APPROVALS",
+  "ASF_ADMIN_TOKEN_FILE",
 ] as const;
 export const MIN_LOCK_WAIT_MS = 1;
 export const MAX_LOCK_WAIT_MS_CONFIG = 60_000;
@@ -181,6 +215,8 @@ export interface ProxyConfig {
   readonly moneyCallTimeoutMs: number;
   /** `ASF_VERIFY_WAIT_MS` (shell env only, T010). */
   readonly verifyWaitMs: number;
+  /** T013: dashboard API (`ASF_API_PORT` set); `undefined` ⇒ no HTTP listener. */
+  readonly api?: ApiConfig;
   /** T011: Telegram approvals (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`); `undefined` ⇒ in-memory stub. SECRET token. */
   readonly telegram?: TelegramConfig;
   /** Non-fatal notes for the log (secret-free). */
@@ -195,6 +231,115 @@ export interface ConfigDeps {
   /** Contents of a file, or `undefined` if it doesn't exist. */
   readonly readFile: (path: string) => string | undefined;
   readonly baseChildEnv: () => Record<string, string>;
+}
+
+export interface ApiConfig {
+  readonly host: LoopbackHost;
+  readonly port: number;
+  /** SECRET: never log it. `undefined` ⇒ no valid `ASF_ADMIN_TOKEN` (every authenticated route answers 503). */
+  readonly adminToken?: string;
+  /** Why the token was refused (secret-free), when `adminToken` is undefined. */
+  readonly tokenProblem?: string;
+  readonly allowedOrigins: readonly string[];
+  /** `ASF_API_APPROVALS=1` (shell only): approve / reject through the API. Default false. */
+  readonly approvalsEnabled: boolean;
+}
+
+export const MAX_TOKEN_FILE_BYTES = 1024;
+
+/**
+ * `ASF_ADMIN_TOKEN_FILE`: absolute path to a regular file (NOT a symlink: opened with `O_NOFOLLOW`) owned by the
+ * current user with no group / other permission bits. Type, mode, owner and size are checked with `fstat` on the
+ * opened fd and the token is read from that same fd (no stat-then-open race). Content: the token, one optional
+ * trailing newline.
+ */
+export function readAdminTokenFile(path: string): Result<string> {
+  if (!isAbsolute(path) || path.includes("\0")) {
+    return err("api.token_file", "ASF_ADMIN_TOKEN_FILE must be an absolute path");
+  }
+  const codeOf = (e: unknown): string =>
+    e instanceof Error && "code" in e && typeof e.code === "string" ? e.code : "error";
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (e: unknown) {
+    return err("api.token_file", `ASF_ADMIN_TOKEN_FILE cannot be opened (${codeOf(e)})`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return err("api.token_file", "ASF_ADMIN_TOKEN_FILE is not a regular file");
+    if ((st.mode & 0o077) !== 0) {
+      return err("api.token_file", "ASF_ADMIN_TOKEN_FILE is group/world accessible; chmod 600 it");
+    }
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (uid !== undefined && st.uid !== uid) {
+      return err("api.token_file", "ASF_ADMIN_TOKEN_FILE is not owned by the proxy's user");
+    }
+    if (st.size > MAX_TOKEN_FILE_BYTES) {
+      return err("api.token_file", "ASF_ADMIN_TOKEN_FILE is too large");
+    }
+    const buf = Buffer.alloc(MAX_TOKEN_FILE_BYTES + 1);
+    let n = 0;
+    for (;;) {
+      const got = readSync(fd, buf, n, buf.length - n, null);
+      if (got === 0) break;
+      n += got;
+      if (n > MAX_TOKEN_FILE_BYTES)
+        return err("api.token_file", "ASF_ADMIN_TOKEN_FILE is too large");
+    }
+    return ok(
+      buf
+        .subarray(0, n)
+        .toString("utf8")
+        .replace(/\r?\n$/, ""),
+    );
+  } catch (e: unknown) {
+    return err("api.token_file", `ASF_ADMIN_TOKEN_FILE cannot be read (${codeOf(e)})`);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export interface ApiConfigSources {
+  /** SHELL-only lookup (`ASF_API_APPROVALS`, `ASF_ADMIN_TOKEN_FILE`). Required: never the merged env / `.env`. */
+  readonly shell: (name: string) => string | undefined;
+  /** Default: `readAdminTokenFile`. */
+  readonly readTokenFile?: (path: string) => Result<string>;
+}
+
+/** T013: `ASF_API_PORT` / `ASF_API_HOST` / `ASF_ADMIN_TOKEN` / `ASF_API_ALLOWED_ORIGINS`. Port unset ⇒ `ok(undefined)`. */
+export function parseApiConfig(
+  env: EnvLike,
+  sources: ApiConfigSources,
+): Result<ApiConfig | undefined> {
+  const shell = sources.shell;
+  const port = parseApiPort(env["ASF_API_PORT"]);
+  if (!port.ok) return port;
+  if (port.value === undefined) return ok(undefined);
+  const host = parseApiHost(env["ASF_API_HOST"]);
+  if (!host.ok) return host;
+  const origins = parseAllowedOrigins(env["ASF_API_ALLOWED_ORIGINS"], port.value);
+  if (!origins.ok) return origins;
+  const approvalsRaw = shell("ASF_API_APPROVALS");
+  if (approvalsRaw !== undefined && approvalsRaw !== "0" && approvalsRaw !== "1") {
+    return err("api.bad_approvals", "ASF_API_APPROVALS must be 0 or 1");
+  }
+  // The token file wins over the env var; a bad file disables the API (never falls back to the env var).
+  const tokenFile = shell("ASF_ADMIN_TOKEN_FILE");
+  let token: Result<string>;
+  if (tokenFile !== undefined) {
+    const read = (sources.readTokenFile ?? readAdminTokenFile)(tokenFile);
+    token = read.ok ? parseAdminToken(read.value) : read;
+  } else {
+    token = parseAdminToken(env["ASF_ADMIN_TOKEN"]);
+  }
+  return ok({
+    host: host.value,
+    port: port.value,
+    allowedOrigins: origins.value,
+    approvalsEnabled: approvalsRaw === "1",
+    ...(token.ok ? { adminToken: token.value } : { tokenProblem: token.error.message }),
+  });
 }
 
 export interface TelegramConfig {
@@ -404,6 +549,8 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
   if (!verifyWait.ok) return verifyWait;
   const telegram = parseTelegramConfig(env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"]);
   if (!telegram.ok) return telegram;
+  const api = parseApiConfig(env, { shell: shellValue });
+  if (!api.ok) return api;
 
   const image = validateImageRef(
     shellValue("ASF_RAZORPAY_MCP_IMAGE") ?? DEFAULT_RAZORPAY_MCP_IMAGE,
@@ -432,6 +579,7 @@ export function resolveProxyConfig(shellEnv: EnvLike, deps: ConfigDeps): Result<
     moneyCallTimeoutMs: moneyTimeout.value,
     verifyWaitMs: verifyWait.value,
     ...(telegram.value === undefined ? {} : { telegram: telegram.value }),
+    ...(api.value === undefined ? {} : { api: api.value }),
     notes,
   });
 }
@@ -580,7 +728,19 @@ export function openApprovals(
   transport?: Parameters<typeof createTelegramApprover>[0]["transport"],
 ): Result<ApprovalWiring | undefined> {
   const tg = config.telegram;
-  if (tg === undefined) return ok(undefined);
+  if (tg === undefined) {
+    // T013: no Telegram, but an authenticated dashboard API ⇒ approvals decided only through the API.
+    if (config.api?.adminToken === undefined || !config.api.approvalsEnabled) return ok(undefined);
+    const store = openApprovalStore({ path: approvalsDbPath(config.auditDbPath) });
+    if (!store.ok) return store;
+    const service = createApprovalService({
+      store: store.value,
+      notifier: dashboardOnlyNotifier,
+      clock: systemClock,
+      logger,
+    });
+    return ok({ service, store: store.value });
+  }
   const store = openApprovalStore({ path: approvalsDbPath(config.auditDbPath) });
   if (!store.ok) return store;
   const ref: { service?: ApprovalService } = {};
@@ -760,6 +920,42 @@ export function startProxy(opts: StartProxyOptions): RunningProxy {
   };
 }
 
+/** T013: build the API over the proxy's stores and listen on loopback. Logs the URL, never the token. */
+export async function startDashboardApi(
+  cfg: ApiConfig,
+  deps: {
+    readonly audit: AuditStore;
+    readonly modes: ModeStore;
+    readonly approvals?: { readonly service: ApprovalService; readonly store: ApprovalStore };
+    readonly logger: Logger;
+  },
+): Promise<Result<RunningApi>> {
+  const ports = createApiPorts(deps);
+  const api = createApi({
+    ...ports,
+    adminToken: cfg.adminToken,
+    approvalsEnabled: cfg.approvalsEnabled,
+    port: cfg.port,
+    allowedOrigins: cfg.allowedOrigins,
+    logger: deps.logger,
+  });
+  const r = await startApiServer(api, cfg.host, cfg.port);
+  if (!r.ok) return r;
+  const shown = cfg.host === "::1" ? "[::1]" : cfg.host;
+  deps.logger(`dashboard API listening on http://${shown}:${String(cfg.port)}`);
+  if (cfg.adminToken === undefined) {
+    deps.logger(
+      `WARNING: dashboard API is DISABLED (every route but /health answers 503): ${cfg.tokenProblem ?? "no admin token"}`,
+    );
+  }
+  deps.logger(
+    cfg.approvalsEnabled
+      ? "WARNING: ASF_API_APPROVALS=1: approvals can be decided through the dashboard API; make sure the AGENT cannot read the admin token"
+      : "dashboard API: approve / reject disabled (set ASF_API_APPROVALS=1 in the shell to enable)",
+  );
+  return r;
+}
+
 function isMain(): boolean {
   const entry = process.argv[1];
   if (entry === undefined) return false;
@@ -836,15 +1032,38 @@ async function main(): Promise<void> {
   logger(
     approvals.value === undefined
       ? "approvals: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; actions needing approval are never executed"
-      : `approvals: Telegram chat ${config.value.telegram?.chatId ?? "?"}; store ${approvals.value.store.path}`,
+      : config.value.telegram === undefined
+        ? `approvals: dashboard API only (no Telegram); store ${approvals.value.store.path}`
+        : `approvals: Telegram chat ${config.value.telegram.chatId}; store ${approvals.value.store.path}`,
   );
+  const modes = createModeStore(firewall.value.store);
   const running = startProxy({
     config: config.value,
     logger,
     firewall: firewall.value,
+    modes,
     ...(approvals.value === undefined ? {} : { approvalWiring: approvals.value }),
     ...(startDegraded === undefined ? {} : { startDegraded }),
   });
+
+  // T013: the dashboard API, in-process (it needs the in-memory pending approval args).
+  let apiServer: RunningApi | undefined;
+  const apiCfg = config.value.api;
+  if (apiCfg !== undefined) {
+    const started = await startDashboardApi(apiCfg, {
+      audit: firewall.value.store,
+      modes,
+      ...(approvals.value === undefined ? {} : { approvals: approvals.value }),
+      logger,
+    });
+    if (!started.ok) {
+      logger(`error: ${started.error.message} (${started.error.code})`);
+      await running.shutdown();
+      process.exitCode = 2;
+      return;
+    }
+    apiServer = started.value;
+  }
   const redact: Redactor = (s) => redactSecrets(s, config.value.keys);
 
   let exiting = false;
@@ -857,7 +1076,7 @@ async function main(): Promise<void> {
       process.exit(code === 0 ? 1 : code);
     }, SHUTDOWN_TIMEOUT_MS);
     force.unref();
-    void running.shutdown().finally(() => {
+    void Promise.allSettled([apiServer?.close(), running.shutdown()]).finally(() => {
       process.exit(code);
     });
   };

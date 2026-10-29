@@ -17,5 +17,11 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@asf/core": "workspace:*",
+    "@hono/node-server": "^2.1.5",
+    "hono": "^4.13.13",
+    "zod": "^4.6.7"
   }
 }

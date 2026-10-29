@@ -6,6 +6,8 @@ export {
   AUDIT_OUTCOMES,
   DEFAULT_MAX_ACTIVITY_ROWS,
   DEFAULT_MAX_SCAN_ROWS,
+  MAX_PAGE_ROWS,
+  type AuditPageQuery,
   openAuditStore,
   type AuditActivity,
   type AuditAttemptRecord,

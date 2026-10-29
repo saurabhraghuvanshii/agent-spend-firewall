@@ -24,6 +24,7 @@
     "mode": "tsx --conditions=@asf/source src/cli/proxy.ts mode"
   },
   "dependencies": {
+    "@asf/api": "workspace:*",
     "@asf/approvals": "workspace:*",
     "@asf/core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.1",
