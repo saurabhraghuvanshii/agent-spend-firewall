@@ -1,0 +1,75 @@
+1
+00:00:00,000 --> 00:00:07,000
+Agent Spend Firewall: a safety layer between AI agents and Razorpay money.
+
+2
+00:00:07,000 --> 00:00:12,500
+AI agents can now issue refunds and payouts through Razorpay's MCP tools.
+
+3
+00:00:12,500 --> 00:00:18,000
+Prompt injection, retry loops or a paise/rupee mix-up can lose real money.
+
+4
+00:00:18,000 --> 00:00:23,500
+Our firewall is a drop-in MCP proxy. The agent connects to it instead of Razorpay.
+
+5
+00:00:23,500 --> 00:00:29,000
+Reads pass straight through. Money tools need a reason, pass policy, and get audited.
+
+6
+00:00:29,000 --> 00:00:38,000
+Limits live in TypeScript policy-as-code. Anything not explicitly allowed is denied.
+
+7
+00:00:38,000 --> 00:00:45,000
+Live run: a refund with no reason is rejected before it ever reaches Razorpay.
+
+8
+00:00:45,000 --> 00:00:52,000
+A legitimate ₹499 refund with a clear reason is allowed and forwarded.
+
+9
+00:00:52,000 --> 00:00:59,000
+The agent retries the same refund. The firewall blocks the duplicate.
+
+10
+00:00:59,000 --> 00:01:06,000
+A prompt injection asks for ₹50,000. The hard cap denies it; the reason grants nothing.
+
+11
+00:01:06,000 --> 00:01:13,000
+Refunding more than what's left on the payment is denied using a live payment lookup.
+
+12
+00:01:13,000 --> 00:01:19,000
+₹4,500 is over the auto-approve limit, so the call is held: NOT executed.
+
+13
+00:01:19,000 --> 00:01:23,500
+The approver gets a Telegram card with the amount, rule and the agent's reason.
+
+14
+00:01:23,500 --> 00:01:29,000
+One tap on Approve: the firewall executes it exactly once and the agent sees the result.
+
+15
+00:01:29,000 --> 00:01:37,000
+Ops flips the kill switch: every money action is frozen; read tools still work.
+
+16
+00:01:37,000 --> 00:01:43,000
+Every attempt, approval and outcome is written to a hash-chained audit log.
+
+17
+00:01:43,000 --> 00:01:49,000
+Edit a single row and audit:verify points to exactly where the chain broke.
+
+18
+00:01:49,000 --> 00:01:55,000
+Of 7 refund attempts, only the 2 safe ones reached Razorpay. 1,939 tests pass.
+
+19
+00:01:55,000 --> 00:02:01,000
+Built so far: proxy, policy, approvals, kill switch, audit. Next: dashboard and evals.
