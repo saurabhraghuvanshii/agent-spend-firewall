@@ -12,10 +12,23 @@ bounded, gated, and auditable**. Razorpay **test mode only** (`rzp_test_` keys).
 
 ▶ [Watch the MVP demo](agent-spend-firewall-mvp/agent-spend-firewall-mvp.mp4) · [captions (.srt)](agent-spend-firewall-mvp/agent-spend-firewall-mvp.srt)
 
-A scripted agent sends seven refund calls through the real firewall (default policy, SQLite hash-chained audit log,
-approval flow): a call with no reason, a legitimate ₹499 refund, a duplicate retry, a prompt-injected ₹50,000 refund,
-an over-refund, a ₹4,500 refund approved over Telegram, and a call while the kill switch is on. It ends by tampering
-with one audit row so `audit:verify` reports the break. Razorpay and Telegram are local test fakes in this recording.
+A scripted agent sends eight refund calls through the real firewall (default policy, SQLite hash-chained audit log,
+approval service, `@asf/api`) while the live dashboard updates over SSE: a call with no reason, a legitimate ₹499
+refund, a duplicate retry, a prompt-injected ₹50,000 refund, an over-refund, and a ₹4,500 refund held for a human and
+approved with one tap in the approver chat (a real signed callback into the firewall). Shadow mode is then switched
+on from the dashboard so a would-deny refund goes through flagged "would deny", and the kill switch (behind a confirm
+dialog) freezes the next refund. It ends by editing one audit row in the SQLite file: the dashboard's chain badge
+turns red at that record, and `audit:verify` reports the same break. Razorpay is a local fake upstream, and the
+Telegram chat is a simulated test bot page driving the real Telegram approver code over a fake transport; no network
+calls are made.
+
+### Screenshots
+
+| Dashboard (dark, default)                                                         | Dashboard (light)                                                                   |
+| --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| ![Dashboard, dark theme](agent-spend-firewall-mvp/screenshots/dashboard-dark.png) | ![Dashboard, light theme](agent-spend-firewall-mvp/screenshots/dashboard-light.png) |
+
+![A ₹4,500 refund waiting for approval on the dashboard and in the simulated Telegram approver chat](agent-spend-firewall-mvp/screenshots/telegram-approval.png)
 
 ## Development
 
