@@ -34,3 +34,43 @@ Copy `.env.example` to `.env` and fill in **test-mode** credentials.
 
 > Native modules (e.g. `better-sqlite3`) are compiled for the active Node version. After switching Node versions,
 > run `pnpm rebuild`.
+
+## Running the dashboard
+
+The dashboard (`packages/dashboard`) is a Vite + React app that talks to the HTTP API served **inside the proxy**
+process (`packages/api`). The API only exists while the proxy runs with `ASF_API_PORT` set.
+
+1. **Create an admin token** (≥ 32 chars). Keep it away from the AI agent — the agent must never hold it:
+
+   ```bash
+   openssl rand -hex 32 > ~/.asf-admin-token && chmod 600 ~/.asf-admin-token
+   ```
+
+2. **Start the proxy with the API on.** These go in the proxy's launch environment (e.g. the `env` block of the
+   agent's MCP server config); `ASF_ADMIN_TOKEN_FILE` and `ASF_API_APPROVALS` are ignored in `.env`:
+
+   ```bash
+   ASF_API_PORT=8787 ASF_ADMIN_TOKEN_FILE=$HOME/.asf-admin-token pnpm --filter @asf/proxy start
+   ```
+
+   The API binds to `127.0.0.1` only. Dashboard approve/reject is **off** by default (403 → "Approve via Telegram");
+   enable it with `ASF_API_APPROVALS=1` only if the agent has no shell/file tools or the proxy runs as a separate OS
+   user (see D-036).
+
+3. **Start the dashboard:**
+
+   ```bash
+   pnpm --filter @asf/dashboard dev    # http://localhost:5173
+   ```
+
+   It calls `http://127.0.0.1:8787` by default. For another port, set `VITE_ASF_API_URL` in the shell or in
+   `packages/dashboard/.env.local` (the root `.env` is not read by Vite).
+
+4. **Open http://localhost:5173 and paste the admin token.** It is kept in this tab's `sessionStorage` only; use
+   "Forget token" to clear it.
+
+What you get: a live audit timeline (₹ amounts, decision badges, matched rule, agent reasons labelled _untrusted_),
+pending approvals, session replay, the chain-integrity badge, and enforce/shadow mode + kill switch controls.
+
+Production build: `pnpm --filter @asf/dashboard build` (output in `packages/dashboard/dist`). Serve it with
+`Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY` headers.

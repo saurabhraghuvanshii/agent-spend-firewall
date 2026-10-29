@@ -1,11 +1,12 @@
+import react from "@vitejs/plugin-react";
+import { defaultClientConditions } from "vite";
 import { defineConfig } from "vitest/config";
 
-// D-006: resolve workspace packages to their `src` via the `@asf/source` export condition.
-// Vite 6+ only applies `resolve.conditions` to the client environment; Vitest's node tests run in the
-// SSR environment, so the condition must be set there too or a stale `dist/` gets imported.
+// D-006: resolve workspace packages to their `src` via the `@asf/source` export condition (client + SSR).
 export default defineConfig({
+  plugins: [react()],
   resolve: {
-    conditions: ["@asf/source"],
+    conditions: ["@asf/source", ...defaultClientConditions],
   },
   ssr: {
     resolve: {
@@ -14,6 +15,8 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["src/**/*.test.ts"],
+    environment: "jsdom",
+    include: ["src/**/*.test.{ts,tsx}"],
+    setupFiles: ["./src/test/setup.ts"],
   },
 });
